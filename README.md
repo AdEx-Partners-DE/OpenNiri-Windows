@@ -44,6 +44,13 @@ Niri is a Wayland compositor that owns the entire rendering pipeline. On Windows
 
 ## Building
 
+### Prerequisites
+
+- Rust (stable toolchain)
+- Visual Studio Build Tools with "C++ build tools" workload
+
+### Build Commands
+
 ```bash
 # Clone the repository
 git clone https://github.com/AdEx-Partners-DE/OpenNiri-Windows.git
@@ -55,6 +62,14 @@ cargo build --release
 # Run tests
 cargo test --all
 ```
+
+### Troubleshooting
+
+**Linker error: "link: extra operand"**
+
+This occurs when Git Bash's `link` command shadows MSVC's `link.exe`. Solutions:
+1. Use the "Developer Command Prompt for VS" instead of Git Bash
+2. Or add MSVC bin directory to PATH before Git: `C:\Program Files\Microsoft Visual Studio\...\VC\Tools\MSVC\...\bin\Hostx64\x64`
 
 ## Usage
 
