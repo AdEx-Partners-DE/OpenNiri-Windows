@@ -48,27 +48,27 @@ impl TrayManager {
 
         // Title item (disabled)
         let title = MenuItem::new("OpenNiri Windows", false, None);
-        menu.append(&title).map_err(|e| TrayError::MenuError(e.to_string()))?;
+        menu.append(&title).map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Separator
         menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| TrayError::MenuError(e.to_string()))?;
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Refresh Windows
         let refresh = MenuItem::with_id(menu_ids::REFRESH, "Refresh Windows", true, None);
-        menu.append(&refresh).map_err(|e| TrayError::MenuError(e.to_string()))?;
+        menu.append(&refresh).map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Reload Config
         let reload = MenuItem::with_id(menu_ids::RELOAD, "Reload Config", true, None);
-        menu.append(&reload).map_err(|e| TrayError::MenuError(e.to_string()))?;
+        menu.append(&reload).map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Separator
         menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| TrayError::MenuError(e.to_string()))?;
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Exit
         let exit = MenuItem::with_id(menu_ids::EXIT, "Exit", true, None);
-        menu.append(&exit).map_err(|e| TrayError::MenuError(e.to_string()))?;
+        menu.append(&exit).map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Create the tray icon with a simple embedded icon
         let icon = create_default_icon()?;
@@ -78,7 +78,7 @@ impl TrayManager {
             .with_tooltip("OpenNiri Windows - Tiling Window Manager")
             .with_icon(icon)
             .build()
-            .map_err(|e| TrayError::BuildError(e.to_string()))?;
+            .map_err(|e| TrayError::Build(e.to_string()))?;
 
         info!("System tray icon created");
 
@@ -169,20 +169,20 @@ fn create_default_icon() -> Result<tray_icon::Icon, TrayError> {
     }
 
     tray_icon::Icon::from_rgba(rgba, SIZE as u32, SIZE as u32)
-        .map_err(|e| TrayError::IconError(e.to_string()))
+        .map_err(|e| TrayError::Icon(e.to_string()))
 }
 
 /// Errors that can occur during tray operations.
 #[derive(Debug, Error)]
 pub enum TrayError {
     #[error("Failed to create menu: {0}")]
-    MenuError(String),
+    Menu(String),
 
     #[error("Failed to build tray icon: {0}")]
-    BuildError(String),
+    Build(String),
 
     #[error("Failed to create icon: {0}")]
-    IconError(String),
+    Icon(String),
 }
 
 #[cfg(test)]

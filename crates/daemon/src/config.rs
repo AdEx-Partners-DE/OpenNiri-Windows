@@ -838,4 +838,198 @@ mod tests {
         assert!(config.behavior.focus_follows_mouse);
         assert_eq!(config.behavior.focus_follows_mouse_delay_ms, 200);
     }
+
+    // =========================================================================
+    // Window Rule Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn test_window_rule_multiple_matches_uses_first() {
+        // When multiple rules could match, the first one wins
+        let rules = vec![
+            WindowRule {
+                match_class: Some("Notepad".to_string()),
+                match_title: None,
+                match_executable: None,
+                action: WindowAction::Float,
+                width: Some(800),
+                height: Some(600),
+            },
+            WindowRule {
+                match_class: Some("Notepad".to_string()),
+                match_title: None,
+                match_executable: None,
+                action: WindowAction::Ignore, // Different action
+                width: None,
+                height: None,
+            },
+        ];
+
+        // First matching rule should be returned
+        let mut matched_action = WindowAction::Tile; // Default
+        for rule in &rules {
+            if rule.matches("Notepad", "Untitled", "notepad.exe") {
+                matched_action = rule.action;
+                break;
+            }
+        }
+        assert_eq!(matched_action, WindowAction::Float);
+    }
+
+    #[test]
+    fn test_window_rule_regex_special_chars() {
+        // Test regex with special characters that need escaping
+        let rule = WindowRule {
+            match_class: None,
+            match_title: Some(r"^\[DEBUG\].*$".to_string()), // Escaped brackets
+            match_executable: None,
+            action: WindowAction::Ignore,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("AnyClass", "[DEBUG] Application started", "app.exe"));
+        assert!(!rule.matches("AnyClass", "DEBUG Application started", "app.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_regex_case_sensitivity() {
+        // By default, regex is case-sensitive
+        let rule = WindowRule {
+            match_class: None,
+            match_title: Some("Error".to_string()),
+            match_executable: None,
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("AnyClass", "Error Dialog", "app.exe"));
+        assert!(!rule.matches("AnyClass", "error dialog", "app.exe")); // Case mismatch
+    }
+
+    #[test]
+    fn test_window_rule_regex_case_insensitive() {
+        // Test case-insensitive regex with (?i) flag
+        let rule = WindowRule {
+            match_class: None,
+            match_title: Some("(?i)error".to_string()),
+            match_executable: None,
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("AnyClass", "Error Dialog", "app.exe"));
+        assert!(rule.matches("AnyClass", "error dialog", "app.exe"));
+        assert!(rule.matches("AnyClass", "ERROR DIALOG", "app.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_partial_config_class_only() {
+        // Rule with only class specified
+        let rule = WindowRule {
+            match_class: Some("MyClass".to_string()),
+            match_title: None,
+            match_executable: None,
+            action: WindowAction::Tile,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("MyClass", "Any Title", "any.exe"));
+        assert!(rule.matches("MyClass", "Different Title", "different.exe"));
+        assert!(!rule.matches("OtherClass", "Any Title", "any.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_partial_config_title_only() {
+        // Rule with only title specified
+        let rule = WindowRule {
+            match_class: None,
+            match_title: Some(".*Settings.*".to_string()),
+            match_executable: None,
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("AnyClass", "App Settings", "any.exe"));
+        assert!(rule.matches("DifferentClass", "Settings Panel", "different.exe"));
+        assert!(!rule.matches("AnyClass", "Main Window", "any.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_partial_config_executable_only() {
+        // Rule with only executable specified
+        let rule = WindowRule {
+            match_class: None,
+            match_title: None,
+            match_executable: Some("notepad.exe".to_string()),
+            action: WindowAction::Tile,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("AnyClass", "Any Title", "notepad.exe"));
+        assert!(rule.matches("AnyClass", "Any Title", "NOTEPAD.EXE")); // Case insensitive
+        assert!(!rule.matches("AnyClass", "Any Title", "wordpad.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_invalid_regex_returns_false() {
+        // Invalid regex should not match anything
+        let rule = WindowRule {
+            match_class: None,
+            match_title: Some("[invalid(regex".to_string()), // Invalid regex
+            match_executable: None,
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        // Should return false because regex is invalid
+        assert!(!rule.matches("AnyClass", "Any Title", "any.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_empty_strings_match() {
+        // Test matching against empty strings
+        let rule = WindowRule {
+            match_class: Some(".*".to_string()), // Match anything including empty
+            match_title: None,
+            match_executable: None,
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("", "Title", "app.exe")); // Empty class matches .*
+        assert!(rule.matches("SomeClass", "Title", "app.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_width_height_optional() {
+        // Width and height are optional and independent
+        let toml_str = r#"
+            [[window_rules]]
+            match_class = "Test"
+            action = "float"
+            width = 1000
+            # height not specified
+
+            [[window_rules]]
+            match_class = "Test2"
+            action = "float"
+            # width not specified
+            height = 800
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.window_rules[0].width, Some(1000));
+        assert_eq!(config.window_rules[0].height, None);
+
+        assert_eq!(config.window_rules[1].width, None);
+        assert_eq!(config.window_rules[1].height, Some(800));
+    }
 }

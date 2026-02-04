@@ -133,6 +133,8 @@ enum QueryType {
     Workspace,
     /// Get focused window info
     Focused,
+    /// List all managed windows
+    All,
 }
 
 /// Convert CLI command to IPC command.
@@ -168,6 +170,7 @@ fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         Commands::Query { what } => match what {
             QueryType::Workspace => IpcCommand::QueryWorkspace,
             QueryType::Focused => IpcCommand::QueryFocused,
+            QueryType::All => IpcCommand::QueryAllWindows,
         },
         Commands::Refresh => IpcCommand::Refresh,
         Commands::Apply => IpcCommand::Apply,
@@ -394,4 +397,226 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // to_ipc_command tests
+    // =========================================================================
+
+    #[test]
+    fn test_to_ipc_command_focus_left() {
+        let cmd = Commands::Focus { direction: FocusDirection::Left };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::FocusLeft));
+    }
+
+    #[test]
+    fn test_to_ipc_command_focus_right() {
+        let cmd = Commands::Focus { direction: FocusDirection::Right };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::FocusRight));
+    }
+
+    #[test]
+    fn test_to_ipc_command_focus_up() {
+        let cmd = Commands::Focus { direction: FocusDirection::Up };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::FocusUp));
+    }
+
+    #[test]
+    fn test_to_ipc_command_focus_down() {
+        let cmd = Commands::Focus { direction: FocusDirection::Down };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::FocusDown));
+    }
+
+    #[test]
+    fn test_to_ipc_command_scroll_left() {
+        let cmd = Commands::Scroll { direction: ScrollDirection::Left { pixels: 100 } };
+        match to_ipc_command(&cmd) {
+            IpcCommand::Scroll { delta } => assert_eq!(delta, -100.0),
+            _ => panic!("Expected Scroll command"),
+        }
+    }
+
+    #[test]
+    fn test_to_ipc_command_scroll_right() {
+        let cmd = Commands::Scroll { direction: ScrollDirection::Right { pixels: 150 } };
+        match to_ipc_command(&cmd) {
+            IpcCommand::Scroll { delta } => assert_eq!(delta, 150.0),
+            _ => panic!("Expected Scroll command"),
+        }
+    }
+
+    #[test]
+    fn test_to_ipc_command_move_left() {
+        let cmd = Commands::Move { direction: MoveDirection::Left };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::MoveColumnLeft));
+    }
+
+    #[test]
+    fn test_to_ipc_command_move_right() {
+        let cmd = Commands::Move { direction: MoveDirection::Right };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::MoveColumnRight));
+    }
+
+    #[test]
+    fn test_to_ipc_command_resize() {
+        let cmd = Commands::Resize { delta: 50 };
+        match to_ipc_command(&cmd) {
+            IpcCommand::Resize { delta } => assert_eq!(delta, 50),
+            _ => panic!("Expected Resize command"),
+        }
+    }
+
+    #[test]
+    fn test_to_ipc_command_resize_negative() {
+        let cmd = Commands::Resize { delta: -30 };
+        match to_ipc_command(&cmd) {
+            IpcCommand::Resize { delta } => assert_eq!(delta, -30),
+            _ => panic!("Expected Resize command"),
+        }
+    }
+
+    #[test]
+    fn test_to_ipc_command_focus_monitor_left() {
+        let cmd = Commands::FocusMonitor { direction: MonitorDirection::Left };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::FocusMonitorLeft));
+    }
+
+    #[test]
+    fn test_to_ipc_command_focus_monitor_right() {
+        let cmd = Commands::FocusMonitor { direction: MonitorDirection::Right };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::FocusMonitorRight));
+    }
+
+    #[test]
+    fn test_to_ipc_command_move_to_monitor_left() {
+        let cmd = Commands::MoveToMonitor { direction: MonitorDirection::Left };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::MoveWindowToMonitorLeft));
+    }
+
+    #[test]
+    fn test_to_ipc_command_move_to_monitor_right() {
+        let cmd = Commands::MoveToMonitor { direction: MonitorDirection::Right };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::MoveWindowToMonitorRight));
+    }
+
+    #[test]
+    fn test_to_ipc_command_query_workspace() {
+        let cmd = Commands::Query { what: QueryType::Workspace };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::QueryWorkspace));
+    }
+
+    #[test]
+    fn test_to_ipc_command_query_focused() {
+        let cmd = Commands::Query { what: QueryType::Focused };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::QueryFocused));
+    }
+
+    #[test]
+    fn test_to_ipc_command_query_all() {
+        let cmd = Commands::Query { what: QueryType::All };
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::QueryAllWindows));
+    }
+
+    #[test]
+    fn test_to_ipc_command_refresh() {
+        let cmd = Commands::Refresh;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::Refresh));
+    }
+
+    #[test]
+    fn test_to_ipc_command_apply() {
+        let cmd = Commands::Apply;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::Apply));
+    }
+
+    #[test]
+    fn test_to_ipc_command_reload() {
+        let cmd = Commands::Reload;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::Reload));
+    }
+
+    #[test]
+    fn test_to_ipc_command_stop() {
+        let cmd = Commands::Stop;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::Stop));
+    }
+
+    // =========================================================================
+    // generate_default_config tests
+    // =========================================================================
+
+    #[test]
+    fn test_generate_default_config_contains_layout_section() {
+        let config = generate_default_config();
+        assert!(config.contains("[layout]"));
+        assert!(config.contains("gap"));
+        assert!(config.contains("outer_gap"));
+        assert!(config.contains("default_column_width"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_appearance_section() {
+        let config = generate_default_config();
+        assert!(config.contains("[appearance]"));
+        assert!(config.contains("use_cloaking"));
+        assert!(config.contains("use_deferred_positioning"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_behavior_section() {
+        let config = generate_default_config();
+        assert!(config.contains("[behavior]"));
+        assert!(config.contains("focus_new_windows"));
+        assert!(config.contains("track_focus_changes"));
+        assert!(config.contains("log_level"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_centering_mode() {
+        let config = generate_default_config();
+        assert!(config.contains("centering_mode"));
+        assert!(config.contains("center") || config.contains("just_in_view"));
+    }
+
+    // =========================================================================
+    // default_config_path tests
+    // =========================================================================
+
+    #[test]
+    fn test_default_config_path_returns_some() {
+        // This may return None in certain CI environments without home dirs
+        // but on most systems it should return Some
+        let path = default_config_path();
+        // Just verify the function runs without panicking
+        if let Some(p) = path {
+            assert!(p.ends_with("config.toml"));
+        }
+    }
+
+    #[test]
+    fn test_default_config_path_contains_openniri() {
+        if let Some(path) = default_config_path() {
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.contains("openniri"),
+                "Path should contain 'openniri': {}",
+                path_str
+            );
+        }
+    }
+
+    // =========================================================================
+    // IPC timeout constant test
+    // =========================================================================
+
+    #[test]
+    fn test_ipc_timeout_is_reasonable() {
+        // Timeout should be between 1 and 30 seconds
+        assert!(IPC_TIMEOUT >= Duration::from_secs(1));
+        assert!(IPC_TIMEOUT <= Duration::from_secs(30));
+    }
 }

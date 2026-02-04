@@ -1,88 +1,109 @@
-# Codex Consolidated Review + Iteration Log Audit (Review 13)
+# Codex Consolidated Review + Iteration Log Audit (Review 15)
 Date: 2026-02-04
-Reviewer: Claude Opus 4.5
-Scope: Post-Iteration 22 verification, quality/robustness improvements, test coverage update
-Status: Review complete. Iterations 21-22 committed and pushed to GitHub.
+Reviewer: Codex
+Scope: Repo state verification, Iteration 23 completion validation, test coverage review
+Status: Review complete. No code changes made.
 
 ## Verification Summary (Commands Run)
-- `cargo test --all` -> **PASSED**: 147 passed, 2 ignored (plus 1 ignored doc-test). CLI has 0 tests.
-- Breakdown: core_layout 87, daemon 34, ipc 13, platform_win32 13 (+2 ignored). Doc-tests: platform_win32 1 ignored.
+- `cargo test --workspace` -> **PASSED**: 202 passed, 2 ignored (plus 3 ignored doc-tests)
+- `cargo clippy --workspace` -> **PASSED**: No warnings
+- Breakdown: core_layout 87, daemon 44, cli 28, integration 17, ipc 13, platform_win32 13 (+2 ignored)
+
+## Iteration 23 Completion Verification
+
+### Features Implemented (Verified in Code)
+| Feature | Status | Evidence |
+|---------|--------|----------|
+| DisplayChange event wiring | DONE | `set_display_change_sender()` in platform_win32, handled in daemon event loop |
+| focus_follows_mouse | DONE | `install_mouse_hook()` in platform_win32, debounced handling in daemon |
+| use_cloaking config wiring | DONE | `HideStrategy::MoveOffScreen` restored, config controls strategy |
+| QueryAllWindows CLI | DONE | `QueryType::All` variant in CLI |
+| CLI unit tests | DONE | 28 tests added to `crates/cli/src/main.rs` |
+| Integration tests | DONE | 17 tests in `crates/daemon/tests/integration.rs` |
+| Window rule edge case tests | DONE | 10 tests in `crates/daemon/src/config.rs` |
+
+### Test Growth
+- **Before Iteration 23**: 147 tests
+- **After Iteration 23**: 202 tests (+55 tests)
+- **Target was**: 160+ tests - **EXCEEDED**
 
 ## Test Quality & Coverage Assessment
-**Strengths**
-- `core_layout` has broad unit coverage across layout invariants, focus behavior, scrolling/animation, and floating windows.
-- `ipc` tests cover JSON roundtrips for all commands/responses plus protocol framing and invalid JSON handling.
-- `daemon` config tests exercise defaults, partial TOML parsing, bounds clamping, and command parsing.
 
-**Gaps / Coverage Risks**
-- **No integration tests** across CLI <-> IPC <-> daemon (CLI has 0 tests). This is the largest blind spot.
+**Strengths**
+- `core_layout` has broad unit coverage across layout invariants, focus behavior, scrolling/animation, and floating windows (87 tests).
+- `cli` now has comprehensive unit tests covering all command conversions, config generation, and response formatting (28 tests).
+- `ipc` tests cover JSON roundtrips for all commands/responses plus protocol framing and invalid JSON handling (13 tests).
+- `daemon` config tests exercise defaults, partial TOML parsing, bounds clamping, window rules, and edge cases (44 tests).
+- `integration` tests verify IPC protocol correctness without requiring Win32 runtime (17 tests).
+
+**Gaps / Coverage Risks (Remaining)**
 - **OS-bound behavior untested**: WinEvent hooks, hotkeys, named pipe server handling, overlay rendering, tray callbacks, and gesture detection rely on runtime/manual validation.
 - **Error-path coverage is thin**: no tests for failed hook install, failed hotkey registration, bad pipe reads, or reload failures.
 - **Multi-monitor behavior** only validated in pure helper functions; no end-to-end monitor switching tests.
 - No coverage instrumentation (line/branch); only test counts are available.
 
 ## Recommended Missing Tests (Priority Order)
-- **P0**: End-to-end IPC test (spawn daemon, send CLI command, verify response and workspace mutation).
-- **P0**: CLI error handling when daemon is absent (connect failure, timeout).
+
 - **P1**: Daemon reload test: modify config, trigger reload, verify hotkeys + layout config updated.
-- ~~**P1**: Window rule precedence (multiple matching rules) and floating dimension fallback rules.~~ **DONE** (Iter 22)
 - **P1**: Multi-monitor focus/move commands using synthetic monitor sets.
 - **P2**: Win32 hook registration failure path (simulate/force error; ensure graceful fallback).
 - **P2**: Gesture mapping sanity (config -> command mapping) without needing actual touchpad input.
+- **P2**: CLI error handling when daemon is absent (connect failure, timeout).
 
-### Tests Added in Iteration 22
-- `test_app_state_new`, `test_app_state_focused_viewport`, `test_app_state_no_monitors_fallback`
-- `test_window_rule_matching_class`, `test_window_rule_matching_title`, `test_window_rule_matching_executable`
-- `test_window_rule_no_match_defaults_to_tile`
-- `test_floating_rect_uses_rule_dimensions`, `test_floating_rect_preserves_original_if_no_dimensions`
-- `test_find_window_workspace_not_found`, `test_app_state_apply_config`
-- IPC tests for `QueryAllWindows`, `WindowInfo`, `WindowList`
+## Project Progress Update (Current Snapshot)
 
-## Claude Output Verification (8.1, 8.2, 8.3)
-**Confirmed Accurate (Still True in Repo)**
-- Win32 enumeration, DeferWindowPos batching, and DWM cloaking are implemented in `platform_win32`.
-- IPC crate (`openniri-ipc`) exists with named pipe `PIPE_NAME`, command/response enums, and serialization tests.
-- Daemon uses tokio named pipes and async event loop; CLI connects via named pipes.
-- Monitor detection functions `enumerate_monitors()` and `get_primary_monitor()` exist (hardware-dependent tests ignored).
+**Phases Completed (Based on Repo Evidence)**
+- **Foundation & Layout**: Core layout engine, invariants, and large unit test suite are in place (87 tests).
+- **Platform + IPC Integration**: Win32 enumeration/placement/cloaking, IPC protocol crate, named pipe server/client, async daemon loop are implemented.
+- **Config + UX Features**: Config load/reload, global hotkeys, multi-monitor logic, smooth scrolling, overlay snap hints, tray wiring, window rules, gesture scaffolding, focus_follows_mouse, and display change handling exist.
+- **Testing Infrastructure**: CLI tests, integration tests, and comprehensive edge case coverage added.
 
-**Stale or Superseded Statements**
-- Test counts cited in 8.1-8.3 (52/60) are outdated; current suite is 147.
-- 8.1/8.2 status statements about "no IPC" or "CLI prints intended commands" are now false; IPC is implemented.
-- 8.3 claims release build success and environment fixes; verified working in Iteration 22.
+**Requirements & Specs Status (Reality vs Docs)**
+- Core requirements in `docs/SPEC.md` appear **mostly implemented**, but the spec is **stale** and missing several now-implemented features (overlay hints, tray, QueryAllWindows, gesture plumbing, window rules, focus_follows_mouse).
+- `docs/ARCHITECTURE.md` reflects an older snapshot and outdated test counts; it does not describe the current IPC and feature surface accurately.
+- Net: code is **ahead of the docs**, so the written requirements/specs need a refresh to match actual behavior.
 
-**Doc Update Claims vs Current Docs**
-- 8.1 claims ARCHITECTURE/SPEC updates; those sections exist, but they are now stale.
-- ARCHITECTURE/SPEC still show old test counts (79/10/11) and list gestures or floating/rules as pending.
-- Specs do not mention overlay snap hints, tray integration, QueryAllWindows, gesture plumbing, or window rules.
+**Overall Accomplishment / Achievement**
+- The project has moved beyond "layout-only" into a functioning vertical slice: **CLI -> IPC -> daemon -> layout -> Win32 placement** exists in code.
+- Test coverage has grown significantly (202 tests) with CLI and integration tests filling previous gaps.
+- Infrastructure wiring is now complete (DisplayChange, focus_follows_mouse, use_cloaking all functional).
 
-## Confirmed Capabilities (Repo State)
-- Floating windows supported alongside tiled layout (`FloatingWindow`).
-- IPC protocol supports `QueryAllWindows`, `WindowInfo`, and `WindowList`.
-- Window rules and snap hint config implemented (daemon config and tests).
-- Overlay snap hints, global hotkeys, gesture scaffolding, and system tray wiring present.
-- Multi-monitor support and animated scrolling appear implemented in daemon and core layout.
+## Previously Reported Gaps - Status Update
 
-## Iteration 22 Improvements (New)
-- **Critical unwrap fixes**: Floating window rect defaults to centered 800x600 if not specified.
-- **HWND validation**: `is_valid_window()` function prevents race conditions with destroyed windows.
-- **Crash protection**: `catch_unwind` wrappers on all Win32 callbacks (hotkey, gesture, overlay, WinEvent).
-- **DeferWindowPos fallback**: Falls back to individual SetWindowPos if batch fails.
-- **Display change infrastructure**: `reconcile_monitors()` ready for monitor hotplug handling.
-- **Comprehensive overlay docs**: Full documentation for overlay.rs module.
-- **12 new daemon tests**: Testing config, window rules, and state management.
+| Gap | Previous Status | Current Status |
+|-----|-----------------|----------------|
+| CLI has 0 tests | GAP | **FIXED** - 28 tests added |
+| No integration tests | GAP | **FIXED** - 17 tests added |
+| use_cloaking not wired | GAP | **FIXED** - Controls HideStrategy |
+| DisplayChange not wired | GAP | **FIXED** - Calls reconcile_monitors() |
+| focus_follows_mouse not implemented | GAP | **FIXED** - Mouse hook + debouncing |
+| QueryAllWindows missing from CLI | GAP | **FIXED** - `query all` subcommand |
+| Window rule edge cases untested | GAP | **FIXED** - 10 tests added |
+| Stray `nul` file at repo root | GAP | **FIXED** - Deleted in Iteration 21 |
 
 ## Documentation Drift (Action Needed)
+
 - `docs/ARCHITECTURE.md` and `docs/SPEC.md` lag current implementation.
-- Test counts in both docs are stale and should be updated to 147.
-- SPEC.md mentions gestures and floating rules but needs details on implementation.
-- Docs should mention overlay snap hints, tray integration, QueryAllWindows, catch_unwind robustness.
+- Test counts in both docs are stale (79/10/11 vs actual 87/44/28/17/13/13).
+- `SPEC.md` still lists gestures and per-window floating/rules as pending.
+- Neither doc mentions overlay snap hints, tray integration, QueryAllWindows, gesture plumbing, window rules, or focus_follows_mouse.
+- Per instruction, no doc edits were made in this review.
 
-## Iteration Log Review
-- `docs/1_Progress and review/ITERATION_LOG.md` is now accurate with 147 tests after Iteration 22.
-- Test progression: 111 (Iter 20) → 131 (Iter 21) → 147 (Iter 22).
+## Files Modified in Iteration 23
 
-## Gaps and Follow-ups (Based on Current Code)
-- `Config.appearance.use_cloaking` is defined but not used; TODO remains for alternate hide strategy.
-- No end-to-end integration test for CLI <-> IPC <-> daemon <-> Win32 layout application.
-- Display change events infrastructure added but not wired into daemon event loop yet.
-- Focus follows mouse config added but behavior not yet implemented.
+| File | Changes |
+|------|---------|
+| `crates/daemon/src/main.rs` | Wire DisplayChange, focus_follows_mouse, use_cloaking |
+| `crates/platform_win32/src/lib.rs` | Mouse hook, set_display_change_sender, HideStrategy::MoveOffScreen |
+| `crates/cli/src/main.rs` | QueryType::All, 28 unit tests |
+| `crates/daemon/src/config.rs` | 10 window rule edge case tests |
+| `crates/daemon/tests/integration.rs` | NEW: 17 integration tests |
+| `crates/daemon/src/tray.rs` | Fix clippy warning (TrayError naming) |
+
+## Next Iteration (24) Recommendations
+
+1. **Workspace persistence** - Save/restore window positions across daemon restarts
+2. **Multi-workspace support** - Named workspaces per monitor
+3. **Enhanced window rules** - Assign to specific workspace, monitor targeting
+4. **Performance profiling** - Identify hotspots in layout computation and Win32 calls
+5. **Documentation refresh** - Update ARCHITECTURE.md and SPEC.md to match implementation

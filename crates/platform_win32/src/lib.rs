@@ -30,12 +30,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DefWindowProcW, DispatchMessageW,
-    EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetMessageW, GetWindowLongW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, PostMessageW, RegisterClassW, SetWindowPos, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-    HWND_MESSAGE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, WM_HOTKEY, WM_USER, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
+    BeginDeferWindowPos, CallNextHookEx, CreateWindowExW, DeferWindowPos, DefWindowProcW,
+    DispatchMessageW, EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetMessageW,
+    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SetWindowPos, SetWindowsHookExW,
+    UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HHOOK, HWND_MESSAGE,
+    MSLLHOOKSTRUCT, MSG, SWP_NOACTIVATE, SWP_NOZORDER, WH_MOUSE_LL, WM_HOTKEY, WM_MOUSEMOVE,
+    WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 
 // WinEvent constants (not all are exposed by windows-rs)
@@ -136,8 +137,9 @@ pub enum HideStrategy {
     /// Use DWM cloaking (preferred, keeps window in Alt-Tab).
     #[default]
     Cloak,
-    // Note: Minimize and MoveOffScreen strategies were considered but removed.
-    // Cloaking is superior because it keeps windows in Alt-Tab and taskbar.
+    /// Move windows off-screen (alternative when cloaking is disabled).
+    /// Windows are moved far off-screen rather than cloaked.
+    MoveOffScreen,
 }
 
 /// Configuration for the Win32 platform layer.
@@ -568,11 +570,29 @@ pub fn apply_placements(
         }
     }
 
-    // Cloak off-screen windows
-    if config.hide_strategy == HideStrategy::Cloak {
-        for placement in &offscreen {
-            if let Err(e) = cloak_window(placement.window_id) {
-                tracing::warn!("Failed to cloak window {}: {}", placement.window_id, e);
+    // Hide off-screen windows based on strategy
+    match config.hide_strategy {
+        HideStrategy::Cloak => {
+            for placement in &offscreen {
+                if let Err(e) = cloak_window(placement.window_id) {
+                    tracing::warn!("Failed to cloak window {}: {}", placement.window_id, e);
+                }
+            }
+        }
+        HideStrategy::MoveOffScreen => {
+            // Move windows far off-screen (don't cloak them)
+            // They remain in Alt-Tab but aren't visible
+            for placement in &offscreen {
+                // Move to far off-screen position
+                let offscreen_placement = WindowPlacement {
+                    window_id: placement.window_id,
+                    rect: Rect::new(-32000, -32000, placement.rect.width, placement.rect.height),
+                    visibility: Visibility::OffScreenLeft,
+                    column_index: placement.column_index,
+                };
+                if let Err(e) = set_window_pos_immediate(&offscreen_placement) {
+                    tracing::warn!("Failed to move window {} off-screen: {}", placement.window_id, e);
+                }
             }
         }
     }
@@ -764,6 +784,8 @@ pub enum WindowEvent {
     MovedOrResized(WindowId),
     /// Display configuration changed (monitors added/removed/rearranged).
     DisplayChange,
+    /// Mouse cursor entered a window (for focus-follows-mouse).
+    MouseEnterWindow(WindowId),
 }
 
 /// Global sender for window events from WinEvent callbacks.
@@ -1014,9 +1036,9 @@ pub struct HotkeyEvent {
 static HOTKEY_SENDER: std::sync::Mutex<Option<mpsc::Sender<HotkeyEvent>>> =
     std::sync::Mutex::new(None);
 
-/// Global sender for display change events.
-/// Uses Mutex to allow re-registration after dropping previous HotkeyHandle.
-static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<()>>> =
+/// Global sender for display change events forwarded to window event channel.
+/// Uses Mutex to allow re-registration after dropping previous EventHookHandle.
+static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
     std::sync::Mutex::new(None);
 
 /// Custom message to signal the hotkey thread to stop.
@@ -1063,11 +1085,26 @@ impl Drop for HotkeyHandle {
             let _ = thread.join();
         }
 
-        // Clear the global sender to allow re-registration
+        // Clear the global senders to allow re-registration
         if let Ok(mut sender) = HOTKEY_SENDER.lock() {
             *sender = None;
         }
+        if let Ok(mut sender) = DISPLAY_CHANGE_SENDER.lock() {
+            *sender = None;
+        }
     }
+}
+
+/// Register a sender for display change events.
+///
+/// This allows the hotkey window to forward WM_DISPLAYCHANGE messages
+/// to the window event channel. Call this before `register_hotkeys`.
+pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
+    let mut guard = DISPLAY_CHANGE_SENDER
+        .lock()
+        .map_err(|_| Win32Error::HookInstallFailed("Display change sender mutex poisoned".to_string()))?;
+    *guard = Some(sender);
+    Ok(())
 }
 
 /// Register global hotkeys and start listening for them.
@@ -1248,12 +1285,12 @@ fn hotkey_window_proc_inner(
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
-            tracing::info!("Display configuration changed");
+            tracing::info!("Display configuration changed (WM_DISPLAYCHANGE)");
 
-            // Send display change event through channel
+            // Send display change event through window event channel
             if let Ok(sender_guard) = DISPLAY_CHANGE_SENDER.lock() {
                 if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.send(());
+                    let _ = sender.send(WindowEvent::DisplayChange);
                 }
             }
 
@@ -1680,6 +1717,125 @@ fn gesture_window_proc_inner(
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+// ============================================================================
+// Focus Follows Mouse (Low-Level Mouse Hook)
+// ============================================================================
+
+/// Global sender for mouse enter events.
+static MOUSE_EVENT_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
+    std::sync::Mutex::new(None);
+
+/// Track the window the mouse is currently over.
+static CURRENT_MOUSE_WINDOW: std::sync::Mutex<Option<WindowId>> = std::sync::Mutex::new(None);
+
+/// Handle for the low-level mouse hook.
+///
+/// Dropping this handle will unhook the mouse hook.
+pub struct MouseHookHandle {
+    hook: HHOOK,
+}
+
+impl Drop for MouseHookHandle {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.hook.is_invalid() {
+                let _ = UnhookWindowsHookEx(self.hook);
+            }
+        }
+        tracing::debug!("Mouse hook uninstalled");
+
+        // Clear the global sender
+        if let Ok(mut sender) = MOUSE_EVENT_SENDER.lock() {
+            *sender = None;
+        }
+    }
+}
+
+/// Install a low-level mouse hook for focus-follows-mouse functionality.
+///
+/// Returns a handle that must be kept alive to receive mouse events,
+/// and registers the given sender to receive MouseEnterWindow events.
+///
+/// # Arguments
+/// * `event_sender` - Sender for WindowEvent (specifically MouseEnterWindow)
+pub fn install_mouse_hook(
+    event_sender: mpsc::Sender<WindowEvent>,
+) -> Result<MouseHookHandle, Win32Error> {
+    // Store sender globally
+    {
+        let mut sender = MOUSE_EVENT_SENDER
+            .lock()
+            .map_err(|_| Win32Error::HookInstallFailed("Mouse sender mutex poisoned".to_string()))?;
+        if sender.is_some() {
+            return Err(Win32Error::HookInstallFailed(
+                "Mouse sender already initialized - drop existing MouseHookHandle first".to_string(),
+            ));
+        }
+        *sender = Some(event_sender);
+    }
+
+    // Install low-level mouse hook
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(mouse_ll_hook_proc),
+            None,
+            0,
+        )
+        .map_err(|e| Win32Error::HookInstallFailed(format!("SetWindowsHookExW failed: {}", e)))?
+    };
+
+    tracing::info!("Low-level mouse hook installed for focus-follows-mouse");
+
+    Ok(MouseHookHandle { hook })
+}
+
+/// Low-level mouse hook callback.
+///
+/// Tracks mouse movement and sends MouseEnterWindow events when the cursor
+/// enters a different window.
+unsafe extern "system" fn mouse_ll_hook_proc(
+    ncode: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    // If ncode < 0, we must call CallNextHookEx without processing
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+
+    // Only process mouse move events
+    if wparam.0 as u32 == WM_MOUSEMOVE {
+        // Get the mouse position from the hook struct
+        let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let point = mouse_struct.pt;
+
+        // Find the window at the cursor position
+        let hwnd = WindowFromPoint(point);
+
+        if !hwnd.is_invalid() {
+            let window_id = hwnd.0 as WindowId;
+
+            // Check if this is a different window than before
+            if let Ok(mut current) = CURRENT_MOUSE_WINDOW.lock() {
+                if *current != Some(window_id) {
+                    *current = Some(window_id);
+
+                    // Send MouseEnterWindow event
+                    if let Ok(sender_guard) = MOUSE_EVENT_SENDER.lock() {
+                        if let Some(sender) = sender_guard.as_ref() {
+                            let _ = sender.send(WindowEvent::MouseEnterWindow(window_id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Always call next hook in the chain
+    CallNextHookEx(None, ncode, wparam, lparam)
 }
 
 #[cfg(test)]

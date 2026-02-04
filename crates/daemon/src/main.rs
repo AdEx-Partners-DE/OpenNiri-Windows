@@ -19,9 +19,10 @@ use openniri_core_layout::{Rect, Workspace};
 use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
 use openniri_platform_win32::{
     enumerate_monitors, enumerate_windows, find_monitor_for_rect, get_process_executable,
-    install_event_hooks, monitor_to_left, monitor_to_right, overlay::OverlayWindow,
-    parse_hotkey_string, register_gestures, register_hotkeys, GestureEvent, Hotkey, HotkeyEvent,
-    HotkeyId, MonitorId, MonitorInfo, PlatformConfig, WindowEvent,
+    install_event_hooks, install_mouse_hook, monitor_to_left, monitor_to_right,
+    overlay::OverlayWindow, parse_hotkey_string, register_gestures, register_hotkeys,
+    set_display_change_sender, GestureEvent, Hotkey, HotkeyEvent, HotkeyId, MonitorId,
+    MonitorInfo, PlatformConfig, WindowEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,6 +51,8 @@ enum DaemonEvent {
     AnimationTick,
     /// Hide snap hint overlay after timeout.
     HideSnapHint,
+    /// Apply focus-follows-mouse focus after delay.
+    FocusFollowsMouse { window_id: u64 },
     /// Shutdown signal.
     Shutdown,
 }
@@ -104,9 +107,12 @@ impl AppState {
             // If map is empty, focused_monitor stays 0; focused_workspace() returns None
         }
 
-        // TODO: Implement MoveOffscreen as alternative hide strategy when use_cloaking is false
         let platform_config = PlatformConfig {
-            hide_strategy: openniri_platform_win32::HideStrategy::Cloak,
+            hide_strategy: if config.appearance.use_cloaking {
+                openniri_platform_win32::HideStrategy::Cloak
+            } else {
+                openniri_platform_win32::HideStrategy::MoveOffScreen
+            },
             use_deferred_positioning: config.appearance.use_deferred_positioning,
         };
 
@@ -146,6 +152,11 @@ impl AppState {
             workspace.set_centering_mode(config.layout.centering_mode.into());
         }
         self.platform_config.use_deferred_positioning = config.appearance.use_deferred_positioning;
+        self.platform_config.hide_strategy = if config.appearance.use_cloaking {
+            openniri_platform_win32::HideStrategy::Cloak
+        } else {
+            openniri_platform_win32::HideStrategy::MoveOffScreen
+        };
         self.config = config;
         info!("Configuration applied to all {} workspaces", self.workspaces.len());
     }
@@ -155,7 +166,6 @@ impl AppState {
     /// This handles:
     /// - Removing workspaces for disconnected monitors (migrating windows to primary)
     /// - Adding workspaces for newly connected monitors
-    #[allow(dead_code)] // Infrastructure for display change handling (future use)
     fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
         let new_ids: HashSet<MonitorId> =
             new_monitors.iter().map(|m| m.id).collect();
@@ -763,12 +773,12 @@ impl AppState {
 
     /// Handle a window lifecycle event.
     fn handle_window_event(&mut self, event: WindowEvent) {
-        // Get window_id from event for validation (DisplayChange has no window ID)
+        // Get window_id from event for validation (DisplayChange and MouseEnterWindow have no validation needed)
         let window_id = match &event {
             WindowEvent::Created(id) | WindowEvent::Destroyed(id) |
             WindowEvent::Focused(id) | WindowEvent::Minimized(id) |
             WindowEvent::Restored(id) | WindowEvent::MovedOrResized(id) => Some(*id),
-            WindowEvent::DisplayChange => None,
+            WindowEvent::DisplayChange | WindowEvent::MouseEnterWindow(_) => None,
         };
 
         // Skip Destroyed events validation (window is already gone)
@@ -946,11 +956,73 @@ impl AppState {
             }
             WindowEvent::DisplayChange => {
                 // Display configuration changed (monitors added/removed/rearranged)
-                // This is handled by Phase 2 robustness code
-                info!("Display configuration changed");
-                // TODO: Re-enumerate monitors and redistribute workspaces
+                info!("Display configuration changed - reconciling monitors");
+
+                // Re-enumerate monitors
+                match enumerate_monitors() {
+                    Ok(new_monitors) if !new_monitors.is_empty() => {
+                        info!("Detected {} monitor(s) after display change", new_monitors.len());
+                        for m in &new_monitors {
+                            info!(
+                                "  Monitor {}: {}x{} at ({},{}){} \"{}\"",
+                                m.id,
+                                m.work_area.width,
+                                m.work_area.height,
+                                m.work_area.x,
+                                m.work_area.y,
+                                if m.is_primary { " [PRIMARY]" } else { "" },
+                                m.device_name
+                            );
+                        }
+
+                        // Reconcile workspaces with new monitor configuration
+                        self.reconcile_monitors(new_monitors);
+
+                        // Re-apply layout with updated monitor configuration
+                        if let Err(e) = self.apply_layout() {
+                            warn!("Failed to apply layout after display change: {}", e);
+                        }
+                    }
+                    Ok(_) => {
+                        warn!("No monitors found after display change");
+                    }
+                    Err(e) => {
+                        warn!("Failed to enumerate monitors after display change: {}", e);
+                    }
+                }
+            }
+            WindowEvent::MouseEnterWindow(_hwnd) => {
+                // This is handled by the main event loop with debouncing
+                // (focus_follows_mouse delay)
             }
         }
+    }
+
+    /// Apply focus to a window for focus-follows-mouse.
+    /// Returns true if focus was applied, false if the window isn't managed.
+    fn apply_focus_follows_mouse(&mut self, hwnd: u64) -> bool {
+        if let Some(monitor_id) = self.find_window_workspace(hwnd) {
+            // Update focused monitor to match the window's monitor
+            self.focused_monitor = monitor_id;
+
+            let viewport_width = self.monitors.get(&monitor_id)
+                .map(|m| m.work_area.width)
+                .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+
+            if let Some(workspace) = self.workspaces.get_mut(&monitor_id) {
+                if let Err(e) = workspace.focus_window(hwnd) {
+                    debug!("Failed to focus window {} for focus-follows-mouse: {}", hwnd, e);
+                    return false;
+                }
+                debug!("Focus-follows-mouse: focused window {} on monitor {}", hwnd, monitor_id);
+                workspace.ensure_focused_visible_animated(viewport_width);
+                if let Err(e) = self.apply_layout() {
+                    warn!("Failed to apply layout after focus-follows-mouse: {}", e);
+                }
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1270,8 +1342,57 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Register display change sender for WM_DISPLAYCHANGE events
+    // This allows the hotkey window to forward display changes to our event loop
+    {
+        let (display_tx, display_rx) = std::sync::mpsc::channel::<WindowEvent>();
+        if let Err(e) = set_display_change_sender(display_tx) {
+            warn!("Failed to register display change sender: {}. Display changes may not be detected.", e);
+        } else {
+            // Forward display change events to the daemon event loop
+            let display_event_tx = event_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(event) = display_rx.recv() {
+                    if display_event_tx.blocking_send(DaemonEvent::WindowEvent(event)).is_err() {
+                        break;
+                    }
+                }
+            });
+            info!("Display change detection enabled");
+        }
+    }
+
     // Register global hotkeys (mutable to support reload)
     let mut hotkey_state = setup_hotkeys(&config, event_tx.clone());
+
+    // Install mouse hook for focus-follows-mouse (if enabled)
+    let _mouse_hook_handle = if config.behavior.focus_follows_mouse {
+        let (mouse_tx, mouse_rx) = std::sync::mpsc::channel::<WindowEvent>();
+        match install_mouse_hook(mouse_tx) {
+            Ok(handle) => {
+                info!("Focus-follows-mouse enabled (delay: {}ms)", config.behavior.focus_follows_mouse_delay_ms);
+
+                // Forward mouse events to the daemon event loop
+                let mouse_event_tx = event_tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(event) = mouse_rx.recv() {
+                        if mouse_event_tx.blocking_send(DaemonEvent::WindowEvent(event)).is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("Failed to install mouse hook: {}. Focus-follows-mouse disabled.", e);
+                None
+            }
+        }
+    } else {
+        info!("Focus-follows-mouse disabled by config (focus_follows_mouse = false)");
+        None
+    };
 
     // Register gesture detection (if enabled)
     let _gesture_handle = if config.gestures.enabled {
@@ -1360,6 +1481,9 @@ async fn main() -> Result<()> {
 
     // Snap hint timer handle - cancels pending hide operation when new hint is shown
     let mut snap_hint_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Focus-follows-mouse timer handle - debounces rapid mouse movements
+    let mut focus_follows_mouse_timer: Option<tokio::task::JoinHandle<()>> = None;
 
     // Helper function to start animation timer if not already running
     fn start_animation_timer(
@@ -1458,8 +1582,34 @@ async fn main() -> Result<()> {
                 }
             }
             DaemonEvent::WindowEvent(win_event) => {
-                let mut state = state.lock().await;
-                state.handle_window_event(win_event);
+                // Handle MouseEnterWindow specially for focus-follows-mouse debouncing
+                if let WindowEvent::MouseEnterWindow(hwnd) = win_event {
+                    let (enabled, delay_ms) = {
+                        let state = state.lock().await;
+                        (
+                            state.config.behavior.focus_follows_mouse,
+                            state.config.behavior.focus_follows_mouse_delay_ms,
+                        )
+                    };
+
+                    if enabled {
+                        // Cancel any pending focus timer
+                        if let Some(handle) = focus_follows_mouse_timer.take() {
+                            handle.abort();
+                        }
+
+                        // Schedule focus after delay (debouncing)
+                        let focus_tx = event_tx.clone();
+                        let delay = delay_ms;
+                        focus_follows_mouse_timer = Some(tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                            let _ = focus_tx.send(DaemonEvent::FocusFollowsMouse { window_id: hwnd }).await;
+                        }));
+                    }
+                } else {
+                    let mut state = state.lock().await;
+                    state.handle_window_event(win_event);
+                }
             }
             DaemonEvent::Hotkey(hotkey_event) => {
                 let (should_animate, is_resize, column_rect, hint_duration) = if let Some(cmd) = hotkey_state.mapping.get(&hotkey_event.id) {
@@ -1615,6 +1765,25 @@ async fn main() -> Result<()> {
                     debug!("Snap hint hidden");
                 }
             }
+            DaemonEvent::FocusFollowsMouse { window_id } => {
+                let should_animate = {
+                    let mut state = state.lock().await;
+                    let applied = state.apply_focus_follows_mouse(window_id);
+                    if applied {
+                        state.is_animating()
+                    } else {
+                        false
+                    }
+                };
+
+                // Start animation timer if needed
+                if should_animate && !animation_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    animation_timer_handle = Some(start_animation_timer(
+                        event_tx.clone(),
+                        animation_running.clone(),
+                    ));
+                }
+            }
             DaemonEvent::Shutdown => {
                 info!("Shutdown signal received");
                 break;
@@ -1627,6 +1796,9 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     if let Some(handle) = snap_hint_timer_handle {
+        handle.abort();
+    }
+    if let Some(handle) = focus_follows_mouse_timer {
         handle.abort();
     }
 
