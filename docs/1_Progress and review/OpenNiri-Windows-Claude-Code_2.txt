@@ -1,0 +1,764 @@
+
+╭─── Claude Code v2.1.29 ─────────────────────────────────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started                                      │
+│           Welcome back Stark!           │ Run /init to create a CLAUDE.md file with instructions for C… │
+│                                         │ ───────────────────────────────────────────────────────────── │
+│                                         │ Recent activity                                               │
+│                 ▐▛███▜▌                 │ No recent activity                                            │
+│                ▝▜█████▛▘                │                                                               │
+│                  ▘▘ ▝▝                  │                                                               │
+│   Opus 4.5 · Claude Max · Stark Burns   │                                                               │
+│         C:\dev\OpenNiri-Windows         │                                                               │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                                                       │
+│                                                                                                         │
+│ Code Review Fixes - OpenNiri Core Layout Engine                                                         │
+│                                                                                                         │
+│ Summary                                                                                                 │
+│                                                                                                         │
+│ Address findings from CLAUDE_REVIEW.md code review (Cycle 1). Fix correctness bugs, add missing tests,  │
+│ and improve robustness.                                                                                 │
+│                                                                                                         │
+│ Design Decisions (Confirmed by User)                                                                    │
+│ ┌──────────────────────────┬───────────────────────────────────────────┐                                │
+│ │         Decision         │                  Choice                   │                                │
+│ ├──────────────────────────┼───────────────────────────────────────────┤                                │
+│ │ Empty workspace allowed? │ Yes - remove last column, reset indices   │                                │
+│ ├──────────────────────────┼───────────────────────────────────────────┤                                │
+│ │ Gap settings             │ Keep unified outer_gap (no split)         │                                │
+│ ├──────────────────────────┼───────────────────────────────────────────┤                                │
+│ │ Dimension validation     │ Validate at insertion - clamp to minimums │                                │
+│ └──────────────────────────┴───────────────────────────────────────────┘                                │
+│ ---                                                                                                     │
+│ Findings to Address                                                                                     │
+│                                                                                                         │
+│ Finding #1: Empty Column Invariant [HIGH]                                                               │
+│                                                                                                         │
+│ Problem: remove_window leaves an empty column when removing the last window from the last column.       │
+│ Causes inconsistent state.                                                                              │
+│                                                                                                         │
+│ Location: crates/core_layout/src/lib.rs:266-287                                                         │
+│                                                                                                         │
+│ Fix:                                                                                                    │
+│ 1. When last window is removed from last column, remove that column too                                 │
+│ 2. Reset focused_column and focused_window_in_column to 0                                               │
+│ 3. is_empty() will correctly return true                                                                │
+│ 4. Remove unused CannotRemoveLastColumn error variant (not needed with "allow empty" decision)          │
+│                                                                                                         │
+│ Code Change:                                                                                            │
+│ // In remove_window(), change this:                                                                     │
+│ if column.is_empty() && self.columns.len() > 1 {                                                        │
+│     self.columns.remove(col_idx);                                                                       │
+│     // ...                                                                                              │
+│ }                                                                                                       │
+│                                                                                                         │
+│ // To this:                                                                                             │
+│ if column.is_empty() {                                                                                  │
+│     self.columns.remove(col_idx);                                                                       │
+│     if self.columns.is_empty() {                                                                        │
+│         // Workspace is now empty                                                                       │
+│         self.focused_column = 0;                                                                        │
+│         self.focused_window_in_column = 0;                                                              │
+│         self.scroll_offset = 0.0;                                                                       │
+│     } else if self.focused_column >= self.columns.len() {                                               │
+│         self.focused_column = self.columns.len() - 1;                                                   │
+│     } else if self.focused_column > col_idx {                                                           │
+│         self.focused_column -= 1;                                                                       │
+│     }                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #2: Negative Heights in compute_placements [HIGH]                                               │
+│                                                                                                         │
+│ Problem: When viewport is too small or too many stacked windows, usable_height - window_gaps can go     │
+│ negative, producing invalid rects.                                                                      │
+│                                                                                                         │
+│ Location: crates/core_layout/src/lib.rs:432-454                                                         │
+│                                                                                                         │
+│ Fix:                                                                                                    │
+│ 1. Clamp usable_height to >= 0                                                                          │
+│ 2. Clamp per-window window_height to >= 0                                                               │
+│ 3. Clamp final height for last window to >= 0                                                           │
+│                                                                                                         │
+│ Code Change:                                                                                            │
+│ // Clamp usable_height                                                                                  │
+│ let usable_height = (viewport.height - self.outer_gap * 2).max(0);                                      │
+│                                                                                                         │
+│ // Clamp window_height                                                                                  │
+│ let window_height = if window_count > 0 {                                                               │
+│     ((usable_height - window_gaps).max(0)) / window_count                                               │
+│ } else {                                                                                                │
+│     0                                                                                                   │
+│ };                                                                                                      │
+│                                                                                                         │
+│ // Clamp final height                                                                                   │
+│ let height = if win_idx == column.windows.len() - 1 {                                                   │
+│     (viewport.y + viewport.height - self.outer_gap - current_y).max(0)                                  │
+│ } else {                                                                                                │
+│     window_height                                                                                       │
+│ };                                                                                                      │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #3: scroll_offset Truncation Jitter [MEDIUM]                                                    │
+│                                                                                                         │
+│ Problem: scroll_offset is f64 but truncated to i32 via as i32, causing fractional values to be lost.    │
+│ Smooth scrolling will "stick" until a full pixel accumulates.                                           │
+│                                                                                                         │
+│ Location: crates/core_layout/src/lib.rs:410-421                                                         │
+│                                                                                                         │
+│ Fix: Use consistent rounding (.round() as i32) instead of truncation at render time. Document that      │
+│ sub-pixel precision is preserved internally.                                                            │
+│                                                                                                         │
+│ Code Change:                                                                                            │
+│ // In compute_placements():                                                                             │
+│ let viewport_left = self.scroll_offset.round() as i32;  // Was: self.scroll_offset as i32               │
+│                                                                                                         │
+│ // In ensure_focused_visible():                                                                         │
+│ let viewport_left = self.scroll_offset.round() as i32;  // Was: self.scroll_offset as i32               │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #4: Unused Error Variants [LOW]                                                                 │
+│                                                                                                         │
+│ Problem: CannotRemoveLastColumn and EmptyColumn are never emitted.                                      │
+│                                                                                                         │
+│ Fix:                                                                                                    │
+│ - Remove CannotRemoveLastColumn (not needed - we allow empty workspace)                                 │
+│ - Keep EmptyColumn for potential future use OR remove it                                                │
+│ - Decision: Remove both for now (YAGNI), can add back later                                             │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #5: Validate at Insertion Time [NEW - per user decision]                                        │
+│                                                                                                         │
+│ Problem: Invalid column widths (zero/negative) could be inserted.                                       │
+│                                                                                                         │
+│ Fix: Clamp column width to minimum (100px) in insert_window() and Column::new().                        │
+│                                                                                                         │
+│ Code Change:                                                                                            │
+│ const MIN_COLUMN_WIDTH: i32 = 100;                                                                      │
+│                                                                                                         │
+│ impl Column {                                                                                           │
+│     pub fn new(window_id: WindowId, width: i32) -> Self {                                               │
+│         Self {                                                                                          │
+│             width: width.max(MIN_COLUMN_WIDTH),                                                         │
+│             windows: vec![window_id],                                                                   │
+│         }                                                                                               │
+│     }                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ // In insert_window():                                                                                  │
+│ let column_width = width.unwrap_or(self.default_column_width).max(MIN_COLUMN_WIDTH);                    │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ New Tests to Add                                                                                        │
+│                                                                                                         │
+│ Test 1: Remove last window (empty workspace)                                                            │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_remove_last_window_empties_workspace() {                                                        │
+│     let mut ws = Workspace::new();                                                                      │
+│     ws.insert_window(1, Some(400));                                                                     │
+│                                                                                                         │
+│     ws.remove_window(1).unwrap();                                                                       │
+│                                                                                                         │
+│     assert!(ws.is_empty());                                                                             │
+│     assert_eq!(ws.column_count(), 0);                                                                   │
+│     assert_eq!(ws.focused_column, 0);                                                                   │
+│     assert_eq!(ws.focused_window_in_column, 0);                                                         │
+│     assert_eq!(ws.scroll_offset, 0.0);                                                                  │
+│ }                                                                                                       │
+│                                                                                                         │
+│ Test 2: JustInView centering mode                                                                       │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_ensure_focused_visible_just_in_view() {                                                         │
+│     let mut ws = Workspace::with_gaps(10, 10);                                                          │
+│     ws.centering_mode = CenteringMode::JustInView;                                                      │
+│                                                                                                         │
+│     ws.insert_window(1, Some(200));  // x: 10-210                                                       │
+│     ws.insert_window(2, Some(200));  // x: 220-420                                                      │
+│     ws.insert_window(3, Some(200));  // x: 430-630                                                      │
+│                                                                                                         │
+│     ws.focused_column = 0;                                                                              │
+│     ws.scroll_offset = 0.0;                                                                             │
+│                                                                                                         │
+│     // Column 0 is already in view - should NOT scroll                                                  │
+│     ws.ensure_focused_visible(500);                                                                     │
+│     assert_eq!(ws.scroll_offset, 0.0);                                                                  │
+│                                                                                                         │
+│     // Focus column 2, which is partially out of view                                                   │
+│     ws.focused_column = 2;                                                                              │
+│     ws.ensure_focused_visible(500);                                                                     │
+│     // Should scroll just enough to bring column 2 into view                                            │
+│     assert!(ws.scroll_offset > 0.0);                                                                    │
+│ }                                                                                                       │
+│                                                                                                         │
+│ Test 3: Tight viewport (negative height clamping)                                                       │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_compute_placements_tight_viewport() {                                                           │
+│     let mut ws = Workspace::with_gaps(10, 50); // Large outer_gap                                       │
+│     ws.insert_window(1, Some(400));                                                                     │
+│     ws.insert_window_in_column(2, 0).unwrap();                                                          │
+│     ws.insert_window_in_column(3, 0).unwrap();                                                          │
+│                                                                                                         │
+│     // Viewport smaller than outer_gaps * 2                                                             │
+│     let viewport = Rect::new(0, 0, 500, 80); // Only 80px tall                                          │
+│     let placements = ws.compute_placements(viewport);                                                   │
+│                                                                                                         │
+│     // All heights should be >= 0                                                                       │
+│     for p in &placements {                                                                              │
+│         assert!(p.rect.height >= 0, "Height was negative: {}", p.rect.height);                          │
+│     }                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ Test 4: Invalid column width clamping                                                                   │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_insert_window_clamps_width() {                                                                  │
+│     let mut ws = Workspace::new();                                                                      │
+│                                                                                                         │
+│     // Try to insert with zero width                                                                    │
+│     ws.insert_window(1, Some(0));                                                                       │
+│     assert_eq!(ws.columns[0].width, 100); // Clamped to minimum                                         │
+│                                                                                                         │
+│     // Try to insert with negative width                                                                │
+│     ws.insert_window(2, Some(-50));                                                                     │
+│     assert_eq!(ws.columns[1].width, 100); // Clamped to minimum                                         │
+│ }                                                                                                       │
+│                                                                                                         │
+│ Test 5: Fractional scroll offset rounding                                                               │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_scroll_offset_rounding() {                                                                      │
+│     let mut ws = Workspace::with_gaps(10, 10);                                                          │
+│     ws.insert_window(1, Some(400));                                                                     │
+│     ws.insert_window(2, Some(400));                                                                     │
+│                                                                                                         │
+│     // Set fractional scroll offset                                                                     │
+│     ws.scroll_offset = 100.7;                                                                           │
+│                                                                                                         │
+│     let viewport = Rect::new(0, 0, 500, 600);                                                           │
+│     let placements = ws.compute_placements(viewport);                                                   │
+│                                                                                                         │
+│     // Verify placements use rounded value (101, not truncated 100)                                     │
+│     // The first column at x=10 should be at screen x = 10 - 101 + 0 = -91                              │
+│     assert_eq!(placements[0].rect.x, -91);                                                              │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Files to Modify                                                                                         │
+│ ┌───────────────────────────────┬─────────────────────────────────────────────────────────┐             │
+│ │             File              │                         Changes                         │             │
+│ ├───────────────────────────────┼─────────────────────────────────────────────────────────┤             │
+│ │ crates/core_layout/src/lib.rs │ Fix bugs, add constant, remove unused errors, add tests │             │
+│ └───────────────────────────────┴─────────────────────────────────────────────────────────┘             │
+│ ---                                                                                                     │
+│ Implementation Order                                                                                    │
+│                                                                                                         │
+│ 1. Add MIN_COLUMN_WIDTH constant                                                                        │
+│ 2. Fix Column::new() to clamp width                                                                     │
+│ 3. Fix insert_window() to clamp width                                                                   │
+│ 4. Fix remove_window() for empty workspace case                                                         │
+│ 5. Fix compute_placements() to clamp heights                                                            │
+│ 6. Fix scroll_offset truncation → rounding                                                              │
+│ 7. Remove unused error variants                                                                         │
+│ 8. Add all 5 new tests                                                                                  │
+│ 9. Run cargo test to verify                                                                             │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Verification                                                                                            │
+│                                                                                                         │
+│ 1. cargo test -p openniri-core-layout - All tests pass                                                  │
+│ 2. New tests specifically cover:                                                                        │
+│   - Empty workspace after last window removal                                                           │
+│   - JustInView centering mode                                                                           │
+│   - Negative height clamping                                                                            │
+│   - Width validation at insertion                                                                       │
+│   - Scroll offset rounding behavior                                                                     │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+● I'll implement the code review fixes for the OpenNiri Core Layout Engine. Let me start by reading the
+  current source file to understand the exact code structure.
+
+● Read 1 file (ctrl+o to expand)
+
+● Now I have a clear picture of the code. Let me implement all the fixes in order. I'll start by creating
+  the task list and then implement the changes.
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines
+      10  use serde::{Deserialize, Serialize};
+      11  use thiserror::Error;
+      12
+      13 +/// Minimum width for columns in pixels.
+      14 +const MIN_COLUMN_WIDTH: i32 = 100;
+      15 +
+      16  /// Unique identifier for a window.
+      17  /// On Windows, this will typically be the HWND cast to u64.
+      18  pub type WindowId = u64;
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 1 line
+      105
+      106  impl Column {
+      107      /// Create a new column with a single window.
+      108 +    /// Width is clamped to MIN_COLUMN_WIDTH (100px) minimum.
+      109      pub fn new(window_id: WindowId, width: i32) -> Self {
+      110          Self {
+      110 -            width,
+      111 +            width: width.max(MIN_COLUMN_WIDTH),
+      112              windows: vec![window_id],
+      113          }
+      114      }
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 1 line
+      114      }
+      115
+      116      /// Create an empty column with specified width.
+      117 +    /// Width is clamped to MIN_COLUMN_WIDTH (100px) minimum.
+      118      pub fn empty(width: i32) -> Self {
+      119          Self {
+      119 -            width,
+      120 +            width: width.max(MIN_COLUMN_WIDTH),
+      121              windows: Vec::new(),
+      122          }
+      123      }
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 1 line
+      235      }
+      236
+      237      /// Insert a new window as a new column to the right of the focused column.
+      238 +    /// Column width is clamped to MIN_COLUMN_WIDTH (100px) minimum.
+      239      pub fn insert_window(&mut self, window_id: WindowId, width: Option<i32>) {
+      239 -        let column_width = width.unwrap_or(self.default_column_width);
+      240 +        let column_width = width.unwrap_or(self.default_column_width).max(MIN_COLUMN_WIDT
+          +H);
+      241          let new_column = Column::new(window_id, column_width);
+      242
+      243          if self.columns.is_empty() {
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 19 lines, removed 12 lines
+      270      }
+      271
+      272      /// Remove a window from the workspace.
+      273 +    /// If removing the last window from a column, the column is removed.
+      274 +    /// If removing the last column, the workspace becomes empty.
+      275      pub fn remove_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
+      276          for (col_idx, column) in self.columns.iter_mut().enumerate() {
+      277              if column.remove_window(window_id) {
+      276 -                // If column is now empty, remove it (unless it's the last column)
+      277 -                if column.is_empty() && self.columns.len() > 1 {
+      278 +                // If column is now empty, remove it
+      279 +                if column.is_empty() {
+      280                      self.columns.remove(col_idx);
+      279 -                    // Adjust focused column if needed
+      280 -                    if self.focused_column >= self.columns.len() {
+      281 -                        self.focused_column = self.columns.len().saturating_sub(1);
+      281 +                    if self.columns.is_empty() {
+      282 +                        // Workspace is now empty - reset all state
+      283 +                        self.focused_column = 0;
+      284 +                        self.focused_window_in_column = 0;
+      285 +                        self.scroll_offset = 0.0;
+      286 +                    } else if self.focused_column >= self.columns.len() {
+      287 +                        self.focused_column = self.columns.len() - 1;
+      288                      } else if self.focused_column > col_idx {
+      283 -                        self.focused_column = self.focused_column.saturating_sub(1);
+      289 +                        self.focused_column -= 1;
+      290                      }
+      285 -                }
+      286 -                // Adjust focused window in column if needed
+      287 -                if col_idx == self.focused_column {
+      288 -                    let col_len = self.columns.get(self.focused_column).map_or(0, |c| c.l
+          -en());
+      289 -                    if self.focused_window_in_column >= col_len {
+      290 -                        self.focused_window_in_column = col_len.saturating_sub(1);
+      291 +                } else {
+      292 +                    // Adjust focused window in column if needed
+      293 +                    if col_idx == self.focused_column {
+      294 +                        let col_len = self.columns[self.focused_column].len();
+      295 +                        if self.focused_window_in_column >= col_len {
+      296 +                            self.focused_window_in_column = col_len.saturating_sub(1);
+      297 +                        }
+      298                      }
+      299                  }
+      300                  return Ok(());
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 6 lines, removed 3 lines
+      443              };
+      444
+      445              // Calculate window heights (equal split for stacked windows)
+      446 -            let usable_height = viewport.height - self.outer_gap * 2;
+      446 +            // Clamp usable_height to >= 0 to handle tight viewports
+      447 +            let usable_height = (viewport.height - self.outer_gap * 2).max(0);
+      448              let window_count = column.windows.len() as i32;
+      449              let window_gaps = if window_count > 1 {
+      450                  self.gap * (window_count - 1)
+      451              } else {
+      452                  0
+      453              };
+      454 +            // Clamp window_height to >= 0 to prevent negative dimensions
+      455              let window_height = if window_count > 0 {
+      454 -                (usable_height - window_gaps) / window_count
+      456 +                ((usable_height - window_gaps).max(0)) / window_count
+      457              } else {
+      458                  0
+      459              };
+     ...
+      462
+      463              for (win_idx, &window_id) in column.windows.iter().enumerate() {
+      464                  // Adjust height for last window to handle rounding
+      465 +                // Clamp to >= 0 to prevent negative dimensions
+      466                  let height = if win_idx == column.windows.len() - 1 {
+      464 -                    viewport.y + viewport.height - self.outer_gap - current_y
+      467 +                    (viewport.y + viewport.height - self.outer_gap - current_y).max(0)
+      468                  } else {
+      469                      window_height
+      470                  };
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 1 line
+      420              return placements;
+      421          }
+      422
+      423 -        let viewport_left = self.scroll_offset as i32;
+      423 +        // Use rounding instead of truncation to prevent sub-pixel jitter
+      424 +        let viewport_left = self.scroll_offset.round() as i32;
+      425          let viewport_right = viewport_left + viewport.width;
+      426
+      427          let mut current_x = self.outer_gap;
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 1 line
+      390              }
+      391              CenteringMode::JustInView => {
+      392                  // Only scroll if the focused column is outside the viewport
+      393 -                let viewport_left = self.scroll_offset as i32;
+      393 +                // Use rounding instead of truncation for consistent behavior
+      394 +                let viewport_left = self.scroll_offset.round() as i32;
+      395                  let viewport_right = viewport_left + viewport_width;
+      396
+      397                  if col_x < viewport_left {
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Removed 6 lines
+      25
+      26      #[error("Window {0} not found in workspace")]
+      27      WindowNotFound(WindowId),
+      28 -
+      29 -    #[error("Cannot remove the last column")]
+      30 -    CannotRemoveLastColumn,
+      31 -
+      32 -    #[error("Column is empty")]
+      33 -    EmptyColumn,
+      28  }
+      29
+      30  /// A rectangle in screen coordinates (pixels).
+
+● Now let me read the end of the file to see the test section and add the new tests.
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 86 lines
+      740          assert!(!r1.intersects(&r3));
+      741          assert!(!r3.intersects(&r1));
+      742      }
+      743 +
+      744 +    // ====== Tests added from code review (Cycle 1) ======
+      745 +
+      746 +    #[test]
+      747 +    fn test_remove_last_window_empties_workspace() {
+      748 +        let mut ws = Workspace::new();
+      749 +        ws.insert_window(1, Some(400));
+      750 +
+      751 +        ws.remove_window(1).unwrap();
+      752 +
+      753 +        assert!(ws.is_empty());
+      754 +        assert_eq!(ws.column_count(), 0);
+      755 +        assert_eq!(ws.focused_column, 0);
+      756 +        assert_eq!(ws.focused_window_in_column, 0);
+      757 +        assert_eq!(ws.scroll_offset, 0.0);
+      758 +    }
+      759 +
+      760 +    #[test]
+      761 +    fn test_ensure_focused_visible_just_in_view() {
+      762 +        let mut ws = Workspace::with_gaps(10, 10);
+      763 +        ws.centering_mode = CenteringMode::JustInView;
+      764 +
+      765 +        ws.insert_window(1, Some(200)); // x: 10-210
+      766 +        ws.insert_window(2, Some(200)); // x: 220-420
+      767 +        ws.insert_window(3, Some(200)); // x: 430-630
+      768 +
+      769 +        ws.focused_column = 0;
+      770 +        ws.scroll_offset = 0.0;
+      771 +
+      772 +        // Column 0 is already in view - should NOT scroll
+      773 +        ws.ensure_focused_visible(500);
+      774 +        assert_eq!(ws.scroll_offset, 0.0);
+      775 +
+      776 +        // Focus column 2, which is partially out of view
+      777 +        ws.focused_column = 2;
+      778 +        ws.ensure_focused_visible(500);
+      779 +        // Should scroll just enough to bring column 2 into view
+      780 +        assert!(ws.scroll_offset > 0.0);
+      781 +    }
+      782 +
+      783 +    #[test]
+      784 +    fn test_compute_placements_tight_viewport() {
+      785 +        let mut ws = Workspace::with_gaps(10, 50); // Large outer_gap
+      786 +        ws.insert_window(1, Some(400));
+      787 +        ws.insert_window_in_column(2, 0).unwrap();
+      788 +        ws.insert_window_in_column(3, 0).unwrap();
+      789 +
+      790 +        // Viewport smaller than outer_gaps * 2
+      791 +        let viewport = Rect::new(0, 0, 500, 80); // Only 80px tall
+      792 +        let placements = ws.compute_placements(viewport);
+      793 +
+      794 +        // All heights should be >= 0
+      795 +        for p in &placements {
+      796 +            assert!(p.rect.height >= 0, "Height was negative: {}", p.rect.height);
+      797 +        }
+      798 +    }
+      799 +
+      800 +    #[test]
+      801 +    fn test_insert_window_clamps_width() {
+      802 +        let mut ws = Workspace::new();
+      803 +
+      804 +        // Try to insert with zero width
+      805 +        ws.insert_window(1, Some(0));
+      806 +        assert_eq!(ws.columns[0].width, 100); // Clamped to minimum
+      807 +
+      808 +        // Try to insert with negative width
+      809 +        ws.insert_window(2, Some(-50));
+      810 +        assert_eq!(ws.columns[1].width, 100); // Clamped to minimum
+      811 +    }
+      812 +
+      813 +    #[test]
+      814 +    fn test_scroll_offset_rounding() {
+      815 +        let mut ws = Workspace::with_gaps(10, 10);
+      816 +        ws.insert_window(1, Some(400));
+      817 +        ws.insert_window(2, Some(400));
+      818 +
+      819 +        // Set fractional scroll offset
+      820 +        ws.scroll_offset = 100.7;
+      821 +
+      822 +        let viewport = Rect::new(0, 0, 500, 600);
+      823 +        let placements = ws.compute_placements(viewport);
+      824 +
+      825 +        // Verify placements use rounded value (101, not truncated 100)
+      826 +        // The first column at x=10 should be at screen x = 10 - 101 + 0 = -91
+      827 +        assert_eq!(placements[0].rect.x, -91);
+      828 +    }
+      829  }
+
+● Bash(cargo test -p openniri-core-layout)
+  ⎿  Error: Exit code 101
+        Compiling proc-macro2 v1.0.106
+        Compiling quote v1.0.44
+        Compiling serde_core v1.0.228
+        Compiling serde v1.0.228
+        Compiling thiserror v2.0.18
+     error: linking with `link.exe` failed: exit code: 1
+       |
+       = note: "link.exe" "/NOLOGO" "C:\\Users\\stark\\AppData\\Local\\Temp\\rustcnT1Bpj\\symbols.o" "<2
+     object files omitted>"
+     "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindo
+     s_targets-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwin
+     -*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "kernel32.lib"
+     "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:msvcrt
+      "/NXCOMPAT" "/OUT:C:\\dev\\OpenNiri-Windows\\target\\debug\\build\\quote-c7f8f84baf71e25f\\build_scri
+     t_build-c7f8f84baf71e25f.exe" "/OPT:REF,NOICF" "/DEBUG" "/PDBALTPATH:%_PDB%"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis"
+       = note: some arguments are omitted. use `--verbose` to show all linker arguments
+     … +48 lines (ctrl+o to see all)
+
+● There's a linker issue with the system (conflicting link.exe from another tool like Git). Let me try
+  running in a developer command prompt context or using rustup run to ensure the correct toolchain.
+
+● Bash(where link.exe)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     C:\Program Files\Git\usr\bin\link.exe
+
+● The issue is that Git's link.exe is being found before the Visual Studio linker. Let me try using the VS
+  Developer shell or adjusting PATH to find the correct linker.
+
+● Bash(cargo check -p openniri-core-layout 2>&1)
+  ⎿  Error: Exit code 101
+     Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling quote v1.0.44
+        Compiling serde_core v1.0.228
+        Compiling thiserror v2.0.18
+        Compiling serde v1.0.228
+     error: linking with `link.exe` failed: exit code: 1
+       |
+       = note: "link.exe" "/NOLOGO" "C:\\Users\\stark\\AppData\\Local\\Temp\\rustccN8xky\\symbols.o" "<2
+     object files omitted>"
+     "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindo
+     s_targets-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwin
+     -*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "kernel32.lib"
+     "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:msvcrt
+      "/NXCOMPAT" "/OUT:C:\\dev\\OpenNiri-Windows\\target\\debug\\build\\quote-c7f8f84baf71e25f\\build_scri
+     t_build-c7f8f84baf71e25f.exe" "/OPT:REF,NOICF" "/DEBUG" "/PDBALTPATH:%_PDB%"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis"
+     "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis"
+     … +47 lines (ctrl+o to see all)
+
+● The toolchain has a PATH conflict. Let me try invoking via the VS Developer PowerShell or using a full
+  path to cargo.
+
+● Bash("C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" > nul 2>&1
+       && cargo test -p openniri-core-layout 2>&1)
+  ⎿  Error: Exit code 127
+     Shell ready. Type 'alias' to see available shortcuts.
+
+● Bash(cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat\"
+      && cargo test -p openniri-core-layout" 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     Microsoft Windows [Version 10.0.26200.7623]
+     (c) Microsoft Corporation. All rights reserved.
+     … +2 lines (ctrl+o to expand)
+
+● Let me try using PowerShell to run the VS Developer tools.
+
+● Bash(powershell -Command "& { Import-Module 'C:\Program Files\Microsoft Visual
+      Studio\2022\Community\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'; Enter-VsDevS…)
+  ⎿ Shell ready. Type 'alias' to see available shortcuts.
+    Import-Module : The specified module 'C:\Program Files\Microsoft Visual
+    Studio\2022\Community\Common7\Tools\Microsoft.VisualStudio.DevShell.dll' was not loaded because no
+    … +128 lines (ctrl+o to expand)
+
+  ⎿  (timeout 5m)
+
+● The PATH has Git's link.exe taking precedence over the MSVC linker. Let me try using the gnu toolchain
+  instead or directly fixing the PATH.
+
+● Bash(rustup show 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     Default host: x86_64-pc-windows-msvc
+     rustup home:  C:\Users\stark\scoop\persist\rustup\.rustup
+     … +11 lines (ctrl+o to expand)
+
+● Bash(dir "C:\Program Files\Microsoft Visual
+      Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe" 2>&1)
+  ⎿  Error: Exit code 2
+     Shell ready. Type 'alias' to see available shortcuts.
+     dir: cannot access 'C:\Program Files\Microsoft Visual
+     Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\x64\link.exe': No such file or directory
+
+● Read 2 files (ctrl+o to expand)
+
+● VS 2018 may be installed instead. Let me check Build Tools.
+
+● Read 1 file (ctrl+o to expand)
+
+● Bash(vswhere -latest -products * -find "VC/Tools/MSVC/*/bin/Hostx64/x64/link.exe" 2>&1)
+  ⎿  Error: Exit code 127
+     Shell ready. Type 'alias' to see available shortcuts.
+     /usr/bin/bash: line 1: vswhere: command not found
+
+● Bash("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -find
+      "VC/Tools/MSVC/*/bin/Hostx64/x64/link.exe" 2>&1)
+  ⎿  Error: Exit code 127
+     Shell ready. Type 'alias' to see available shortcuts.
+     /usr/bin/bash: line 1: C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe: No such
+     file or directory
+
+● Read 1 file (ctrl+o to expand)
+
+● It looks like Visual Studio isn't fully installed. Let me try using rustup to install the gnu toolchain
+  as a workaround.
+
+● Bash(rustup target add x86_64-pc-windows-gnu 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     info: downloading component 'rust-std' for 'x86_64-pc-windows-gnu'
+     info: installing component 'rust-std' for 'x86_64-pc-windows-gnu'
+  ⎿  (timeout 2m)
+
+● Bash(cargo test -p openniri-core-layout --target x86_64-pc-windows-gnu 2>&1)
+  ⎿  Error: Exit code 101
+     Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling quote v1.0.44
+        Compiling unicode-ident v1.0.22
+        Compiling serde_core v1.0.228
+        Compiling thiserror v2.0.18
+        Compiling serde v1.0.228
+     error: linking with `link.exe` failed: exit code: 1
+       |
+     … +48 lines (ctrl+o to see all)
+
+● The build scripts still use the host (msvc) target. Let me try installing the GNU toolchain entirely.
+
+● Bash(rustup toolchain install stable-x86_64-pc-windows-gnu 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     info: syncing channel updates for 'stable-x86_64-pc-windows-gnu'
+     info: latest update on 2026-01-22, rust version 1.93.0 (254b59607 2026-01-19)
+     … +18 lines (ctrl+o to expand)
+  ⎿  (timeout 3m)
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling unicode-ident v1.0.22
+     … +37 lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+● All 17 tests pass. Let me update the task status and provide a summary.
+
+● All code review fixes have been implemented and verified. Here's a summary:
+
+  Completed Fixes
+  Finding: #1 Empty Column Invariant
+  Fix: remove_window() now removes empty columns including the last one, resets workspace state when empty
+  Location: lib.rs:269-295
+  ────────────────────────────────────────
+  Finding: #2 Negative Heights
+  Fix: Added .max(0) clamping for usable_height, window_height, and final height
+  Location: lib.rs:435-455
+  ────────────────────────────────────────
+  Finding: #3 Scroll Offset Jitter
+  Fix: Changed as i32 to .round() as i32 in both compute_placements() and ensure_focused_visible()
+  Location: lib.rs:413, 383
+  ────────────────────────────────────────
+  Finding: #4 Unused Error Variants
+  Fix: Removed CannotRemoveLastColumn and EmptyColumn from LayoutError enum
+  Location: lib.rs:18-24
+  ────────────────────────────────────────
+  Finding: #5 Dimension Validation
+  Fix: Added MIN_COLUMN_WIDTH constant (100px), clamping in Column::new(), Column::empty(), and
+    insert_window()
+  Location: lib.rs:13, 107, 118, 237
+  New Tests Added (5)
+
+  1. test_remove_last_window_empties_workspace - Verifies workspace becomes empty correctly
+  2. test_ensure_focused_visible_just_in_view - Tests JustInView centering mode
+  3. test_compute_placements_tight_viewport - Tests height clamping with small viewports
+  4. test_insert_window_clamps_width - Tests width validation at insertion
+  5. test_scroll_offset_rounding - Tests fractional scroll offset rounding behavior
+
+  Test Results
+
+  All 17 tests pass (12 existing + 5 new).
+
+  Note: There's a PATH conflict on this system where Git's link.exe shadows the MSVC linker. Tests were run
+   using the stable-x86_64-pc-windows-gnu toolchain. You may want to fix the PATH issue by ensuring the VS
+  Developer tools PATH comes before Git.
+
+✻ Worked for 7m 18s
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ commit this
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

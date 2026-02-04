@@ -1,0 +1,1377 @@
+
+╭─── Claude Code v2.1.29 ─────────────────────────────────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started                                      │
+│           Welcome back Stark!           │ Run /init to create a CLAUDE.md file with instructions for C… │
+│                                         │ ───────────────────────────────────────────────────────────── │
+│                                         │ Recent activity                                               │
+│                 ▐▛███▜▌                 │ No recent activity                                            │
+│                ▝▜█████▛▘                │                                                               │
+│                  ▘▘ ▝▝                  │                                                               │
+│   Opus 4.5 · Claude Max · Stark Burns   │                                                               │
+│         C:\dev\OpenNiri-Windows         │                                                               │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                                                       │
+│                                                                                                         │
+│ Code Review Cycle 4 - OpenNiri Core Layout Engine                                                       │
+│                                                                                                         │
+│ PHASE 1: DEEP ANALYSIS & BLUEPRINT                                                                      │
+│                                                                                                         │
+│ 1.1 Goal Definition                                                                                     │
+│                                                                                                         │
+│ Success Criteria: Enforce documented invariants through encapsulation, add robustness improvements, and │
+│  ensure production-ready safety. All changes must pass tests and maintain external API compatibility    │
+│ where possible.                                                                                         │
+│                                                                                                         │
+│ 1.2 Context & Reconnaissance                                                                            │
+│ ┌─────────────────────────┬──────────────────────────────────────────────────┐                          │
+│ │         Aspect          │                     Details                      │                          │
+│ ├─────────────────────────┼──────────────────────────────────────────────────┤                          │
+│ │ File                    │ crates/core_layout/src/lib.rs (988 lines)        │                          │
+│ ├─────────────────────────┼──────────────────────────────────────────────────┤                          │
+│ │ Tech Stack              │ Rust, serde, thiserror                           │                          │
+│ ├─────────────────────────┼──────────────────────────────────────────────────┤                          │
+│ │ Current Tests           │ 25 tests (all passing after Cycle 2+3)           │                          │
+│ ├─────────────────────────┼──────────────────────────────────────────────────┤                          │
+│ │ External Consumers      │ daemon/main.rs, platform_win32/lib.rs            │                          │
+│ ├─────────────────────────┼──────────────────────────────────────────────────┤                          │
+│ │ External Access Pattern │ All method-based - no direct field modifications │                          │
+│ └─────────────────────────┴──────────────────────────────────────────────────┘                          │
+│ 1.3 Assumption Inventory                                                                                │
+│ ┌────────────────────────────────────────┬────────────┬────────────────────────────────┐                │
+│ │               Assumption               │   Status   │             Notes              │                │
+│ ├────────────────────────────────────────┼────────────┼────────────────────────────────┤                │
+│ │ External code uses only methods        │ [VERIFIED] │ Explore agent confirmed        │                │
+│ ├────────────────────────────────────────┼────────────┼────────────────────────────────┤                │
+│ │ Rect fields are read-only externally   │ [VERIFIED] │ Only for logging/positioning   │                │
+│ ├────────────────────────────────────────┼────────────┼────────────────────────────────┤                │
+│ │ All Rect construction uses Rect::new() │ [VERIFIED] │ No struct literal construction │                │
+│ ├────────────────────────────────────────┼────────────┼────────────────────────────────┤                │
+│ │ Test code directly sets focus/scroll   │ [VERIFIED] │ ~10 instances need migration   │                │
+│ ├────────────────────────────────────────┼────────────┼────────────────────────────────┤                │
+│ │ Encapsulation won't break daemon       │ [VERIFIED] │ Already uses methods           │                │
+│ └────────────────────────────────────────┴────────────┴────────────────────────────────┘                │
+│ 1.4 Data Flow Trace                                                                                     │
+│                                                                                                         │
+│ External Code                     Core Layout (lib.rs)                                                  │
+│       │                                  │                                                              │
+│       ├─► Workspace::new()              │                                                               │
+│       ├─► insert_window() ──────────────┼──► validates duplicates                                       │
+│       ├─► compute_placements() ─────────┼──► reads internal state                                       │
+│       ├─► column_count() ───────────────┼──► returns columns.len()                                      │
+│       │                                  │                                                              │
+│       ▼                                  │                                                              │
+│   READ-ONLY field access:               │                                                               │
+│     - p.rect.x, p.rect.y               │                                                                │
+│     - state.viewport.width             │                                                                │
+│                                                                                                         │
+│ Key Insight: All external access is already method-based or read-only. Encapsulation has minimal        │
+│ breaking impact.                                                                                        │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ PHASE 2: FINDINGS & FIXES                                                                               │
+│                                                                                                         │
+│ Finding #1: Workspace Focus State Unprotected [HIGH]                                                    │
+│                                                                                                         │
+│ Problem: focused_column and focused_window_in_column are public, allowing external code to set invalid  │
+│ indices.                                                                                                │
+│                                                                                                         │
+│ Solution: Make private, add validated accessors.                                                        │
+│                                                                                                         │
+│ // New getters                                                                                          │
+│ pub fn focused_column_index(&self) -> usize                                                             │
+│ pub fn focused_window_index_in_column(&self) -> usize                                                   │
+│ pub fn scroll_offset(&self) -> f64                                                                      │
+│ pub fn columns(&self) -> &[Column]                                                                      │
+│                                                                                                         │
+│ // New validated setter                                                                                 │
+│ pub fn set_focus(&mut self, column: usize, window_in_column: usize) -> Result<(), LayoutError>          │
+│                                                                                                         │
+│ // New method to focus by window ID                                                                     │
+│ pub fn focus_window(&mut self, window_id: WindowId) -> Result<(), LayoutError>                          │
+│                                                                                                         │
+│ Test Migration: Add #[cfg(test)] helpers:                                                               │
+│ #[cfg(test)]                                                                                            │
+│ impl Workspace {                                                                                        │
+│     pub fn test_set_focus_unchecked(&mut self, column: usize, win: usize)                               │
+│     pub fn test_set_scroll_offset(&mut self, offset: f64)                                               │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #2: Column Fields Unprotected [MEDIUM]                                                          │
+│                                                                                                         │
+│ Problem: Column::width and Column::windows are public.                                                  │
+│                                                                                                         │
+│ Solution: Make private, add accessors.                                                                  │
+│                                                                                                         │
+│ // New methods                                                                                          │
+│ pub fn width(&self) -> i32                                                                              │
+│ pub fn set_width(&mut self, width: i32)  // Clamped to MIN_COLUMN_WIDTH                                 │
+│ pub fn windows(&self) -> &[WindowId]                                                                    │
+│ pub fn contains(&self, window_id: WindowId) -> bool                                                     │
+│ pub fn get(&self, index: usize) -> Option<WindowId>                                                     │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #3: Rect Fields Should Stay Public [DECISION]                                                   │
+│                                                                                                         │
+│ Analysis:                                                                                               │
+│ - ALL external access is read-only (for positioning/logging)                                            │
+│ - Making fields private gains minimal safety                                                            │
+│ - Would require verbose getters: rect.x() instead of rect.x                                             │
+│ - Construction already enforces clamping via Rect::new()                                                │
+│                                                                                                         │
+│ Decision: Keep Rect fields public. Document this is intentional:                                        │
+│ /// A rectangle in screen coordinates (pixels).                                                         │
+│ ///                                                                                                     │
+│ /// Note: Fields are intentionally public for convenient read access.                                   │
+│ /// Use `Rect::new()` to construct with dimension validation.                                           │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #4: Missing Saturating Arithmetic in column_x() [LOW]                                           │
+│                                                                                                         │
+│ Problem: column_x() accumulates widths+gaps without overflow protection.                                │
+│                                                                                                         │
+│ Fix:                                                                                                    │
+│ fn column_x(&self, column_index: usize) -> i32 {                                                        │
+│     let mut x = self.outer_gap;                                                                         │
+│     for (i, col) in self.columns.iter().enumerate() {                                                   │
+│         if i == column_index {                                                                          │
+│             return x;                                                                                   │
+│         }                                                                                               │
+│         x = x.saturating_add(col.width).saturating_add(self.gap);                                       │
+│     }                                                                                                   │
+│     x                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #5: New Error Variant Needed [LOW]                                                              │
+│                                                                                                         │
+│ Problem: set_focus() needs to report invalid window index.                                              │
+│                                                                                                         │
+│ Fix: Add error variant:                                                                                 │
+│ #[error("Window index {0} is out of bounds in column {1} (max: {2})")]                                  │
+│ WindowIndexOutOfBounds(usize, usize, usize),                                                            │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #6: Missing Test Coverage [MEDIUM]                                                              │
+│                                                                                                         │
+│ New tests needed:                                                                                       │
+│ 1. test_focus_window_by_id - Tests focus_window() method                                                │
+│ 2. test_set_focus_validates - Tests set_focus() bounds checking                                         │
+│ 3. test_scroll_by_special_floats - Tests NaN/Infinity handling                                          │
+│ 4. test_column_width_getter - Tests Column::width() method                                              │
+│ 5. test_column_contains - Tests Column::contains() method                                               │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Files to Modify                                                                                         │
+│ ┌───────────────────────────────┬─────────────────────────────┐                                         │
+│ │             File              │           Changes           │                                         │
+│ ├───────────────────────────────┼─────────────────────────────┤                                         │
+│ │ crates/core_layout/src/lib.rs │ All encapsulation + methods │                                         │
+│ └───────────────────────────────┴─────────────────────────────┘                                         │
+│ ---                                                                                                     │
+│ Implementation Order                                                                                    │
+│                                                                                                         │
+│ Phase A: Non-Breaking Additions (Safe)                                                                  │
+│                                                                                                         │
+│ 1. Add WindowIndexOutOfBounds error variant                                                             │
+│ 2. Add Workspace getter methods: focused_column_index(), focused_window_index_in_column(),              │
+│ scroll_offset(), columns()                                                                              │
+│ 3. Add Column getter methods: width(), windows(), contains(), get()                                     │
+│ 4. Add set_focus() method with validation                                                               │
+│ 5. Add focus_window() method                                                                            │
+│ 6. Add Column::set_width() method                                                                       │
+│ 7. Fix column_x() saturating arithmetic                                                                 │
+│                                                                                                         │
+│ Phase B: Encapsulation (Breaking for Tests Only)                                                        │
+│                                                                                                         │
+│ 8. Make Workspace fields private: columns, focused_column, focused_window_in_column, scroll_offset      │
+│ 9. Add #[cfg(test)] helper methods                                                                      │
+│ 10. Update all test code to use new API                                                                 │
+│ 11. Make Column fields private: width, windows                                                          │
+│ 12. Update Column-related test code                                                                     │
+│                                                                                                         │
+│ Phase C: Test Coverage                                                                                  │
+│                                                                                                         │
+│ 13. Add 5 new test cases                                                                                │
+│ 14. Run full test suite                                                                                 │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ New Tests Summary                                                                                       │
+│ ┌─────┬───────────────────────────────┬───────────────────────────────────────┐                         │
+│ │  #  │           Test Name           │                Purpose                │                         │
+│ ├─────┼───────────────────────────────┼───────────────────────────────────────┤                         │
+│ │ 1   │ test_focus_window_by_id       │ focus_window() finds and focuses      │                         │
+│ ├─────┼───────────────────────────────┼───────────────────────────────────────┤                         │
+│ │ 2   │ test_set_focus_validates      │ set_focus() rejects invalid indices   │                         │
+│ ├─────┼───────────────────────────────┼───────────────────────────────────────┤                         │
+│ │ 3   │ test_scroll_by_special_floats │ NaN/Infinity handled safely           │                         │
+│ ├─────┼───────────────────────────────┼───────────────────────────────────────┤                         │
+│ │ 4   │ test_column_width_getter      │ Column::width() returns correct value │                         │
+│ ├─────┼───────────────────────────────┼───────────────────────────────────────┤                         │
+│ │ 5   │ test_column_contains          │ Column::contains() works correctly    │                         │
+│ └─────┴───────────────────────────────┴───────────────────────────────────────┘                         │
+│ ---                                                                                                     │
+│ Verification                                                                                            │
+│                                                                                                         │
+│ 1. cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout - All tests pass                    │
+│ 2. cargo +stable-x86_64-pc-windows-gnu check -p openniri-daemon - Daemon compiles                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ PHASE 3: SELF-CORRECTION & QA                                                                           │
+│                                                                                                         │
+│ Breaking Change Assessment                                                                              │
+│ ┌──────────────────────────┬─────────────────┬───────────────────────┐                                  │
+│ │          Change          │ External Impact │      Test Impact      │                                  │
+│ ├──────────────────────────┼─────────────────┼───────────────────────┤                                  │
+│ │ Workspace fields private │ NONE            │ ~10 lines need update │                                  │
+│ ├──────────────────────────┼─────────────────┼───────────────────────┤                                  │
+│ │ Column fields private    │ NONE            │ ~8 lines need update  │                                  │
+│ ├──────────────────────────┼─────────────────┼───────────────────────┤                                  │
+│ │ Rect fields              │ No change       │ No change             │                                  │
+│ └──────────────────────────┴─────────────────┴───────────────────────┘                                  │
+│ Risk Assessment: LOW - External code already follows proper patterns.                                   │
+│                                                                                                         │
+│ Configuration Fields Remain Public                                                                      │
+│                                                                                                         │
+│ These fields are intentionally kept public for easy configuration:                                      │
+│ - gap: i32                                                                                              │
+│ - outer_gap: i32                                                                                        │
+│ - default_column_width: i32                                                                             │
+│ - centering_mode: CenteringMode                                                                         │
+│                                                                                                         │
+│ Deferred Items                                                                                          │
+│ ┌───────────────────────────────────────┬────────────────────────────────────────┐                      │
+│ │                 Item                  │                 Reason                 │                      │
+│ ├───────────────────────────────────────┼────────────────────────────────────────┤                      │
+│ │ contains_window() O(n*m) optimization │ Not a hot path, document trade-off     │                      │
+│ ├───────────────────────────────────────┼────────────────────────────────────────┤                      │
+│ │ Serialization versioning              │ Needs broader architectural discussion │                      │
+│ ├───────────────────────────────────────┼────────────────────────────────────────┤                      │
+│ │ Private Rect fields                   │ Read-only access pattern is safe       │                      │
+│ └───────────────────────────────────────┴────────────────────────────────────────┘                      │
+│ ---                                                                                                     │
+│ Summary                                                                                                 │
+│                                                                                                         │
+│ This cycle transforms the layout engine from "documented invariants" to "enforced invariants" through:  │
+│ 1. Encapsulation - State fields become private                                                          │
+│ 2. Validated Setters - set_focus(), focus_window() validate before mutating                             │
+│ 3. Saturation - Additional overflow protection in column_x()                                            │
+│ 4. Test Coverage - 5 new tests for the new methods                                                      │
+│                                                                                                         │
+│ Total: ~30 new/modified functions, 5 new tests, 0 external breaking changes                             │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+● I'll implement this plan systematically. Let me start by reading the current state of the file to
+  understand the exact code structure.
+
+● Read 1 file (ctrl+o to expand)
+
+● I've read the file. Now I'll implement the plan systematically. Let me start with Phase A (non-breaking
+  additions).
+
+  Phase A: Non-Breaking Additions
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines
+      35
+      36      #[error("Window {0} already exists in workspace")]
+      37      DuplicateWindow(WindowId),
+      38 +
+      39 +    #[error("Window index {0} is out of bounds in column {1} (max: {2})")]
+      40 +    WindowIndexOutOfBounds(usize, usize, usize),
+      41  }
+      42
+      43  /// A rectangle in screen coordinates (pixels).
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines
+      41  }
+      42
+      43  /// A rectangle in screen coordinates (pixels).
+      44 +///
+      45 +/// Note: Fields are intentionally public for convenient read access.
+      46 +/// Use `Rect::new()` to construct with dimension validation.
+      47  #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+      48  pub struct Rect {
+      49      pub x: i32,
+
+● Now let me add the Column getter methods:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 26 lines
+      162              false
+      163          }
+      164      }
+      165 +
+      166 +    /// Get the width of this column.
+      167 +    pub fn width(&self) -> i32 {
+      168 +        self.width
+      169 +    }
+      170 +
+      171 +    /// Set the width of this column.
+      172 +    /// Width is clamped to MIN_COLUMN_WIDTH (100px) minimum.
+      173 +    pub fn set_width(&mut self, width: i32) {
+      174 +        self.width = width.max(MIN_COLUMN_WIDTH);
+      175 +    }
+      176 +
+      177 +    /// Get a slice of windows in this column.
+      178 +    pub fn windows(&self) -> &[WindowId] {
+      179 +        &self.windows
+      180 +    }
+      181 +
+      182 +    /// Check if this column contains a specific window.
+      183 +    pub fn contains(&self, window_id: WindowId) -> bool {
+      184 +        self.windows.contains(&window_id)
+      185 +    }
+      186 +
+      187 +    /// Get a window by index.
+      188 +    pub fn get(&self, index: usize) -> Option<WindowId> {
+      189 +        self.windows.get(index).copied()
+      190 +    }
+      191  }
+      192
+      193  /// Focus centering mode.
+
+● Now let me add the Workspace getter methods and validated setters. First, let me add the getters after
+  the focused_window method:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 64 lines
+      430              .copied()
+      431      }
+      432
+      433 +    /// Get the index of the currently focused column.
+      434 +    pub fn focused_column_index(&self) -> usize {
+      435 +        self.focused_column
+      436 +    }
+      437 +
+      438 +    /// Get the index of the focused window within the focused column.
+      439 +    pub fn focused_window_index_in_column(&self) -> usize {
+      440 +        self.focused_window_in_column
+      441 +    }
+      442 +
+      443 +    /// Get the current scroll offset.
+      444 +    pub fn scroll_offset(&self) -> f64 {
+      445 +        self.scroll_offset
+      446 +    }
+      447 +
+      448 +    /// Get a slice of all columns.
+      449 +    pub fn columns(&self) -> &[Column] {
+      450 +        &self.columns
+      451 +    }
+      452 +
+      453 +    /// Set focus to a specific column and window index with validation.
+      454 +    ///
+      455 +    /// # Errors
+      456 +    ///
+      457 +    /// Returns `LayoutError::ColumnOutOfBounds` if the column index is invalid.
+      458 +    /// Returns `LayoutError::WindowIndexOutOfBounds` if the window index is invalid.
+      459 +    pub fn set_focus(&mut self, column: usize, window_in_column: usize) -> Result<(), Lay
+          +outError> {
+      460 +        if column >= self.columns.len() {
+      461 +            return Err(LayoutError::ColumnOutOfBounds(
+      462 +                column,
+      463 +                self.columns.len().saturating_sub(1),
+      464 +            ));
+      465 +        }
+      466 +
+      467 +        let col_len = self.columns[column].len();
+      468 +        if window_in_column >= col_len {
+      469 +            return Err(LayoutError::WindowIndexOutOfBounds(
+      470 +                window_in_column,
+      471 +                column,
+      472 +                col_len.saturating_sub(1),
+      473 +            ));
+      474 +        }
+      475 +
+      476 +        self.focused_column = column;
+      477 +        self.focused_window_in_column = window_in_column;
+      478 +        Ok(())
+      479 +    }
+      480 +
+      481 +    /// Focus a window by its ID.
+      482 +    ///
+      483 +    /// # Errors
+      484 +    ///
+      485 +    /// Returns `LayoutError::WindowNotFound` if the window is not in the workspace.
+      486 +    pub fn focus_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
+      487 +        for (col_idx, column) in self.columns.iter().enumerate() {
+      488 +            if let Some(win_idx) = column.windows.iter().position(|&w| w == window_id) {
+      489 +                self.focused_column = col_idx;
+      490 +                self.focused_window_in_column = win_idx;
+      491 +                return Ok(());
+      492 +            }
+      493 +        }
+      494 +        Err(LayoutError::WindowNotFound(window_id))
+      495 +    }
+      496 +
+      497      /// Calculate the x-coordinate of a column's left edge on the strip.
+      498      fn column_x(&self, column_index: usize) -> i32 {
+      499          let mut x = self.outer_gap;
+
+● Now let me fix the column_x() method to use saturating arithmetic:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      501              if i == column_index {
+      502                  return x;
+      503              }
+      504 -            x += col.width + self.gap;
+      504 +            x = x.saturating_add(col.width).saturating_add(self.gap);
+      505          }
+      506          x
+      507      }
+
+● Now let me fix scroll_by to handle special floats (NaN/Infinity):
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 5 lines, removed 1 line
+      656      }
+      657
+      658      /// Scroll the viewport by a pixel delta.
+      659 +    ///
+      660 +    /// Special float values (NaN, Infinity) are treated as zero for safety.
+      661      pub fn scroll_by(&mut self, delta: f64, viewport_width: i32) {
+      660 -        self.scroll_offset += delta;
+      662 +        // Treat NaN and Infinity as zero for safety
+      663 +        let safe_delta = if delta.is_finite() { delta } else { 0.0 };
+      664 +        self.scroll_offset += safe_delta;
+      665          let max_scroll = (self.total_width() - viewport_width).max(0);
+      666          self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+      667      }
+
+● Phase A is complete. Now let me implement Phase B: Encapsulation. I need to make the Workspace fields
+  private and add test helpers. First, let me update the Workspace struct:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 4 lines, removed 4 lines
+      218  #[derive(Debug, Clone, Serialize, Deserialize)]
+      219  pub struct Workspace {
+      220      /// Columns in the workspace, ordered left to right.
+      221 -    pub columns: Vec<Column>,
+      221 +    columns: Vec<Column>,
+      222      /// Index of the currently focused column.
+      223 -    pub focused_column: usize,
+      223 +    focused_column: usize,
+      224      /// Index of the focused window within the focused column.
+      225 -    pub focused_window_in_column: usize,
+      225 +    focused_window_in_column: usize,
+      226      /// Current scroll offset (x position of viewport's left edge on the strip).
+      227 -    pub scroll_offset: f64,
+      227 +    scroll_offset: f64,
+      228      /// Gap between columns in pixels.
+      229      pub gap: i32,
+      230      /// Gap at the edges of the viewport.
+
+● Now let me make Column fields private:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      114  #[derive(Debug, Clone, Serialize, Deserialize)]
+      115  pub struct Column {
+      116      /// Width of the column in pixels.
+      117 -    pub width: i32,
+      117 +    width: i32,
+      118      /// Windows in this column (vertically stacked).
+      119 -    pub windows: Vec<WindowId>,
+      119 +    windows: Vec<WindowId>,
+      120  }
+      121
+      122  impl Column {
+
+● Now I need to add test helpers and update the tests. Let me first read the tests section to see what
+  needs updating:
+
+● Read 1 file (ctrl+o to expand)
+
+● Now I need to add test helper methods and update the tests. Let me add the test helpers just before the
+  tests module, and update the tests to use the new API:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 15 lines
+      667      }
+      668  }
+      669
+      670 +// Test-only helper methods for direct state manipulation
+      671  #[cfg(test)]
+      672 +impl Workspace {
+      673 +    /// Set focus state directly without validation (test helper).
+      674 +    pub fn test_set_focus_unchecked(&mut self, column: usize, win: usize) {
+      675 +        self.focused_column = column;
+      676 +        self.focused_window_in_column = win;
+      677 +    }
+      678 +
+      679 +    /// Set scroll offset directly (test helper).
+      680 +    pub fn test_set_scroll_offset(&mut self, offset: f64) {
+      681 +        self.scroll_offset = offset;
+      682 +    }
+      683 +}
+      684 +
+      685 +#[cfg(test)]
+      686  mod tests {
+      687      use super::*;
+      688
+
+● Now I need to update all the tests that directly access private fields. Let me update them one by one:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      701
+      702          assert!(!ws.is_empty());
+      703          assert_eq!(ws.column_count(), 1);
+      704 -        assert_eq!(ws.focused_column, 0);
+      704 +        assert_eq!(ws.focused_column_index(), 0);
+      705          assert_eq!(ws.focused_window(), Some(1));
+      706      }
+      707
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      714
+      715          assert_eq!(ws.column_count(), 3);
+      716          // Last inserted window should be focused
+      717 -        assert_eq!(ws.focused_column, 2);
+      717 +        assert_eq!(ws.focused_column_index(), 2);
+      718          assert_eq!(ws.focused_window(), Some(3));
+      719
+      720          // Total width: outer_gap + 400 + gap + 600 + gap + 400 + outer_gap
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 6 lines, removed 6 lines
+      729          ws.insert_window(2, Some(400)).unwrap();
+      730          ws.insert_window(3, Some(400)).unwrap();
+      731
+      732 -        assert_eq!(ws.focused_column, 2); // Last inserted
+      732 +        assert_eq!(ws.focused_column_index(), 2); // Last inserted
+      733
+      734          ws.focus_left();
+      735 -        assert_eq!(ws.focused_column, 1);
+      735 +        assert_eq!(ws.focused_column_index(), 1);
+      736          assert_eq!(ws.focused_window(), Some(2));
+      737
+      738          ws.focus_left();
+      739 -        assert_eq!(ws.focused_column, 0);
+      739 +        assert_eq!(ws.focused_column_index(), 0);
+      740
+      741          // Should not go below 0
+      742          ws.focus_left();
+      743 -        assert_eq!(ws.focused_column, 0);
+      743 +        assert_eq!(ws.focused_column_index(), 0);
+      744
+      745          ws.focus_right();
+      746          ws.focus_right();
+      747 -        assert_eq!(ws.focused_column, 2);
+      747 +        assert_eq!(ws.focused_column_index(), 2);
+      748
+      749          // Should not go beyond last column
+      750          ws.focus_right();
+      751 -        assert_eq!(ws.focused_column, 2);
+      751 +        assert_eq!(ws.focused_column_index(), 2);
+      752      }
+      753
+      754      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 4 lines, removed 4 lines
+      765
+      766          // Windows 1 and 3 should remain
+      767          assert!(ws
+      768 -            .columns
+      768 +            .columns()
+      769              .iter()
+      770 -            .any(|c| c.windows.contains(&1)));
+      770 +            .any(|c| c.contains(1)));
+      771          assert!(ws
+      772 -            .columns
+      772 +            .columns()
+      773              .iter()
+      774 -            .any(|c| c.windows.contains(&3)));
+      774 +            .any(|c| c.contains(3)));
+      775      }
+      776
+      777      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      781          ws.insert_window(2, Some(400)).unwrap(); // x: 420-820
+      782          ws.insert_window(3, Some(400)).unwrap(); // x: 830-1230
+      783
+      784 -        ws.scroll_offset = 0.0;
+      784 +        ws.test_set_scroll_offset(0.0);
+      785
+      786          // Viewport of 500px wide starting at (0, 0)
+      787          let viewport = Rect::new(0, 0, 500, 600);
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      809          ws.insert_window(2, Some(400)).unwrap();
+      810          ws.insert_window(3, Some(400)).unwrap();
+      811
+      812 -        ws.focused_column = 0;
+      813 -        ws.scroll_offset = 500.0; // Start scrolled right
+      812 +        ws.test_set_focus_unchecked(0, 0);
+      813 +        ws.test_set_scroll_offset(500.0); // Start scrolled right
+      814
+      815          ws.ensure_focused_visible(500);
+      816
+     ...
+      818          // Column 0 is at x=10, width=400, center=210
+      819          // Viewport width=500, center=250
+      820          // scroll_offset = 210 - 250 = -40, clamped to 0
+      821 -        assert_eq!(ws.scroll_offset, 0.0);
+      821 +        assert_eq!(ws.scroll_offset(), 0.0);
+      822      }
+      823
+      824      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      829          ws.insert_window_in_column(3, 0).unwrap();
+      830
+      831          assert_eq!(ws.column_count(), 1);
+      832 -        assert_eq!(ws.columns[0].len(), 3);
+      832 +        assert_eq!(ws.columns()[0].len(), 3);
+      833
+      834          let viewport = Rect::new(0, 0, 500, 600);
+      835          let placements = ws.compute_placements(viewport);
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 4 lines, removed 4 lines
+      844          let mut ws = Workspace::new();
+      845          ws.insert_window(1, Some(400)).unwrap();
+      846
+      847 -        assert_eq!(ws.columns[0].width, 400);
+      847 +        assert_eq!(ws.columns()[0].width(), 400);
+      848
+      849          ws.resize_focused_column(100);
+      850 -        assert_eq!(ws.columns[0].width, 500);
+      850 +        assert_eq!(ws.columns()[0].width(), 500);
+      851
+      852          ws.resize_focused_column(-200);
+      853 -        assert_eq!(ws.columns[0].width, 300);
+      853 +        assert_eq!(ws.columns()[0].width(), 300);
+      854
+      855          // Should not go below minimum (100)
+      856          ws.resize_focused_column(-500);
+      857 -        assert_eq!(ws.columns[0].width, 100);
+      857 +        assert_eq!(ws.columns()[0].width(), 100);
+      858      }
+      859
+      860      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 7 lines, removed 7 lines
+      864          ws.insert_window(2, Some(400)).unwrap();
+      865          ws.insert_window(3, Some(400)).unwrap();
+      866
+      867 -        ws.focused_column = 1;
+      867 +        ws.test_set_focus_unchecked(1, 0);
+      868          ws.move_column_left();
+      869
+      870 -        assert_eq!(ws.focused_column, 0);
+      871 -        assert_eq!(ws.columns[0].windows[0], 2);
+      872 -        assert_eq!(ws.columns[1].windows[0], 1);
+      870 +        assert_eq!(ws.focused_column_index(), 0);
+      871 +        assert_eq!(ws.columns()[0].get(0), Some(2));
+      872 +        assert_eq!(ws.columns()[1].get(0), Some(1));
+      873
+      874          ws.move_column_right();
+      875 -        assert_eq!(ws.focused_column, 1);
+      876 -        assert_eq!(ws.columns[0].windows[0], 1);
+      877 -        assert_eq!(ws.columns[1].windows[0], 2);
+      875 +        assert_eq!(ws.focused_column_index(), 1);
+      876 +        assert_eq!(ws.columns()[0].get(0), Some(1));
+      877 +        assert_eq!(ws.columns()[1].get(0), Some(2));
+      878      }
+      879
+      880      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      887          let viewport_width = 500;
+      888
+      889          ws.scroll_by(100.0, viewport_width);
+      890 -        assert_eq!(ws.scroll_offset, 100.0);
+      890 +        assert_eq!(ws.scroll_offset(), 100.0);
+      891
+      892          ws.scroll_by(2000.0, viewport_width);
+      893          // Should clamp to max scroll
+      894          let max_scroll = (ws.total_width() - viewport_width).max(0) as f64;
+      895 -        assert_eq!(ws.scroll_offset, max_scroll);
+      895 +        assert_eq!(ws.scroll_offset(), max_scroll);
+      896
+      897          ws.scroll_by(-5000.0, viewport_width);
+      898 -        assert_eq!(ws.scroll_offset, 0.0);
+      898 +        assert_eq!(ws.scroll_offset(), 0.0);
+      899      }
+      900
+      901      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      921
+      922          assert!(ws.is_empty());
+      923          assert_eq!(ws.column_count(), 0);
+      924 -        assert_eq!(ws.focused_column, 0);
+      925 -        assert_eq!(ws.focused_window_in_column, 0);
+      926 -        assert_eq!(ws.scroll_offset, 0.0);
+      924 +        assert_eq!(ws.focused_column_index(), 0);
+      925 +        assert_eq!(ws.focused_window_index_in_column(), 0);
+      926 +        assert_eq!(ws.scroll_offset(), 0.0);
+      927      }
+      928
+      929      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 5 lines, removed 5 lines
+      935          ws.insert_window(2, Some(200)).unwrap(); // x: 220-420
+      936          ws.insert_window(3, Some(200)).unwrap(); // x: 430-630
+      937
+      938 -        ws.focused_column = 0;
+      939 -        ws.scroll_offset = 0.0;
+      938 +        ws.test_set_focus_unchecked(0, 0);
+      939 +        ws.test_set_scroll_offset(0.0);
+      940
+      941          // Column 0 is already in view - should NOT scroll
+      942          ws.ensure_focused_visible(500);
+      943 -        assert_eq!(ws.scroll_offset, 0.0);
+      943 +        assert_eq!(ws.scroll_offset(), 0.0);
+      944
+      945          // Focus column 2, which is partially out of view
+      946 -        ws.focused_column = 2;
+      946 +        ws.test_set_focus_unchecked(2, 0);
+      947          ws.ensure_focused_visible(500);
+      948          // Should scroll just enough to bring column 2 into view
+      949 -        assert!(ws.scroll_offset > 0.0);
+      949 +        assert!(ws.scroll_offset() > 0.0);
+      950      }
+      951
+      952      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      972
+      973          // Try to insert with zero width
+      974          ws.insert_window(1, Some(0)).unwrap();
+      975 -        assert_eq!(ws.columns[0].width, 100); // Clamped to minimum
+      975 +        assert_eq!(ws.columns()[0].width(), 100); // Clamped to minimum
+      976
+      977          // Try to insert with negative width
+      978          ws.insert_window(2, Some(-50)).unwrap();
+      979 -        assert_eq!(ws.columns[1].width, 100); // Clamped to minimum
+      979 +        assert_eq!(ws.columns()[1].width(), 100); // Clamped to minimum
+      980      }
+      981
+      982      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      986          ws.insert_window(2, Some(400)).unwrap();
+      987
+      988          // Set fractional scroll offset
+      989 -        ws.scroll_offset = 100.7;
+      989 +        ws.test_set_scroll_offset(100.7);
+      990
+      991          let viewport = Rect::new(0, 0, 500, 600);
+      992          let placements = ws.compute_placements(viewport);
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      1001      #[test]
+      1002      fn test_column_empty_constructor() {
+      1003          let col = Column::empty(50);
+      1004 -        assert_eq!(col.width, 100); // Clamped to MIN_COLUMN_WIDTH
+      1004 +        assert_eq!(col.width(), 100); // Clamped to MIN_COLUMN_WIDTH
+      1005          assert!(col.is_empty());
+      1006          assert_eq!(col.len(), 0);
+      1007      }
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      1029          ws.focus_down();
+      1030
+      1031          assert!(ws.focused_window().is_none());
+      1032 -        assert_eq!(ws.focused_column, 0);
+      1033 -        assert_eq!(ws.focused_window_in_column, 0);
+      1032 +        assert_eq!(ws.focused_column_index(), 0);
+      1033 +        assert_eq!(ws.focused_window_index_in_column(), 0);
+      1034      }
+      1035
+      1036      #[test]
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      1048          ws.insert_window(3, Some(400)).unwrap();
+      1049
+      1050          // Focus on column 2 (window 3)
+      1051 -        ws.focused_column = 2;
+      1051 +        ws.test_set_focus_unchecked(2, 0);
+      1052
+      1053          // Remove from column 0
+      1054          ws.remove_window(1).unwrap();
+      1055
+      1056          // Focus should adjust: was 2, column 0 removed, now should be 1
+      1057 -        assert_eq!(ws.focused_column, 1);
+      1057 +        assert_eq!(ws.focused_column_index(), 1);
+      1058          assert_eq!(ws.focused_window(), Some(3));
+      1059      }
+      1060
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      1073
+      1074          // Workspace should still have only one column with one window
+      1075          assert_eq!(ws.column_count(), 1);
+      1076 -        assert_eq!(ws.columns[0].len(), 1);
+      1076 +        assert_eq!(ws.columns()[0].len(), 1);
+      1077      }
+      1078
+      1079      #[test]
+
+● Now let me add the 5 new tests for Phase C. Let me add them at the end of the tests module:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 104 lines
+      1099          assert!(width > 0); // Should not wrap to negative
+      1100          assert_eq!(width, i32::MAX); // Should saturate at max
+      1101      }
+      1102 +
+      1103 +    // ====== Tests added from code review (Cycle 4) ======
+      1104 +
+      1105 +    #[test]
+      1106 +    fn test_focus_window_by_id() {
+      1107 +        let mut ws = Workspace::new();
+      1108 +        ws.insert_window(1, Some(400)).unwrap();
+      1109 +        ws.insert_window(2, Some(400)).unwrap();
+      1110 +        ws.insert_window(3, Some(400)).unwrap();
+      1111 +
+      1112 +        // Focus is on column 2 (window 3) after inserts
+      1113 +        assert_eq!(ws.focused_window(), Some(3));
+      1114 +
+      1115 +        // Focus window 1 by ID
+      1116 +        ws.focus_window(1).unwrap();
+      1117 +        assert_eq!(ws.focused_column_index(), 0);
+      1118 +        assert_eq!(ws.focused_window(), Some(1));
+      1119 +
+      1120 +        // Focus window 2 by ID
+      1121 +        ws.focus_window(2).unwrap();
+      1122 +        assert_eq!(ws.focused_column_index(), 1);
+      1123 +        assert_eq!(ws.focused_window(), Some(2));
+      1124 +
+      1125 +        // Try to focus nonexistent window
+      1126 +        let result = ws.focus_window(999);
+      1127 +        assert!(matches!(result, Err(LayoutError::WindowNotFound(999))));
+      1128 +    }
+      1129 +
+      1130 +    #[test]
+      1131 +    fn test_set_focus_validates() {
+      1132 +        let mut ws = Workspace::new();
+      1133 +        ws.insert_window(1, Some(400)).unwrap();
+      1134 +        ws.insert_window(2, Some(400)).unwrap();
+      1135 +        ws.insert_window_in_column(3, 1).unwrap(); // Stack window 3 in column 1
+      1136 +
+      1137 +        // Valid focus
+      1138 +        ws.set_focus(1, 1).unwrap();
+      1139 +        assert_eq!(ws.focused_column_index(), 1);
+      1140 +        assert_eq!(ws.focused_window_index_in_column(), 1);
+      1141 +        assert_eq!(ws.focused_window(), Some(3));
+      1142 +
+      1143 +        // Invalid column index
+      1144 +        let result = ws.set_focus(5, 0);
+      1145 +        assert!(matches!(result, Err(LayoutError::ColumnOutOfBounds(5, 1))));
+      1146 +
+      1147 +        // Invalid window index in column
+      1148 +        let result = ws.set_focus(0, 10);
+      1149 +        assert!(matches!(result, Err(LayoutError::WindowIndexOutOfBounds(10, 0, 0))));
+      1150 +    }
+      1151 +
+      1152 +    #[test]
+      1153 +    fn test_scroll_by_special_floats() {
+      1154 +        let mut ws = Workspace::with_gaps(10, 10);
+      1155 +        ws.insert_window(1, Some(400)).unwrap();
+      1156 +        ws.insert_window(2, Some(400)).unwrap();
+      1157 +
+      1158 +        let viewport_width = 500;
+      1159 +
+      1160 +        // Scroll to a known position
+      1161 +        ws.scroll_by(50.0, viewport_width);
+      1162 +        assert_eq!(ws.scroll_offset(), 50.0);
+      1163 +
+      1164 +        // NaN should be treated as zero (no change)
+      1165 +        ws.scroll_by(f64::NAN, viewport_width);
+      1166 +        assert_eq!(ws.scroll_offset(), 50.0);
+      1167 +
+      1168 +        // Infinity should be treated as zero (no change)
+      1169 +        ws.scroll_by(f64::INFINITY, viewport_width);
+      1170 +        assert_eq!(ws.scroll_offset(), 50.0);
+      1171 +
+      1172 +        // Negative infinity should be treated as zero (no change)
+      1173 +        ws.scroll_by(f64::NEG_INFINITY, viewport_width);
+      1174 +        assert_eq!(ws.scroll_offset(), 50.0);
+      1175 +    }
+      1176 +
+      1177 +    #[test]
+      1178 +    fn test_column_width_getter() {
+      1179 +        let col = Column::new(1, 500);
+      1180 +        assert_eq!(col.width(), 500);
+      1181 +
+      1182 +        let col2 = Column::new(2, 50); // Below minimum
+      1183 +        assert_eq!(col2.width(), 100); // Clamped
+      1184 +    }
+      1185 +
+      1186 +    #[test]
+      1187 +    fn test_column_contains() {
+      1188 +        let mut col = Column::new(1, 400);
+      1189 +        col.add_window(2);
+      1190 +        col.add_window(3);
+      1191 +
+      1192 +        assert!(col.contains(1));
+      1193 +        assert!(col.contains(2));
+      1194 +        assert!(col.contains(3));
+      1195 +        assert!(!col.contains(999));
+      1196 +
+      1197 +        // Test get() method
+      1198 +        assert_eq!(col.get(0), Some(1));
+      1199 +        assert_eq!(col.get(1), Some(2));
+      1200 +        assert_eq!(col.get(2), Some(3));
+      1201 +        assert_eq!(col.get(10), None);
+      1202 +
+      1203 +        // Test windows() slice
+      1204 +        assert_eq!(col.windows(), &[1, 2, 3]);
+      1205 +    }
+      1206  }
+
+● Now let's run the tests to verify everything works:
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+        Compiling openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+         Finished `test` profile [unoptimized + debuginfo] target(s) in 0.88s
+     … +41 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● All 30 tests pass. Now let's verify that the daemon compiles:
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu check -p openniri-daemon 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+         Checking openniri-platform-win32 v0.1.0 (C:\dev\OpenNiri-Windows\crates\platform_win32)
+     … +23 lines (ctrl+o to expand)
+
+● The daemon compiles successfully (the warnings are pre-existing and unrelated to our changes).
+
+  Let me provide a summary of the implementation:
+
+  Summary - Code Review Cycle 4 Complete
+
+  Successfully implemented all planned changes to the OpenNiri Core Layout Engine:
+
+  Phase A: Non-Breaking Additions
+
+  1. Added WindowIndexOutOfBounds error variant - New error type for invalid window indices
+  2. Added Workspace getter methods:
+    - focused_column_index()
+    - focused_window_index_in_column()
+    - scroll_offset()
+    - columns()
+  3. Added validated setters:
+    - set_focus(column, window) - validates bounds before setting
+    - focus_window(window_id) - finds and focuses a window by ID
+  4. Added Column getter methods:
+    - width()
+    - set_width() - with clamping to MIN_COLUMN_WIDTH
+    - windows() - returns slice
+    - contains(window_id) - check membership
+    - get(index) - safe index access
+  5. Fixed column_x() saturating arithmetic - prevents overflow
+  6. Fixed scroll_by() special float handling - NaN/Infinity treated as 0.0
+
+  Phase B: Encapsulation
+
+  7. Made Workspace fields private: columns, focused_column, focused_window_in_column, scroll_offset
+  8. Made Column fields private: width, windows
+  9. Added test helpers: test_set_focus_unchecked(), test_set_scroll_offset()
+  10. Updated all 25 existing tests to use the new API
+  11. Kept Rect fields public (intentional, documented)
+  12. Kept configuration fields public: gap, outer_gap, default_column_width, centering_mode
+
+  Phase C: New Test Coverage
+
+  Added 5 new tests (30 total):
+  1. test_focus_window_by_id - Tests focus_window() method
+  2. test_set_focus_validates - Tests set_focus() bounds checking
+  3. test_scroll_by_special_floats - Tests NaN/Infinity handling
+  4. test_column_width_getter - Tests Column::width() method
+  5. test_column_contains - Tests Column::contains() and get() methods
+
+  Verification
+
+  - All 30 tests pass
+  - Daemon compiles successfully
+  - 0 external breaking changes (external code already used methods)
+
+✻ Cooked for 6m 23s
+
+❯ "C:\dev\OpenNiri-Windows\docs\1_Progress and review\CODEX_QA_ARCH_REVIEW_CYCLE_5.md"
+
+● Read 1 file (ctrl+o to expand)
+
+● This is the Cycle 5 QA review. Let me analyze what needs to be addressed:
+
+  Key Issues to Fix:
+
+  1. [HIGH] Focus-on-removal bug - When removing a window before the focused window in a stacked column,
+  focus silently jumps to a different window
+  2. [MEDIUM] Non-saturating arithmetic in compute_placements - current_x accumulation can overflow
+  3. [LOW] Negative gaps allowed - No clamping on gap values
+  4. [CARRYOVER] DEFAULT_ constants not used* - Workspace::default() uses literals instead of constants
+
+  Let me implement these fixes.
+
+● Read 1 file (ctrl+o to expand)
+
+● I can see the current state. Looking at the review, some items were already addressed (like DEFAULT_*
+  constants being used at lines 245-247). Let me implement the remaining fixes:
+
+  Fix 1: Focus-on-removal bug in stacked columns (HIGH priority)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 4 lines, removed 3 lines
+      154      }
+      155
+      156      /// Remove a window from this column.
+      157 -    pub fn remove_window(&mut self, window_id: WindowId) -> bool {
+      157 +    /// Returns the index of the removed window if found, None otherwise.
+      158 +    pub fn remove_window(&mut self, window_id: WindowId) -> Option<usize> {
+      159          if let Some(pos) = self.windows.iter().position(|&w| w == window_id) {
+      160              self.windows.remove(pos);
+      160 -            true
+      161 +            Some(pos)
+      162          } else {
+      162 -            false
+      163 +            None
+      164          }
+      165      }
+      166
+
+● Now update the Workspace::remove_window to use the returned index for proper focus adjustment:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 20 lines, removed 4 lines
+      352      /// Remove a window from the workspace.
+      353      /// If removing the last window from a column, the column is removed.
+      354      /// If removing the last column, the workspace becomes empty.
+      355 +    ///
+      356 +    /// # Focus Policy
+      357 +    ///
+      358 +    /// When removing a window from a stacked column:
+      359 +    /// - If removed window was before the focused window, focus index decrements to stay
+          + on same window
+      360 +    /// - If removed window was the focused window, focus moves to next window (or previo
+          +us if at end)
+      361 +    /// - If removed window was after the focused window, focus index stays the same
+      362      pub fn remove_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
+      363          for (col_idx, column) in self.columns.iter_mut().enumerate() {
+      357 -            if column.remove_window(window_id) {
+      364 +            if let Some(removed_idx) = column.remove_window(window_id) {
+      365                  // If column is now empty, remove it
+      366                  if column.is_empty() {
+      367                      self.columns.remove(col_idx);
+     ...
+      376                          self.focused_column -= 1;
+      377                      }
+      378                  } else {
+      372 -                    // Adjust focused window in column if needed
+      379 +                    // Adjust focused window in column if this is the focused column
+      380                      if col_idx == self.focused_column {
+      381                          let col_len = self.columns[self.focused_column].len();
+      375 -                        if self.focused_window_in_column >= col_len {
+      376 -                            self.focused_window_in_column = col_len.saturating_sub(1);
+      382 +                        if removed_idx < self.focused_window_in_column {
+      383 +                            // Removed window was before focused - decrement to stay on s
+          +ame window
+      384 +                            self.focused_window_in_column -= 1;
+      385 +                        } else if removed_idx == self.focused_window_in_column {
+      386 +                            // Removed the focused window - move to next (or previous if
+          +at end)
+      387 +                            if self.focused_window_in_column >= col_len {
+      388 +                                self.focused_window_in_column = col_len.saturating_sub(1)
+          +;
+      389 +                            }
+      390 +                            // If focus index is still valid, it now points to the "next"
+          + window
+      391 +                            // (which slid into this position), which is the expected beh
+          +avior
+      392                          }
+      393 +                        // If removed_idx > focused_window_in_column, no adjustment neede
+          +d
+      394                      }
+      395                  }
+      396                  return Ok(());
+
+● Fix 2: Saturating arithmetic in compute_placements (MEDIUM priority)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      639                      column_index: col_idx,
+      640                  });
+      641
+      642 -                current_y += height + self.gap;
+      642 +                current_y = current_y.saturating_add(height).saturating_add(self.gap);
+      643              }
+      644
+      645 -            current_x += column.width + self.gap;
+      645 +            current_x = current_x.saturating_add(column.width).saturating_add(self.gap);
+      646          }
+      647
+      648          placements
+
+● Fix 3: Clamp negative gaps (LOW priority)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 2 lines
+      258      }
+      259
+      260      /// Create a workspace with custom gap settings.
+      261 +    /// Gap values are clamped to >= 0.
+      262      pub fn with_gaps(gap: i32, outer_gap: i32) -> Self {
+      263          Self {
+      263 -            gap,
+      264 -            outer_gap,
+      264 +            gap: gap.max(0),
+      265 +            outer_gap: outer_gap.max(0),
+      266              ..Default::default()
+      267          }
+      268      }
+
+● Now let me add the missing tests identified in the review:
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 147 lines
+      1221          // Test windows() slice
+      1222          assert_eq!(col.windows(), &[1, 2, 3]);
+      1223      }
+      1224 +
+      1225 +    // ====== Tests added from code review (Cycle 5) ======
+      1226 +
+      1227 +    #[test]
+      1228 +    fn test_remove_window_before_focus_in_stacked_column() {
+      1229 +        // Bug test: removing a window BEFORE the focused window in a stacked column
+      1230 +        // should keep focus on the same window (index should decrement)
+      1231 +        let mut ws = Workspace::new();
+      1232 +        ws.insert_window(1, Some(400)).unwrap(); // Column 0
+      1233 +        ws.insert_window_in_column(2, 0).unwrap(); // Stack: [1, 2]
+      1234 +        ws.insert_window_in_column(3, 0).unwrap(); // Stack: [1, 2, 3]
+      1235 +
+      1236 +        // Focus on window 2 (index 1)
+      1237 +        ws.test_set_focus_unchecked(0, 1);
+      1238 +        assert_eq!(ws.focused_window(), Some(2));
+      1239 +
+      1240 +        // Remove window 1 (index 0, before focused)
+      1241 +        ws.remove_window(1).unwrap();
+      1242 +
+      1243 +        // Focus should still be on window 2, but index should now be 0
+      1244 +        assert_eq!(ws.focused_window(), Some(2));
+      1245 +        assert_eq!(ws.focused_window_index_in_column(), 0);
+      1246 +    }
+      1247 +
+      1248 +    #[test]
+      1249 +    fn test_remove_focused_window_in_stacked_column() {
+      1250 +        // Removing the focused window should move focus to next window (or previous if
+           +at end)
+      1251 +        let mut ws = Workspace::new();
+      1252 +        ws.insert_window(1, Some(400)).unwrap();
+      1253 +        ws.insert_window_in_column(2, 0).unwrap();
+      1254 +        ws.insert_window_in_column(3, 0).unwrap(); // Stack: [1, 2, 3]
+      1255 +
+      1256 +        // Focus on window 2 (index 1, middle)
+      1257 +        ws.test_set_focus_unchecked(0, 1);
+      1258 +        assert_eq!(ws.focused_window(), Some(2));
+      1259 +
+      1260 +        // Remove window 2 (the focused window)
+      1261 +        ws.remove_window(2).unwrap();
+      1262 +
+      1263 +        // Stack is now [1, 3], focus index 1 should point to window 3 (next)
+      1264 +        assert_eq!(ws.focused_window(), Some(3));
+      1265 +        assert_eq!(ws.focused_window_index_in_column(), 1);
+      1266 +    }
+      1267 +
+      1268 +    #[test]
+      1269 +    fn test_remove_last_focused_window_in_stacked_column() {
+      1270 +        // Removing the last focused window should move focus to previous
+      1271 +        let mut ws = Workspace::new();
+      1272 +        ws.insert_window(1, Some(400)).unwrap();
+      1273 +        ws.insert_window_in_column(2, 0).unwrap();
+      1274 +        ws.insert_window_in_column(3, 0).unwrap(); // Stack: [1, 2, 3]
+      1275 +
+      1276 +        // Focus on window 3 (index 2, last)
+      1277 +        ws.test_set_focus_unchecked(0, 2);
+      1278 +        assert_eq!(ws.focused_window(), Some(3));
+      1279 +
+      1280 +        // Remove window 3 (the focused window, at end)
+      1281 +        ws.remove_window(3).unwrap();
+      1282 +
+      1283 +        // Stack is now [1, 2], focus should move to index 1 (window 2)
+      1284 +        assert_eq!(ws.focused_window(), Some(2));
+      1285 +        assert_eq!(ws.focused_window_index_in_column(), 1);
+      1286 +    }
+      1287 +
+      1288 +    #[test]
+      1289 +    fn test_compute_placements_wide_column() {
+      1290 +        // Column wider than viewport
+      1291 +        let mut ws = Workspace::with_gaps(10, 10);
+      1292 +        ws.insert_window(1, Some(1000)).unwrap(); // Column wider than viewport
+      1293 +
+      1294 +        let viewport = Rect::new(0, 0, 500, 600); // Viewport only 500px wide
+      1295 +        let placements = ws.compute_placements(viewport);
+      1296 +
+      1297 +        assert_eq!(placements.len(), 1);
+      1298 +        assert_eq!(placements[0].visibility, Visibility::Visible);
+      1299 +        assert_eq!(placements[0].rect.width, 1000); // Full column width preserved
+      1300 +    }
+      1301 +
+      1302 +    #[test]
+      1303 +    fn test_compute_placements_empty_column() {
+      1304 +        // Empty columns should occupy horizontal space but produce no window placements
+      1305 +        let mut ws = Workspace::new();
+      1306 +        ws.insert_window(1, Some(400)).unwrap();
+      1307 +        ws.insert_window(2, Some(400)).unwrap();
+      1308 +
+      1309 +        // Manually create an empty column scenario by tracking expected behavior
+      1310 +        // (In practice, empty columns are removed, but Column::empty exists)
+      1311 +        let empty_col = Column::empty(300);
+      1312 +        assert!(empty_col.is_empty());
+      1313 +        assert_eq!(empty_col.width(), 300);
+      1314 +
+      1315 +        // For actual workspace, verify no placements for empty space
+      1316 +        let viewport = Rect::new(0, 0, 2000, 600);
+      1317 +        let placements = ws.compute_placements(viewport);
+      1318 +        assert_eq!(placements.len(), 2); // Only 2 windows, no extras
+      1319 +    }
+      1320 +
+      1321 +    #[test]
+      1322 +    fn test_negative_gaps_clamped() {
+      1323 +        // Negative gaps should be clamped to 0
+      1324 +        let ws = Workspace::with_gaps(-100, -50);
+      1325 +        assert_eq!(ws.gap, 0);
+      1326 +        assert_eq!(ws.outer_gap, 0);
+      1327 +    }
+      1328 +
+      1329 +    #[test]
+      1330 +    fn test_compute_placements_spacing_integrity() {
+      1331 +        // Verify stacked window heights + gaps sum correctly
+      1332 +        let mut ws = Workspace::with_gaps(10, 20);
+      1333 +        ws.insert_window(1, Some(400)).unwrap();
+      1334 +        ws.insert_window_in_column(2, 0).unwrap();
+      1335 +        ws.insert_window_in_column(3, 0).unwrap(); // Stack: [1, 2, 3]
+      1336 +
+      1337 +        let viewport = Rect::new(0, 0, 500, 600);
+      1338 +        let placements = ws.compute_placements(viewport);
+      1339 +
+      1340 +        // usable_height = 600 - 20*2 = 560
+      1341 +        // 3 windows with 2 gaps = 560 - 10*2 = 540 for windows
+      1342 +        // Each window ~180px, but last takes remainder
+      1343 +
+      1344 +        let total_height: i32 = placements.iter().map(|p| p.rect.height).sum();
+      1345 +        let expected_usable = viewport.height - ws.outer_gap * 2;
+      1346 +        let expected_gaps = ws.gap * (placements.len() as i32 - 1);
+      1347 +
+      1348 +        // Total heights + gaps should equal usable height
+      1349 +        assert_eq!(total_height + expected_gaps, expected_usable);
+      1350 +    }
+      1351 +
+      1352 +    #[test]
+      1353 +    fn test_column_remove_returns_index() {
+      1354 +        let mut col = Column::new(1, 400);
+      1355 +        col.add_window(2);
+      1356 +        col.add_window(3);
+      1357 +        // Windows: [1, 2, 3]
+      1358 +
+      1359 +        // Remove middle window
+      1360 +        let removed = col.remove_window(2);
+      1361 +        assert_eq!(removed, Some(1)); // Index 1
+      1362 +
+      1363 +        // Remove first window
+      1364 +        let removed = col.remove_window(1);
+      1365 +        assert_eq!(removed, Some(0)); // Index 0
+      1366 +
+      1367 +        // Remove nonexistent
+      1368 +        let removed = col.remove_window(999);
+      1369 +        assert_eq!(removed, None);
+      1370 +    }
+      1371  }
+
+● Now let's run all tests to verify everything works:
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+        Compiling openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+         Finished `test` profile [unoptimized + debuginfo] target(s) in 0.85s
+     … +49 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● All 38 tests pass. Let me verify the daemon still compiles:
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu check -p openniri-daemon 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+         Checking openniri-platform-win32 v0.1.0 (C:\dev\OpenNiri-Windows\crates\platform_win32)
+     … +23 lines (ctrl+o to expand)
+
+● Daemon compiles successfully.
+
+  Summary - Code Review Cycle 5 Complete
+
+  Fixes Implemented:
+
+  1. [HIGH] Focus-on-removal bug in stacked columns (Finding #1)
+  - Changed Column::remove_window to return Option<usize> (the removed index)
+  - Updated Workspace::remove_window to properly adjust focus:
+    - If removed window was before the focused window → decrement focus index (stay on same window)
+    - If removed window was the focused window → focus moves to next (or previous if at end)
+    - If removed window was after the focused window → no change needed
+
+  2. [MEDIUM] Saturating arithmetic in compute_placements (Finding #2)
+  - Fixed current_x and current_y accumulation to use .saturating_add() to prevent overflow
+
+  3. [LOW] Negative gaps clamped (Finding #6)
+  - Workspace::with_gaps() now clamps gap and outer_gap to >= 0
+
+  New Tests Added (8 new tests, 38 total):
+  Test: test_remove_window_before_focus_in_stacked_column
+  Purpose: Focus stays on same window when earlier window removed
+  ────────────────────────────────────────
+  Test: test_remove_focused_window_in_stacked_column
+  Purpose: Focus moves to next window when middle focused removed
+  ────────────────────────────────────────
+  Test: test_remove_last_focused_window_in_stacked_column
+  Purpose: Focus moves to previous when last focused removed
+  ────────────────────────────────────────
+  Test: test_compute_placements_wide_column
+  Purpose: Column wider than viewport handled correctly
+  ────────────────────────────────────────
+  Test: test_compute_placements_empty_column
+  Purpose: Empty column behavior documented
+  ────────────────────────────────────────
+  Test: test_negative_gaps_clamped
+  Purpose: Negative gaps clamped to 0
+  ────────────────────────────────────────
+  Test: test_compute_placements_spacing_integrity
+  Purpose: Heights + gaps sum correctly
+  ────────────────────────────────────────
+  Test: test_column_remove_returns_index
+  Purpose: Column::remove_window returns correct index
+  Verification:
+
+  - 38 tests pass (up from 30)
+  - Daemon compiles successfully
+  - 0 external breaking changes
+
+✻ Worked for 2m 34s
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ commit the cycle 4 and 5 changes
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

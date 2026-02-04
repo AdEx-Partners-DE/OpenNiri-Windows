@@ -1,0 +1,10 @@
+# Cargo configuration for OpenNiri-Windows
+# Uses GNU toolchain with MinGW
+
+[build]
+# Default to GNU target
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+# MinGW linker
+linker = "gcc"

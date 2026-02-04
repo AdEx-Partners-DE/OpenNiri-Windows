@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core_layout",
     "crates/platform_win32",
+    "crates/ipc",
     "crates/daemon",
     "crates/cli",
 ]
@@ -18,7 +19,10 @@ authors = ["AdEx Partners <stark.burns@adexpartners.com>"]
 # Win32 bindings
 windows = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
@@ -40,3 +44,7 @@ clap = { version = "4", features = ["derive"] }
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# Configuration
+toml = "0.8"
+directories = "5"

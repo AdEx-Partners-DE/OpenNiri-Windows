@@ -1,0 +1,1053 @@
+
+╭─── Claude Code v2.1.29 ─────────────────────────────────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started                                      │
+│           Welcome back Stark!           │ Run /init to create a CLAUDE.md file with instructions for C… │
+│                                         │ ───────────────────────────────────────────────────────────── │
+│                                         │ Recent activity                                               │
+│                 ▐▛███▜▌                 │ No recent activity                                            │
+│                ▝▜█████▛▘                │                                                               │
+│                  ▘▘ ▝▝                  │                                                               │
+│   Opus 4.5 · Claude Max · Stark Burns   │                                                               │
+│         C:\dev\OpenNiri-Windows         │                                                               │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                                                       │
+│                                                                                                         │
+│ Code Review Cycle 2 - OpenNiri Core Layout Engine                                                       │
+│                                                                                                         │
+│ PHASE 1: DEEP ANALYSIS & BLUEPRINT                                                                      │
+│                                                                                                         │
+│ 1.1 Goal Definition                                                                                     │
+│                                                                                                         │
+│ Success Criteria: Improve the core_layout engine's safety, correctness, and robustness by addressing    │
+│ findings from Cycle 2 deep review. All changes must pass existing tests plus new tests for edge cases.  │
+│                                                                                                         │
+│ 1.2 Context & Reconnaissance                                                                            │
+│ ┌────────────────┬──────────────────────────────────────────────────────────┐                           │
+│ │     Aspect     │                         Details                          │                           │
+│ ├────────────────┼──────────────────────────────────────────────────────────┤                           │
+│ │ File           │ crates/core_layout/src/lib.rs (830 lines)                │                           │
+│ ├────────────────┼──────────────────────────────────────────────────────────┤                           │
+│ │ Tech Stack     │ Rust, serde, thiserror                                   │                           │
+│ ├────────────────┼──────────────────────────────────────────────────────────┤                           │
+│ │ Existing Tests │ 17 tests (all passing after Cycle 1)                     │                           │
+│ ├────────────────┼──────────────────────────────────────────────────────────┤                           │
+│ │ Patterns       │ Public struct fields, derive macros, Result-based errors │                           │
+│ └────────────────┴──────────────────────────────────────────────────────────┘                           │
+│ 1.3 Assumption Inventory                                                                                │
+│ ┌────────────────────────────────────┬────────────┬─────────────────────────────┐                       │
+│ │             Assumption             │   Status   │            Notes            │                       │
+│ ├────────────────────────────────────┼────────────┼─────────────────────────────┤                       │
+│ │ WindowIds are unique per workspace │ [RISKY]    │ Not enforced - Finding #1   │                       │
+│ ├────────────────────────────────────┼────────────┼─────────────────────────────┤                       │
+│ │ Column widths fit in i32           │ [VERIFIED] │ Clamped to MIN_COLUMN_WIDTH │                       │
+│ ├────────────────────────────────────┼────────────┼─────────────────────────────┤                       │
+│ │ Viewport dimensions are reasonable │ [RISKY]    │ No validation on Rect       │                       │
+│ ├────────────────────────────────────┼────────────┼─────────────────────────────┤                       │
+│ │ Focus indices stay valid           │ [VERIFIED] │ Cycle 1 fixed this          │                       │
+│ ├────────────────────────────────────┼────────────┼─────────────────────────────┤                       │
+│ │ Integer overflow won't occur       │ [RISKY]    │ No checked arithmetic       │                       │
+│ └────────────────────────────────────┴────────────┴─────────────────────────────┘                       │
+│ 1.4 Data Flow Trace                                                                                     │
+│                                                                                                         │
+│ User Action → Layout Mutation → State Update → compute_placements() → Window Rects                      │
+│                     ↓                                                                                   │
+│             Invariant Check (MISSING)                                                                   │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ PHASE 2: FINDINGS & FIXES                                                                               │
+│                                                                                                         │
+│ Finding #1: Duplicate WindowIds Silently Accepted [CRITICAL]                                            │
+│                                                                                                         │
+│ Problem: No validation prevents adding the same WindowId twice. Can corrupt state.                      │
+│                                                                                                         │
+│ Location: lib.rs:130-131 (add_window), lib.rs:233-246 (insert_window)                                   │
+│                                                                                                         │
+│ Proof of Bug:                                                                                           │
+│ ws.insert_window(42, Some(400));                                                                        │
+│ ws.insert_window_in_column(42, 0).unwrap();  // Silently allows duplicate!                              │
+│ // Now remove_window(42) only removes first occurrence                                                  │
+│                                                                                                         │
+│ Fix: Add helper method to check for duplicates, validate in all insertion paths.                        │
+│                                                                                                         │
+│ impl Workspace {                                                                                        │
+│     /// Check if a window ID already exists in the workspace.                                           │
+│     pub fn contains_window(&self, window_id: WindowId) -> bool {                                        │
+│         self.columns.iter().any(|c| c.windows.contains(&window_id))                                     │
+│     }                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ // In insert_window():                                                                                  │
+│ pub fn insert_window(&mut self, window_id: WindowId, width: Option<i32>) -> Result<(), LayoutError> {   │
+│     if self.contains_window(window_id) {                                                                │
+│         return Err(LayoutError::DuplicateWindow(window_id));                                            │
+│     }                                                                                                   │
+│     // ... rest of implementation                                                                       │
+│ }                                                                                                       │
+│                                                                                                         │
+│ // Add new error variant:                                                                               │
+│ #[error("Window {0} already exists in workspace")]                                                      │
+│ DuplicateWindow(WindowId),                                                                              │
+│                                                                                                         │
+│ Breaking Change: insert_window signature changes from () to Result<(), LayoutError>.                    │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #2: Magic Number 100 Used Instead of Constant [HIGH]                                            │
+│                                                                                                         │
+│ Problem: Line 487 uses hardcoded 100 instead of MIN_COLUMN_WIDTH.                                       │
+│                                                                                                         │
+│ Location: lib.rs:487                                                                                    │
+│                                                                                                         │
+│ Current Code:                                                                                           │
+│ let new_width = (column.width + delta).max(100); // Hardcoded!                                          │
+│                                                                                                         │
+│ Fix:                                                                                                    │
+│ let new_width = (column.width + delta).max(MIN_COLUMN_WIDTH);                                           │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #3: Rect Allows Invalid Dimensions [HIGH]                                                       │
+│                                                                                                         │
+│ Problem: Rect::new() accepts negative width/height without validation.                                  │
+│                                                                                                         │
+│ Location: lib.rs:41-43                                                                                  │
+│                                                                                                         │
+│ Fix Options:                                                                                            │
+│ - Option A (Defensive): Clamp to 0 in constructor                                                       │
+│ - Option B (Strict): Return Result or panic on invalid input                                            │
+│ - Recommended: Option A - matches the pattern used elsewhere (silent clamping)                          │
+│                                                                                                         │
+│ pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {                                           │
+│     Self {                                                                                              │
+│         x,                                                                                              │
+│         y,                                                                                              │
+│         width: width.max(0),                                                                            │
+│         height: height.max(0),                                                                          │
+│     }                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #4: Integer Overflow in total_width() [HIGH]                                                    │
+│                                                                                                         │
+│ Problem: Sum of column widths can overflow i32 with many columns.                                       │
+│                                                                                                         │
+│ Location: lib.rs:224-228                                                                                │
+│                                                                                                         │
+│ Fix: Use saturating arithmetic to prevent panic/wrap.                                                   │
+│                                                                                                         │
+│ pub fn total_width(&self) -> i32 {                                                                      │
+│     if self.columns.is_empty() {                                                                        │
+│         return 0;                                                                                       │
+│     }                                                                                                   │
+│                                                                                                         │
+│     let column_widths: i32 = self.columns.iter()                                                        │
+│         .map(|c| c.width)                                                                               │
+│         .fold(0i32, |acc, w| acc.saturating_add(w));                                                    │
+│     let gaps = self.gap.saturating_mul(self.columns.len().saturating_sub(1) as i32);                    │
+│     let outer_gaps = self.outer_gap.saturating_mul(2);                                                  │
+│                                                                                                         │
+│     column_widths.saturating_add(gaps).saturating_add(outer_gaps)                                       │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #5: Column::empty() Never Tested [MEDIUM]                                                       │
+│                                                                                                         │
+│ Problem: Public constructor exists but has no test coverage.                                            │
+│                                                                                                         │
+│ Location: lib.rs:112-117                                                                                │
+│                                                                                                         │
+│ Fix: Add test.                                                                                          │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_column_empty_constructor() {                                                                    │
+│     let col = Column::empty(50);                                                                        │
+│     assert_eq!(col.width, 100);  // Clamped to MIN_COLUMN_WIDTH                                         │
+│     assert!(col.is_empty());                                                                            │
+│     assert_eq!(col.len(), 0);                                                                           │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #6: Missing Tests for Rect::right() and Rect::bottom() [MEDIUM]                                 │
+│                                                                                                         │
+│ Location: lib.rs:54-61                                                                                  │
+│                                                                                                         │
+│ Fix: Add tests.                                                                                         │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_rect_right_and_bottom() {                                                                       │
+│     let r = Rect::new(10, 20, 100, 50);                                                                 │
+│     assert_eq!(r.right(), 110);                                                                         │
+│     assert_eq!(r.bottom(), 70);                                                                         │
+│                                                                                                         │
+│     // Edge case: negative coordinates                                                                  │
+│     let r2 = Rect::new(-50, -30, 100, 80);                                                              │
+│     assert_eq!(r2.right(), 50);                                                                         │
+│     assert_eq!(r2.bottom(), 50);                                                                        │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #7: Focus Operations on Empty Workspace Not Tested [MEDIUM]                                     │
+│                                                                                                         │
+│ Problem: No test verifies focus operations are safe on empty workspace.                                 │
+│                                                                                                         │
+│ Location: lib.rs:301-338                                                                                │
+│                                                                                                         │
+│ Fix: Add comprehensive test.                                                                            │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_focus_operations_on_empty_workspace() {                                                         │
+│     let mut ws = Workspace::new();                                                                      │
+│                                                                                                         │
+│     // All focus operations should safely do nothing                                                    │
+│     ws.focus_left();                                                                                    │
+│     ws.focus_right();                                                                                   │
+│     ws.focus_up();                                                                                      │
+│     ws.focus_down();                                                                                    │
+│                                                                                                         │
+│     assert!(ws.focused_window().is_none());                                                             │
+│     assert_eq!(ws.focused_column, 0);                                                                   │
+│     assert_eq!(ws.focused_window_in_column, 0);                                                         │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #8: Remove Window Edge Cases Not Tested [MEDIUM]                                                │
+│                                                                                                         │
+│ Location: lib.rs:269-298                                                                                │
+│                                                                                                         │
+│ Fix: Add edge case tests.                                                                               │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_remove_nonexistent_window() {                                                                   │
+│     let mut ws = Workspace::new();                                                                      │
+│     let result = ws.remove_window(999);                                                                 │
+│     assert!(matches!(result, Err(LayoutError::WindowNotFound(999))));                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ #[test]                                                                                                 │
+│ fn test_remove_window_adjusts_focus_correctly() {                                                       │
+│     let mut ws = Workspace::new();                                                                      │
+│     ws.insert_window(1, Some(400));                                                                     │
+│     ws.insert_window(2, Some(400));                                                                     │
+│     ws.insert_window(3, Some(400));                                                                     │
+│                                                                                                         │
+│     // Focus on column 2 (window 3)                                                                     │
+│     ws.focused_column = 2;                                                                              │
+│                                                                                                         │
+│     // Remove from column 0                                                                             │
+│     ws.remove_window(1).unwrap();                                                                       │
+│                                                                                                         │
+│     // Focus should adjust: was 2, column 0 removed, now should be 1                                    │
+│     assert_eq!(ws.focused_column, 1);                                                                   │
+│     assert_eq!(ws.focused_window(), Some(3));                                                           │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #9: Add Invariant Documentation [MEDIUM]                                                        │
+│                                                                                                         │
+│ Problem: No documentation explains the invariants that must hold.                                       │
+│                                                                                                         │
+│ Fix: Add doc comment to Workspace struct.                                                               │
+│                                                                                                         │
+│ /// The scrollable workspace.                                                                           │
+│ ///                                                                                                     │
+│ /// # Invariants                                                                                        │
+│ ///                                                                                                     │
+│ /// The following invariants are maintained by all methods:                                             │
+│ ///                                                                                                     │
+│ /// 1. **No duplicate windows:** Each `WindowId` appears at most once.                                  │
+│ /// 2. **Valid focus:** If `columns` is empty, `focused_window()` returns `None`.                       │
+│ ///    Otherwise, `focused_column < columns.len()` and                                                  │
+│ ///    `focused_window_in_column < columns[focused_column].len()`.                                      │
+│ /// 3. **Valid column widths:** All column widths are >= `MIN_COLUMN_WIDTH` (100px).                    │
+│ /// 4. **Valid scroll range:** `0.0 <= scroll_offset <= max_scroll` where                               │
+│ ///    `max_scroll = (total_width() - viewport_width).max(0)`.                                          │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Finding #10: Default Values Should Be Constants [LOW]                                                   │
+│                                                                                                         │
+│ Location: lib.rs:180-189                                                                                │
+│                                                                                                         │
+│ Fix: Extract to module-level constants.                                                                 │
+│                                                                                                         │
+│ /// Default gap between columns in pixels.                                                              │
+│ pub const DEFAULT_GAP: i32 = 10;                                                                        │
+│ /// Default gap at viewport edges in pixels.                                                            │
+│ pub const DEFAULT_OUTER_GAP: i32 = 10;                                                                  │
+│ /// Default width for new columns in pixels.                                                            │
+│ pub const DEFAULT_COLUMN_WIDTH: i32 = 800;                                                              │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Files to Modify                                                                                         │
+│ ┌───────────────────────────────┬─────────────────┐                                                     │
+│ │             File              │     Changes     │                                                     │
+│ ├───────────────────────────────┼─────────────────┤                                                     │
+│ │ crates/core_layout/src/lib.rs │ All fixes above │                                                     │
+│ └───────────────────────────────┴─────────────────┘                                                     │
+│ ---                                                                                                     │
+│ Implementation Order                                                                                    │
+│                                                                                                         │
+│ 1. Add constants (DEFAULT_GAP, DEFAULT_OUTER_GAP, DEFAULT_COLUMN_WIDTH)                                 │
+│ 2. Fix magic number in resize_focused_column() → use MIN_COLUMN_WIDTH                                   │
+│ 3. Add Rect::new() dimension clamping                                                                   │
+│ 4. Add DuplicateWindow error variant                                                                    │
+│ 5. Add contains_window() method                                                                         │
+│ 6. Update insert_window() to return Result and check duplicates                                         │
+│ 7. Update insert_window_in_column() to check duplicates                                                 │
+│ 8. Fix total_width() to use saturating arithmetic                                                       │
+│ 9. Add invariant documentation                                                                          │
+│ 10. Add all new tests (8 tests)                                                                         │
+│ 11. Run cargo test to verify                                                                            │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ New Tests Summary                                                                                       │
+│ ┌─────┬────────────────────────────────────────────┬───────────────────────────────────┐                │
+│ │  #  │                 Test Name                  │              Purpose              │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 1   │ test_column_empty_constructor              │ Column::empty() works correctly   │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 2   │ test_rect_right_and_bottom                 │ Rect edge accessors work          │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 3   │ test_focus_operations_on_empty_workspace   │ Focus ops are safe when empty     │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 4   │ test_remove_nonexistent_window             │ Error returned for missing window │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 5   │ test_remove_window_adjusts_focus_correctly │ Focus adjusts on removal          │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 6   │ test_duplicate_window_rejected             │ Duplicates are rejected           │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 7   │ test_rect_clamps_negative_dimensions       │ Rect validates dimensions         │                │
+│ ├─────┼────────────────────────────────────────────┼───────────────────────────────────┤                │
+│ │ 8   │ test_total_width_saturates                 │ Overflow is handled               │                │
+│ └─────┴────────────────────────────────────────────┴───────────────────────────────────┘                │
+│ ---                                                                                                     │
+│ Verification                                                                                            │
+│                                                                                                         │
+│ 1. cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout - All tests pass                    │
+│ 2. Manual review of public API changes (insert_window now returns Result)                               │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ PHASE 3: SELF-CORRECTION & QA                                                                           │
+│                                                                                                         │
+│ Breaking Change Warning                                                                                 │
+│                                                                                                         │
+│ insert_window() signature change: ✅ APPROVED BY USER                                                   │
+│ - Old: pub fn insert_window(&mut self, window_id: WindowId, width: Option<i32>)                         │
+│ - New: pub fn insert_window(&mut self, window_id: WindowId, width: Option<i32>) -> Result<(),           │
+│ LayoutError>                                                                                            │
+│                                                                                                         │
+│ Callers must now handle the Result. Update test calls to use .unwrap().                                 │
+│                                                                                                         │
+│ Deferred Items (Future Cycle)                                                                           │
+│ ┌────────────────────────────┬──────────────────────────────────────────────────┐                       │
+│ │            Item            │                      Reason                      │                       │
+│ ├────────────────────────────┼──────────────────────────────────────────────────┤                       │
+│ │ column_x() caching         │ Performance optimization - needs profiling first │                       │
+│ ├────────────────────────────┼──────────────────────────────────────────────────┤                       │
+│ │ Private fields + accessors │ Large refactor affecting all callers             │                       │
+│ ├────────────────────────────┼──────────────────────────────────────────────────┤                       │
+│ │ Newtype indices            │ Nice-to-have, significant API change             │                       │
+│ ├────────────────────────────┼──────────────────────────────────────────────────┤                       │
+│ │ Serialization versioning   │ Needs broader architectural discussion           │                       │
+│ └────────────────────────────┴──────────────────────────────────────────────────┘                       │
+│ Risk Assessment                                                                                         │
+│ ┌──────────────────────────────────┬────────────────────────────────────────────────┐                   │
+│ │               Risk               │                   Mitigation                   │                   │
+│ ├──────────────────────────────────┼────────────────────────────────────────────────┤                   │
+│ │ Breaking API change              │ Tests will catch any missed call sites         │                   │
+│ ├──────────────────────────────────┼────────────────────────────────────────────────┤                   │
+│ │ Saturating math changes behavior │ Only affects extreme edge cases, safer default │                   │
+│ ├──────────────────────────────────┼────────────────────────────────────────────────┤                   │
+│ │ Rect clamping changes behavior   │ May affect callers expecting exact values      │                   │
+│ └──────────────────────────────────┴────────────────────────────────────────────────┘                   │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+● I'll implement this plan for Code Review Cycle 2. Let me start by reading the current state of the file.
+
+● Read 1 file (ctrl+o to expand)
+
+● Now I have the current state. Let me implement the changes in order as specified in the plan. I'll start
+  with tasks and track progress.
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 7 lines
+      13  /// Minimum width for columns in pixels.
+      14  const MIN_COLUMN_WIDTH: i32 = 100;
+      15
+      16 +/// Default gap between columns in pixels.
+      17 +pub const DEFAULT_GAP: i32 = 10;
+      18 +/// Default gap at viewport edges in pixels.
+      19 +pub const DEFAULT_OUTER_GAP: i32 = 10;
+      20 +/// Default width for new columns in pixels.
+      21 +pub const DEFAULT_COLUMN_WIDTH: i32 = 800;
+      22 +
+      23  /// Unique identifier for a window.
+      24  /// On Windows, this will typically be the HWND cast to u64.
+      25  pub type WindowId = u64;
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      491      /// Resize the focused column by a delta amount.
+      492      pub fn resize_focused_column(&mut self, delta: i32) {
+      493          if let Some(column) = self.columns.get_mut(self.focused_column) {
+      494 -            let new_width = (column.width + delta).max(100); // Minimum width
+      494 +            let new_width = (column.width + delta).max(MIN_COLUMN_WIDTH);
+      495              column.width = new_width;
+      496          }
+      497      }
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 7 lines, removed 1 line
+      45
+      46  impl Rect {
+      47      /// Create a new rectangle.
+      48 +    /// Width and height are clamped to >= 0 to prevent invalid dimensions.
+      49      pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+      49 -        Self { x, y, width, height }
+      50 +        Self {
+      51 +            x,
+      52 +            y,
+      53 +            width: width.max(0),
+      54 +            height: height.max(0),
+      55 +        }
+      56      }
+      57
+      58      /// Check if this rectangle intersects with another.
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines
+      32
+      33      #[error("Window {0} not found in workspace")]
+      34      WindowNotFound(WindowId),
+      35 +
+      36 +    #[error("Window {0} already exists in workspace")]
+      37 +    DuplicateWindow(WindowId),
+      38  }
+      39
+      40  /// A rectangle in screen coordinates (pixels).
+
+● Now I need to read the current state of the Workspace impl to add contains_window method in the right
+  place.
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 5 lines
+      231          self.columns.len()
+      232      }
+      233
+      234 +    /// Check if a window ID already exists in the workspace.
+      235 +    pub fn contains_window(&self, window_id: WindowId) -> bool {
+      236 +        self.columns.iter().any(|c| c.windows.contains(&window_id))
+      237 +    }
+      238 +
+      239      /// Get the total width of the strip (sum of all column widths + gaps).
+      240      pub fn total_width(&self) -> i32 {
+      241          if self.columns.is_empty() {
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 10 lines, removed 1 line
+      251
+      252      /// Insert a new window as a new column to the right of the focused column.
+      253      /// Column width is clamped to MIN_COLUMN_WIDTH (100px) minimum.
+      254 -    pub fn insert_window(&mut self, window_id: WindowId, width: Option<i32>) {
+      254 +    ///
+      255 +    /// # Errors
+      256 +    ///
+      257 +    /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
+      258 +    pub fn insert_window(&mut self, window_id: WindowId, width: Option<i32>) -> Result<()
+          +, LayoutError> {
+      259 +        if self.contains_window(window_id) {
+      260 +            return Err(LayoutError::DuplicateWindow(window_id));
+      261 +        }
+      262 +
+      263          let column_width = width.unwrap_or(self.default_column_width).max(MIN_COLUMN_WIDT
+           H);
+      264          let new_column = Column::new(window_id, column_width);
+      265
+     ...
+      273              self.focused_column = insert_pos;
+      274          }
+      275          self.focused_window_in_column = 0;
+      276 +        Ok(())
+      277      }
+      278
+      279      /// Insert a window into an existing column (stacking).
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 9 lines
+      277      }
+      278
+      279      /// Insert a window into an existing column (stacking).
+      280 +    ///
+      281 +    /// # Errors
+      282 +    ///
+      283 +    /// Returns `LayoutError::ColumnOutOfBounds` if the column index is invalid.
+      284 +    /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
+      285      pub fn insert_window_in_column(
+      286          &mut self,
+      287          window_id: WindowId,
+      288          column_index: usize,
+      289      ) -> Result<(), LayoutError> {
+      290 +        if self.contains_window(window_id) {
+      291 +            return Err(LayoutError::DuplicateWindow(window_id));
+      292 +        }
+      293 +
+      294          if column_index >= self.columns.len() {
+      295              return Err(LayoutError::ColumnOutOfBounds(
+      296                  column_index,
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 6 lines, removed 4 lines
+      242              return 0;
+      243          }
+      244
+      245 -        let column_widths: i32 = self.columns.iter().map(|c| c.width).sum();
+      246 -        let gaps = self.gap * (self.columns.len() as i32 - 1);
+      247 -        let outer_gaps = self.outer_gap * 2;
+      245 +        let column_widths: i32 = self.columns.iter()
+      246 +            .map(|c| c.width)
+      247 +            .fold(0i32, |acc, w| acc.saturating_add(w));
+      248 +        let gaps = self.gap.saturating_mul(self.columns.len().saturating_sub(1) as i32);
+      249 +        let outer_gaps = self.outer_gap.saturating_mul(2);
+      250
+      249 -        column_widths + gaps + outer_gaps
+      251 +        column_widths.saturating_add(gaps).saturating_add(outer_gaps)
+      252      }
+      253
+      254      /// Insert a new window as a new column to the right of the focused column.
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 12 lines
+      171
+      172  /// The scrollable workspace.
+      173  /// This is the core data structure representing the infinite horizontal strip.
+      174 +///
+      175 +/// # Invariants
+      176 +///
+      177 +/// The following invariants are maintained by all methods:
+      178 +///
+      179 +/// 1. **No duplicate windows:** Each `WindowId` appears at most once.
+      180 +/// 2. **Valid focus:** If `columns` is empty, `focused_window()` returns `None`.
+      181 +///    Otherwise, `focused_column < columns.len()` and
+      182 +///    `focused_window_in_column < columns[focused_column].len()`.
+      183 +/// 3. **Valid column widths:** All column widths are >= `MIN_COLUMN_WIDTH` (100px).
+      184 +/// 4. **Valid scroll range:** `0.0 <= scroll_offset <= max_scroll` where
+      185 +///    `max_scroll = (total_width() - viewport_width).max(0)`.
+      186  #[derive(Debug, Clone, Serialize, Deserialize)]
+      187  pub struct Workspace {
+      188      /// Columns in the workspace, ordered left to right.
+
+● Now let me read the test section to add the new tests.
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 106 lines, removed 2 lines
+      866      #[test]
+      867      fn test_scroll_offset_rounding() {
+      868          let mut ws = Workspace::with_gaps(10, 10);
+      869 -        ws.insert_window(1, Some(400));
+      870 -        ws.insert_window(2, Some(400));
+      869 +        ws.insert_window(1, Some(400)).unwrap();
+      870 +        ws.insert_window(2, Some(400)).unwrap();
+      871
+      872          // Set fractional scroll offset
+      873          ws.scroll_offset = 100.7;
+     ...
+      879          // The first column at x=10 should be at screen x = 10 - 101 + 0 = -91
+      880          assert_eq!(placements[0].rect.x, -91);
+      881      }
+      882 +
+      883 +    // ====== Tests added from code review (Cycle 2) ======
+      884 +
+      885 +    #[test]
+      886 +    fn test_column_empty_constructor() {
+      887 +        let col = Column::empty(50);
+      888 +        assert_eq!(col.width, 100); // Clamped to MIN_COLUMN_WIDTH
+      889 +        assert!(col.is_empty());
+      890 +        assert_eq!(col.len(), 0);
+      891 +    }
+      892 +
+      893 +    #[test]
+      894 +    fn test_rect_right_and_bottom() {
+      895 +        let r = Rect::new(10, 20, 100, 50);
+      896 +        assert_eq!(r.right(), 110);
+      897 +        assert_eq!(r.bottom(), 70);
+      898 +
+      899 +        // Edge case: negative coordinates
+      900 +        let r2 = Rect::new(-50, -30, 100, 80);
+      901 +        assert_eq!(r2.right(), 50);
+      902 +        assert_eq!(r2.bottom(), 50);
+      903 +    }
+      904 +
+      905 +    #[test]
+      906 +    fn test_focus_operations_on_empty_workspace() {
+      907 +        let mut ws = Workspace::new();
+      908 +
+      909 +        // All focus operations should safely do nothing
+      910 +        ws.focus_left();
+      911 +        ws.focus_right();
+      912 +        ws.focus_up();
+      913 +        ws.focus_down();
+      914 +
+      915 +        assert!(ws.focused_window().is_none());
+      916 +        assert_eq!(ws.focused_column, 0);
+      917 +        assert_eq!(ws.focused_window_in_column, 0);
+      918 +    }
+      919 +
+      920 +    #[test]
+      921 +    fn test_remove_nonexistent_window() {
+      922 +        let mut ws = Workspace::new();
+      923 +        let result = ws.remove_window(999);
+      924 +        assert!(matches!(result, Err(LayoutError::WindowNotFound(999))));
+      925 +    }
+      926 +
+      927 +    #[test]
+      928 +    fn test_remove_window_adjusts_focus_correctly() {
+      929 +        let mut ws = Workspace::new();
+      930 +        ws.insert_window(1, Some(400)).unwrap();
+      931 +        ws.insert_window(2, Some(400)).unwrap();
+      932 +        ws.insert_window(3, Some(400)).unwrap();
+      933 +
+      934 +        // Focus on column 2 (window 3)
+      935 +        ws.focused_column = 2;
+      936 +
+      937 +        // Remove from column 0
+      938 +        ws.remove_window(1).unwrap();
+      939 +
+      940 +        // Focus should adjust: was 2, column 0 removed, now should be 1
+      941 +        assert_eq!(ws.focused_column, 1);
+      942 +        assert_eq!(ws.focused_window(), Some(3));
+      943 +    }
+      944 +
+      945 +    #[test]
+      946 +    fn test_duplicate_window_rejected() {
+      947 +        let mut ws = Workspace::new();
+      948 +        ws.insert_window(42, Some(400)).unwrap();
+      949 +
+      950 +        // Try to insert same window as new column
+      951 +        let result = ws.insert_window(42, Some(400));
+      952 +        assert!(matches!(result, Err(LayoutError::DuplicateWindow(42))));
+      953 +
+      954 +        // Try to insert same window into existing column
+      955 +        let result = ws.insert_window_in_column(42, 0);
+      956 +        assert!(matches!(result, Err(LayoutError::DuplicateWindow(42))));
+      957 +
+      958 +        // Workspace should still have only one column with one window
+      959 +        assert_eq!(ws.column_count(), 1);
+      960 +        assert_eq!(ws.columns[0].len(), 1);
+      961 +    }
+      962 +
+      963 +    #[test]
+      964 +    fn test_rect_clamps_negative_dimensions() {
+      965 +        let r = Rect::new(10, 20, -100, -50);
+      966 +        assert_eq!(r.width, 0);
+      967 +        assert_eq!(r.height, 0);
+      968 +        assert_eq!(r.x, 10);
+      969 +        assert_eq!(r.y, 20);
+      970 +    }
+      971 +
+      972 +    #[test]
+      973 +    fn test_total_width_saturates() {
+      974 +        let mut ws = Workspace::new();
+      975 +
+      976 +        // Insert many columns with large widths to test saturation
+      977 +        for i in 0..1000 {
+      978 +            ws.insert_window(i, Some(i32::MAX / 100)).unwrap();
+      979 +        }
+      980 +
+      981 +        // Should saturate to i32::MAX instead of overflowing/panicking
+      982 +        let width = ws.total_width();
+      983 +        assert!(width > 0); // Should not wrap to negative
+      984 +        assert_eq!(width, i32::MAX); // Should saturate at max
+      985 +    }
+      986  }
+
+● Now I need to update all existing test calls to insert_window to use .unwrap(). Let me read through the
+  tests to find them all.
+
+● Read 1 file (ctrl+o to expand)
+
+● I need to add .unwrap() to all the insert_window calls. Let me do this with multiple edits.
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      581      #[test]
+      582      fn test_insert_window() {
+      583          let mut ws = Workspace::new();
+      584 -        ws.insert_window(1, Some(400));
+      584 +        ws.insert_window(1, Some(400)).unwrap();
+      585
+      586          assert!(!ws.is_empty());
+      587          assert_eq!(ws.column_count(), 1);
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      592      #[test]
+      593      fn test_insert_multiple_windows() {
+      594          let mut ws = Workspace::with_gaps(10, 10);
+      595 -        ws.insert_window(1, Some(400));
+      596 -        ws.insert_window(2, Some(600));
+      597 -        ws.insert_window(3, Some(400));
+      595 +        ws.insert_window(1, Some(400)).unwrap();
+      596 +        ws.insert_window(2, Some(600)).unwrap();
+      597 +        ws.insert_window(3, Some(400)).unwrap();
+      598
+      599          assert_eq!(ws.column_count(), 3);
+      600          // Last inserted window should be focused
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      609      #[test]
+      610      fn test_focus_navigation() {
+      611          let mut ws = Workspace::new();
+      612 -        ws.insert_window(1, Some(400));
+      613 -        ws.insert_window(2, Some(400));
+      614 -        ws.insert_window(3, Some(400));
+      612 +        ws.insert_window(1, Some(400)).unwrap();
+      613 +        ws.insert_window(2, Some(400)).unwrap();
+      614 +        ws.insert_window(3, Some(400)).unwrap();
+      615
+      616          assert_eq!(ws.focused_column, 2); // Last inserted
+      617
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      638      #[test]
+      639      fn test_remove_window() {
+      640          let mut ws = Workspace::new();
+      641 -        ws.insert_window(1, Some(400));
+      642 -        ws.insert_window(2, Some(400));
+      643 -        ws.insert_window(3, Some(400));
+      641 +        ws.insert_window(1, Some(400)).unwrap();
+      642 +        ws.insert_window(2, Some(400)).unwrap();
+      643 +        ws.insert_window(3, Some(400)).unwrap();
+      644
+      645          assert_eq!(ws.column_count(), 3);
+      646
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      661      #[test]
+      662      fn test_compute_placements_visibility() {
+      663          let mut ws = Workspace::with_gaps(10, 10);
+      664 -        ws.insert_window(1, Some(400)); // x: 10-410
+      665 -        ws.insert_window(2, Some(400)); // x: 420-820
+      666 -        ws.insert_window(3, Some(400)); // x: 830-1230
+      664 +        ws.insert_window(1, Some(400)).unwrap(); // x: 10-410
+      665 +        ws.insert_window(2, Some(400)).unwrap(); // x: 420-820
+      666 +        ws.insert_window(3, Some(400)).unwrap(); // x: 830-1230
+      667
+      668          ws.scroll_offset = 0.0;
+      669
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      689          let mut ws = Workspace::with_gaps(10, 10);
+      690          ws.centering_mode = CenteringMode::Center;
+      691
+      692 -        ws.insert_window(1, Some(400));
+      693 -        ws.insert_window(2, Some(400));
+      694 -        ws.insert_window(3, Some(400));
+      692 +        ws.insert_window(1, Some(400)).unwrap();
+      693 +        ws.insert_window(2, Some(400)).unwrap();
+      694 +        ws.insert_window(3, Some(400)).unwrap();
+      695
+      696          ws.focused_column = 0;
+      697          ws.scroll_offset = 500.0; // Start scrolled right
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      708      #[test]
+      709      fn test_stacked_windows() {
+      710          let mut ws = Workspace::new();
+      711 -        ws.insert_window(1, Some(400));
+      711 +        ws.insert_window(1, Some(400)).unwrap();
+      712          ws.insert_window_in_column(2, 0).unwrap();
+      713          ws.insert_window_in_column(3, 0).unwrap();
+      714
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      726      #[test]
+      727      fn test_resize_column() {
+      728          let mut ws = Workspace::new();
+      729 -        ws.insert_window(1, Some(400));
+      729 +        ws.insert_window(1, Some(400)).unwrap();
+      730
+      731          assert_eq!(ws.columns[0].width, 400);
+      732
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      744      #[test]
+      745      fn test_move_column() {
+      746          let mut ws = Workspace::new();
+      747 -        ws.insert_window(1, Some(400));
+      748 -        ws.insert_window(2, Some(400));
+      749 -        ws.insert_window(3, Some(400));
+      747 +        ws.insert_window(1, Some(400)).unwrap();
+      748 +        ws.insert_window(2, Some(400)).unwrap();
+      749 +        ws.insert_window(3, Some(400)).unwrap();
+      750
+      751          ws.focused_column = 1;
+      752          ws.move_column_left();
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      764      #[test]
+      765      fn test_scroll_by() {
+      766          let mut ws = Workspace::with_gaps(10, 10);
+      767 -        ws.insert_window(1, Some(400));
+      768 -        ws.insert_window(2, Some(400));
+      769 -        ws.insert_window(3, Some(400));
+      767 +        ws.insert_window(1, Some(400)).unwrap();
+      768 +        ws.insert_window(2, Some(400)).unwrap();
+      769 +        ws.insert_window(3, Some(400)).unwrap();
+      770
+      771          let viewport_width = 500;
+      772
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      799      #[test]
+      800      fn test_remove_last_window_empties_workspace() {
+      801          let mut ws = Workspace::new();
+      802 -        ws.insert_window(1, Some(400));
+      802 +        ws.insert_window(1, Some(400)).unwrap();
+      803
+      804          ws.remove_window(1).unwrap();
+      805
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      815          let mut ws = Workspace::with_gaps(10, 10);
+      816          ws.centering_mode = CenteringMode::JustInView;
+      817
+      818 -        ws.insert_window(1, Some(200)); // x: 10-210
+      819 -        ws.insert_window(2, Some(200)); // x: 220-420
+      820 -        ws.insert_window(3, Some(200)); // x: 430-630
+      818 +        ws.insert_window(1, Some(200)).unwrap(); // x: 10-210
+      819 +        ws.insert_window(2, Some(200)).unwrap(); // x: 220-420
+      820 +        ws.insert_window(3, Some(200)).unwrap(); // x: 430-630
+      821
+      822          ws.focused_column = 0;
+      823          ws.scroll_offset = 0.0;
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      836      #[test]
+      837      fn test_compute_placements_tight_viewport() {
+      838          let mut ws = Workspace::with_gaps(10, 50); // Large outer_gap
+      839 -        ws.insert_window(1, Some(400));
+      839 +        ws.insert_window(1, Some(400)).unwrap();
+      840          ws.insert_window_in_column(2, 0).unwrap();
+      841          ws.insert_window_in_column(3, 0).unwrap();
+      842
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      855          let mut ws = Workspace::new();
+      856
+      857          // Try to insert with zero width
+      858 -        ws.insert_window(1, Some(0));
+      858 +        ws.insert_window(1, Some(0)).unwrap();
+      859          assert_eq!(ws.columns[0].width, 100); // Clamped to minimum
+      860
+      861          // Try to insert with negative width
+      862 -        ws.insert_window(2, Some(-50));
+      862 +        ws.insert_window(2, Some(-50)).unwrap();
+      863          assert_eq!(ws.columns[1].width, 100); // Clamped to minimum
+      864      }
+      865
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+
+     running 25 tests
+     … +36 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● All 25 tests pass. Let me mark the task as completed and provide a summary.
+
+● Code Review Cycle 2 implementation complete. All 25 tests pass.
+
+  Summary of Changes
+
+  Constants Added:
+  - DEFAULT_GAP (10)
+  - DEFAULT_OUTER_GAP (10)
+  - DEFAULT_COLUMN_WIDTH (800)
+
+  Bug Fixes:
+  1. Finding #1 - Duplicate WindowIds now rejected with DuplicateWindow error
+  2. Finding #2 - Magic number 100 replaced with MIN_COLUMN_WIDTH
+  3. Finding #3 - Rect::new() now clamps negative dimensions to 0
+  4. Finding #4 - total_width() uses saturating arithmetic to prevent overflow
+
+  API Changes:
+  - insert_window() now returns Result<(), LayoutError> (breaking change)
+  - insert_window_in_column() now checks for duplicate windows
+  - Added contains_window() helper method
+
+  Documentation:
+  - Added invariant documentation to Workspace struct
+
+  New Tests (8):
+  1. test_column_empty_constructor
+  2. test_rect_right_and_bottom
+  3. test_focus_operations_on_empty_workspace
+  4. test_remove_nonexistent_window
+  5. test_remove_window_adjusts_focus_correctly
+  6. test_duplicate_window_rejected
+  7. test_rect_clamps_negative_dimensions
+  8. test_total_width_saturates
+
+✻ Crunched for 5m 13s
+
+❯ • Created review file for Claude: docs/1_Progress and review/CODEX_REVIEW_CYCLE_3.md.
+
+    Key points in the review:
+
+    1. High: insert_window() now returns Result, but non-test code still calls it without handling
+  (e.g.,
+       crates/daemon/src/main.rs). This will break cargo build --all/CI.
+    2. Medium: DEFAULT_* constants exist but aren’t used in Workspace::default (risk of drift).
+    3. Medium: Invariants are documented but not enforceable due to public fields; external code can
+  violate
+       them.
+    4. Low: Rect::new clamps dimensions, but public fields allow bypass.
+    5. Low: compute_placements still has unchecked arithmetic for window_gaps, inconsistent with
+  total_width
+       saturation.
+
+● Good catch on the review findings. Let me address these issues, starting with the critical build-breaking
+   one.
+
+● Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Now I'll fix all issues. Let me create tasks and implement the fixes.
+
+● Update(crates\daemon\src\main.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      73
+      74      // For now, just demonstrate the layout engine
+      75      let mut demo_workspace = Workspace::with_gaps(10, 10);
+      76 -    demo_workspace.insert_window(1, Some(600));
+      77 -    demo_workspace.insert_window(2, Some(800));
+      78 -    demo_workspace.insert_window(3, Some(600));
+      76 +    demo_workspace.insert_window(1, Some(600)).unwrap();
+      77 +    demo_workspace.insert_window(2, Some(800)).unwrap();
+      78 +    demo_workspace.insert_window(3, Some(600)).unwrap();
+      79
+      80      info!("Demo workspace has {} columns", demo_workspace.column_count());
+      81      info!("Total strip width: {} pixels", demo_workspace.total_width());
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 3 lines
+      210              focused_column: 0,
+      211              focused_window_in_column: 0,
+      212              scroll_offset: 0.0,
+      213 -            gap: 10,
+      214 -            outer_gap: 10,
+      215 -            default_column_width: 800,
+      213 +            gap: DEFAULT_GAP,
+      214 +            outer_gap: DEFAULT_OUTER_GAP,
+      215 +            default_column_width: DEFAULT_COLUMN_WIDTH,
+      216              centering_mode: CenteringMode::default(),
+      217          }
+      218      }
+
+● Update(crates\core_layout\src\lib.rs)
+  ⎿  Added 3 lines, removed 2 lines
+      493
+      494              // Calculate window heights (equal split for stacked windows)
+      495              // Clamp usable_height to >= 0 to handle tight viewports
+      496 -            let usable_height = (viewport.height - self.outer_gap * 2).max(0);
+      496 +            // Use saturating arithmetic to prevent overflow
+      497 +            let usable_height = viewport.height.saturating_sub(self.outer_gap.saturating_
+          +mul(2)).max(0);
+      498              let window_count = column.windows.len() as i32;
+      499              let window_gaps = if window_count > 1 {
+      499 -                self.gap * (window_count - 1)
+      500 +                self.gap.saturating_mul(window_count - 1)
+      501              } else {
+      502                  0
+      503              };
+
+● Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu build --all)
+  ⎿  Error: Exit code 101
+      Downloading crates ...
+       Downloaded windows_x86_64_gnu v0.53.1
+        Compiling windows-link v0.2.1
+        Compiling windows_x86_64_gnu v0.53.1
+        Compiling once_cell v1.21.3
+        Compiling cfg-if v1.0.4
+        Compiling windows-link v0.1.3
+        Compiling anstyle v1.0.13
+        Compiling zmij v1.0.19
+     … +36 lines (ctrl+o to see all)
+
+● The build failed due to a Windows toolchain issue (dlltool.exe not found), not a code problem. Let me run
+   the core_layout tests to verify the code changes are correct.
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu test -p openniri-core-layout)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+
+     running 25 tests
+     … +36 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● All 25 tests pass. Let me also verify the daemon code compiles with cargo check.
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu check -p openniri-daemon 2>&1 | head -30)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking windows-link v0.2.1
+         Checking once_cell v1.21.3
+     … +28 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● Bash(cargo +stable-x86_64-pc-windows-gnu check -p openniri-daemon)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking tracing-core v0.1.36
+         Checking regex-automata v0.4.14
+     … +43 lines (ctrl+o to expand)
+  ⎿  (timeout 3m)
+
+● All code compiles and tests pass. Here's the summary of Cycle 3 fixes:
+
+  Cycle 3 Review Fixes
+  Finding: #1 High: insert_window() Result not handled in daemon
+  Fix Applied: Added .unwrap() to all 3 calls in crates/daemon/src/main.rs:76-78
+  ────────────────────────────────────────
+  Finding: #2 Medium: DEFAULT_* constants not used
+  Fix Applied: Updated Workspace::default() to use DEFAULT_GAP, DEFAULT_OUTER_GAP, DEFAULT_COLUMN_WIDTH
+  ────────────────────────────────────────
+  Finding: #5 Low: compute_placements unchecked arithmetic
+  Fix Applied: Changed self.outer_gap * 2 → self.outer_gap.saturating_mul(2) and self.gap * (window_count -
+
+    1) → self.gap.saturating_mul(window_count - 1)
+  Deferred items (require larger architectural changes):
+  - #3 Medium: Public fields allowing invariant violation - would require significant API refactor
+  - #4 Low: Rect public fields bypass clamping - same architectural concern
+
+  Build status:
+  - cargo check -p openniri-daemon - Compiles (warnings for unused code unrelated to these changes)
+  - cargo test -p openniri-core-layout - All 25 tests pass
+
+✻ Sautéed for 5m 0s
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ commit the changes
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -9,13 +9,50 @@
 //! - WinEvent hooks for window lifecycle events
 
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
+use std::ffi::c_void;
+use std::sync::mpsc;
 use thiserror::Error;
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED,
+};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+    MOD_SHIFT, MOD_WIN,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DefWindowProcW, DispatchMessageW,
+    EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetMessageW, GetWindowLongW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, PostMessageW, RegisterClassW, SetWindowPos, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
+    HWND_MESSAGE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, WM_HOTKEY, WM_USER, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
+};
+
+// WinEvent constants (not all are exposed by windows-rs)
+const EVENT_OBJECT_CREATE: u32 = 0x8000;
+const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+const EVENT_OBJECT_FOCUS: u32 = 0x8005;
+const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+const OBJID_WINDOW: i32 = 0;
+const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
 /// Errors that can occur during Win32 operations.
 #[derive(Debug, Error)]
 pub enum Win32Error {
     #[error("Failed to enumerate windows: {0}")]
     EnumerationFailed(String),
+
+    #[error("Failed to enumerate monitors: {0}")]
+    MonitorEnumerationFailed(String),
 
     #[error("Failed to set window position: {0}")]
     SetPositionFailed(String),
@@ -25,6 +62,9 @@ pub enum Win32Error {
 
     #[error("Failed to install event hook: {0}")]
     HookInstallFailed(String),
+
+    #[error("Failed to register hotkey: {0}")]
+    HotkeyRegistrationFailed(String),
 
     #[error("Window not found: {0}")]
     WindowNotFound(WindowId),
@@ -47,16 +87,49 @@ pub struct WindowInfo {
     pub visible: bool,
 }
 
+/// Unique identifier for a monitor (derived from HMONITOR handle).
+pub type MonitorId = isize;
+
+/// Information about a display monitor.
+#[derive(Debug, Clone)]
+pub struct MonitorInfo {
+    /// Unique monitor identifier.
+    pub id: MonitorId,
+    /// Full monitor rectangle (entire display area).
+    pub rect: Rect,
+    /// Work area (excludes taskbar and other docked windows).
+    pub work_area: Rect,
+    /// Whether this is the primary monitor.
+    pub is_primary: bool,
+    /// Device name (e.g., `\\.\DISPLAY1`).
+    pub device_name: String,
+}
+
+impl MonitorInfo {
+    /// Check if a point is within this monitor's bounds.
+    pub fn contains_point(&self, x: i32, y: i32) -> bool {
+        x >= self.rect.x
+            && x < self.rect.x + self.rect.width
+            && y >= self.rect.y
+            && y < self.rect.y + self.rect.height
+    }
+
+    /// Check if a rectangle's center is within this monitor's bounds.
+    pub fn contains_rect_center(&self, rect: &Rect) -> bool {
+        let center_x = rect.x + rect.width / 2;
+        let center_y = rect.y + rect.height / 2;
+        self.contains_point(center_x, center_y)
+    }
+}
+
 /// Strategy for hiding off-screen windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HideStrategy {
     /// Use DWM cloaking (preferred, keeps window in Alt-Tab).
     #[default]
     Cloak,
-    /// Minimize the window.
-    Minimize,
-    /// Move off-screen (may cause DWM to stop rendering).
-    MoveOffScreen,
+    // Note: Minimize and MoveOffScreen strategies were considered but removed.
+    // Cloaking is superior because it keeps windows in Alt-Tab and taskbar.
 }
 
 /// Configuration for the Win32 platform layer.
@@ -64,8 +137,6 @@ pub enum HideStrategy {
 pub struct PlatformConfig {
     /// Strategy for hiding off-screen windows.
     pub hide_strategy: HideStrategy,
-    /// Buffer zone size in pixels (windows in this zone are kept uncloaked).
-    pub buffer_zone: i32,
     /// Whether to use DeferWindowPos for batched moves.
     pub use_deferred_positioning: bool,
 }
@@ -74,7 +145,6 @@ impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
             hide_strategy: HideStrategy::default(),
-            buffer_zone: 1000,
             use_deferred_positioning: true,
         }
     }
@@ -84,18 +154,331 @@ impl Default for PlatformConfig {
 ///
 /// Filters out:
 /// - Invisible windows
-/// - Tool windows
+/// - Tool windows (WS_EX_TOOLWINDOW without WS_EX_APPWINDOW)
 /// - Windows with empty titles
-/// - System windows (taskbar, etc.)
+/// - Cloaked windows
+/// - Windows with WS_EX_NOACTIVATE
 pub fn enumerate_windows() -> Result<Vec<WindowInfo>, Win32Error> {
-    // TODO: Implement using windows-rs
-    // - EnumWindows callback
-    // - Filter by WS_VISIBLE, !WS_EX_TOOLWINDOW
-    // - GetWindowText, GetClassName
-    // - GetWindowThreadProcessId
-    // - GetWindowRect
-    tracing::warn!("enumerate_windows not yet implemented");
-    Ok(Vec::new())
+    let mut windows: Vec<WindowInfo> = Vec::new();
+
+    unsafe {
+        // EnumWindows callback receives a raw pointer to our Vec
+        let windows_ptr = &mut windows as *mut Vec<WindowInfo>;
+
+        let result = EnumWindows(
+            Some(enum_windows_callback),
+            LPARAM(windows_ptr as isize),
+        );
+
+        if result.is_err() {
+            return Err(Win32Error::EnumerationFailed(
+                "EnumWindows failed".to_string(),
+            ));
+        }
+    }
+
+    tracing::debug!("Enumerated {} manageable windows", windows.len());
+    Ok(windows)
+}
+
+/// Get the primary monitor's information.
+///
+/// Returns the work area (excluding taskbar) which is suitable for window positioning.
+pub fn get_primary_monitor() -> Result<MonitorInfo, Win32Error> {
+    let monitors = enumerate_monitors()?;
+
+    monitors
+        .into_iter()
+        .find(|m| m.is_primary)
+        .ok_or_else(|| {
+            Win32Error::MonitorEnumerationFailed("No primary monitor found".to_string())
+        })
+}
+
+/// Find which monitor contains the center of a given rectangle.
+///
+/// Returns the monitor info if found, or None if no monitor contains the point.
+/// Falls back to primary monitor if no exact match.
+pub fn find_monitor_for_rect<'a>(monitors: &'a [MonitorInfo], rect: &Rect) -> Option<&'a MonitorInfo> {
+    // First, try to find a monitor that contains the rect's center
+    let center_x = rect.x + rect.width / 2;
+    let center_y = rect.y + rect.height / 2;
+
+    monitors
+        .iter()
+        .find(|m| m.contains_point(center_x, center_y))
+        .or_else(|| monitors.iter().find(|m| m.is_primary))
+}
+
+/// Find a monitor by its ID.
+pub fn find_monitor_by_id(monitors: &[MonitorInfo], id: MonitorId) -> Option<&MonitorInfo> {
+    monitors.iter().find(|m| m.id == id)
+}
+
+/// Get monitors sorted by position (left to right, then top to bottom).
+pub fn monitors_by_position(monitors: &[MonitorInfo]) -> Vec<&MonitorInfo> {
+    let mut sorted: Vec<_> = monitors.iter().collect();
+    sorted.sort_by(|a, b| {
+        // Sort by x first, then by y
+        a.rect.x.cmp(&b.rect.x).then(a.rect.y.cmp(&b.rect.y))
+    });
+    sorted
+}
+
+/// Find the monitor to the left of the given monitor.
+pub fn monitor_to_left(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
+    let sorted = monitors_by_position(monitors);
+    let current_idx = sorted.iter().position(|m| m.id == current_id)?;
+    if current_idx > 0 {
+        Some(sorted[current_idx - 1])
+    } else {
+        None
+    }
+}
+
+/// Find the monitor to the right of the given monitor.
+pub fn monitor_to_right(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
+    let sorted = monitors_by_position(monitors);
+    let current_idx = sorted.iter().position(|m| m.id == current_id)?;
+    if current_idx + 1 < sorted.len() {
+        Some(sorted[current_idx + 1])
+    } else {
+        None
+    }
+}
+
+/// Enumerate all connected monitors.
+///
+/// Returns information about each display including work area (usable space
+/// excluding taskbar and docked windows).
+pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Win32Error> {
+    let mut monitors: Vec<MonitorInfo> = Vec::new();
+
+    unsafe {
+        let monitors_ptr = &mut monitors as *mut Vec<MonitorInfo>;
+
+        let result = EnumDisplayMonitors(
+            None, // HDC - None to enumerate all monitors
+            None, // lprcClip - None to not clip
+            Some(enum_monitors_callback),
+            LPARAM(monitors_ptr as isize),
+        );
+
+        if !result.as_bool() {
+            return Err(Win32Error::MonitorEnumerationFailed(
+                "EnumDisplayMonitors failed".to_string(),
+            ));
+        }
+    }
+
+    if monitors.is_empty() {
+        return Err(Win32Error::MonitorEnumerationFailed(
+            "No monitors found".to_string(),
+        ));
+    }
+
+    tracing::debug!("Enumerated {} monitors", monitors.len());
+    Ok(monitors)
+}
+
+/// Callback for EnumDisplayMonitors that collects monitor info.
+unsafe extern "system" fn enum_monitors_callback(
+    hmonitor: HMONITOR,
+    _hdc: HDC,
+    _lprc_clip: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
+
+    // Initialize MONITORINFOEXW with correct size
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+
+    if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _).as_bool() {
+        let mon_rect = info.monitorInfo.rcMonitor;
+        let work_rect = info.monitorInfo.rcWork;
+
+        // Convert device name from wide string
+        let device_name_len = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        let device_name = String::from_utf16_lossy(&info.szDevice[..device_name_len]);
+
+        monitors.push(MonitorInfo {
+            id: hmonitor.0 as MonitorId,
+            rect: Rect::new(
+                mon_rect.left,
+                mon_rect.top,
+                mon_rect.right - mon_rect.left,
+                mon_rect.bottom - mon_rect.top,
+            ),
+            work_area: Rect::new(
+                work_rect.left,
+                work_rect.top,
+                work_rect.right - work_rect.left,
+                work_rect.bottom - work_rect.top,
+            ),
+            // MONITORINFOF_PRIMARY = 1
+            is_primary: info.monitorInfo.dwFlags & 1 != 0,
+            device_name,
+        });
+
+        TRUE
+    } else {
+        // Continue enumeration even if one monitor fails
+        TRUE
+    }
+}
+
+/// Callback for EnumWindows that filters and collects window info.
+unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+
+    // Skip invisible windows
+    if !IsWindowVisible(hwnd).as_bool() {
+        return TRUE;
+    }
+
+    // Get window styles
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+    // Skip if not visible style
+    if style & WS_VISIBLE.0 == 0 {
+        return TRUE;
+    }
+
+    // Skip tool windows (unless they have WS_EX_APPWINDOW)
+    let is_tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
+    let is_app_window = ex_style & WS_EX_APPWINDOW.0 != 0;
+    if is_tool_window && !is_app_window {
+        return TRUE;
+    }
+
+    // Skip windows with WS_EX_NOACTIVATE (tooltips, popups, etc.)
+    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
+        return TRUE;
+    }
+
+    // Skip cloaked windows (e.g., on other virtual desktops)
+    if is_window_cloaked(hwnd) {
+        return TRUE;
+    }
+
+    // Get window title
+    let title_len = GetWindowTextLengthW(hwnd);
+    if title_len == 0 {
+        return TRUE; // Skip windows with no title
+    }
+
+    let mut title_buf: Vec<u16> = vec![0; (title_len + 1) as usize];
+    let actual_len = GetWindowTextW(hwnd, &mut title_buf);
+    if actual_len == 0 {
+        return TRUE;
+    }
+    let title = String::from_utf16_lossy(&title_buf[..actual_len as usize]);
+
+    // Skip known system windows by title
+    if should_skip_window_by_title(&title) {
+        return TRUE;
+    }
+
+    // Get class name
+    let mut class_buf: Vec<u16> = vec![0; 256];
+    let class_len = GetClassNameW(hwnd, &mut class_buf);
+    let class_name = if class_len > 0 {
+        String::from_utf16_lossy(&class_buf[..class_len as usize])
+    } else {
+        String::new()
+    };
+
+    // Skip known system classes
+    if should_skip_window_by_class(&class_name) {
+        return TRUE;
+    }
+
+    // Get process ID
+    let mut process_id: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+
+    // Get window rect
+    let mut win_rect = RECT::default();
+    if GetWindowRect(hwnd, &mut win_rect).is_err() {
+        return TRUE;
+    }
+
+    let rect = Rect::new(
+        win_rect.left,
+        win_rect.top,
+        win_rect.right - win_rect.left,
+        win_rect.bottom - win_rect.top,
+    );
+
+    // Skip zero-size windows
+    if rect.width == 0 || rect.height == 0 {
+        return TRUE;
+    }
+
+    windows.push(WindowInfo {
+        hwnd: hwnd.0 as WindowId,
+        title,
+        class_name,
+        process_id,
+        rect,
+        visible: true,
+    });
+
+    TRUE
+}
+
+/// Check if a window should be skipped based on its title.
+fn should_skip_window_by_title(title: &str) -> bool {
+    const SKIP_TITLES: &[&str] = &[
+        "Program Manager",
+        "Windows Input Experience",
+        "Microsoft Text Input Application",
+        "Settings",
+        // Add more system window titles as needed
+    ];
+
+    SKIP_TITLES.contains(&title)
+}
+
+/// Check if a window is cloaked (hidden by DWM).
+///
+/// Cloaked windows should be skipped during enumeration since they're
+/// not actually visible to the user (e.g., windows on other virtual desktops).
+fn is_window_cloaked(hwnd: HWND) -> bool {
+    unsafe {
+        let mut cloaked: u32 = 0;
+        let result = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        // If the call fails, assume not cloaked
+        result.is_ok() && cloaked != 0
+    }
+}
+
+/// Check if a window should be skipped based on its class name.
+fn should_skip_window_by_class(class_name: &str) -> bool {
+    const SKIP_CLASSES: &[&str] = &[
+        "Progman",                          // Program Manager
+        "Shell_TrayWnd",                    // Taskbar
+        "Shell_SecondaryTrayWnd",           // Secondary taskbar
+        "WorkerW",                          // Desktop worker
+        "Windows.UI.Core.CoreWindow",       // UWP system windows
+        "ApplicationFrameWindow",           // Some UWP containers
+        "XamlExplorerHostIslandWindow",     // XAML islands
+        "TopLevelWindowForOverflowXamlIsland", // Overflow islands
+        // Add more system classes as needed
+    ];
+
+    SKIP_CLASSES.contains(&class_name)
 }
 
 /// Apply window placements from the layout engine.
@@ -106,45 +489,180 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>, Win32Error> {
 /// 3. Applies cloaking/uncloaking based on visibility changes
 pub fn apply_placements(
     placements: &[WindowPlacement],
-    _config: &PlatformConfig,
+    config: &PlatformConfig,
 ) -> Result<(), Win32Error> {
-    // TODO: Implement using windows-rs
-    // - BeginDeferWindowPos
-    // - DeferWindowPos for each visible window
-    // - EndDeferWindowPos
-    // - DwmSetWindowAttribute(DWMWA_CLOAK) for off-screen windows
-    tracing::warn!("apply_placements not yet implemented");
+    if placements.is_empty() {
+        return Ok(());
+    }
 
-    for placement in placements {
-        match placement.visibility {
-            Visibility::Visible => {
-                tracing::debug!(
-                    "Would move window {} to ({}, {})",
-                    placement.window_id,
-                    placement.rect.x,
-                    placement.rect.y
-                );
+    // Separate visible and off-screen windows
+    let (visible, offscreen): (Vec<_>, Vec<_>) = placements
+        .iter()
+        .partition(|p| p.visibility == Visibility::Visible);
+
+    // Apply positions for visible windows
+    if !visible.is_empty() {
+        if config.use_deferred_positioning {
+            apply_placements_deferred(&visible)?;
+        } else {
+            apply_placements_immediate(&visible)?;
+        }
+
+        // Uncloak visible windows
+        for placement in &visible {
+            if let Err(e) = uncloak_window(placement.window_id) {
+                tracing::warn!("Failed to uncloak window {}: {}", placement.window_id, e);
             }
-            Visibility::OffScreenLeft | Visibility::OffScreenRight => {
-                tracing::debug!("Would cloak window {}", placement.window_id);
+        }
+    }
+
+    // Cloak off-screen windows
+    if config.hide_strategy == HideStrategy::Cloak {
+        for placement in &offscreen {
+            if let Err(e) = cloak_window(placement.window_id) {
+                tracing::warn!("Failed to cloak window {}: {}", placement.window_id, e);
             }
+        }
+    }
+
+    tracing::debug!(
+        "Applied {} visible placements, {} off-screen",
+        visible.len(),
+        offscreen.len()
+    );
+
+    Ok(())
+}
+
+/// Apply placements using DeferWindowPos for batched positioning.
+fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
+    unsafe {
+        let hdwp = BeginDeferWindowPos(placements.len() as i32)
+            .map_err(|e| Win32Error::SetPositionFailed(format!("BeginDeferWindowPos failed: {}", e)))?;
+
+        let mut current_hdwp = hdwp;
+
+        for placement in placements {
+            let hwnd = HWND(placement.window_id as *mut c_void);
+            let rect = &placement.rect;
+
+            match DeferWindowPos(
+                current_hdwp,
+                hwnd,
+                None, // HWND_TOP equivalent - no z-order change with SWP_NOZORDER
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) {
+                Ok(new_hdwp) => {
+                    current_hdwp = new_hdwp;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DeferWindowPos failed for window {}: {}, falling back to immediate",
+                        placement.window_id,
+                        e
+                    );
+                    // Fall back to immediate positioning for this window
+                    set_window_pos_immediate(placement)?;
+                }
+            }
+        }
+
+        // Commit all deferred positions
+        if let Err(e) = EndDeferWindowPos(current_hdwp) {
+            return Err(Win32Error::SetPositionFailed(format!(
+                "EndDeferWindowPos failed: {}. Some windows may not be positioned correctly.",
+                e
+            )));
         }
     }
 
     Ok(())
 }
 
+/// Apply placements using immediate SetWindowPos calls.
+fn apply_placements_immediate(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
+    for placement in placements {
+        set_window_pos_immediate(placement)?;
+    }
+    Ok(())
+}
+
+/// Set window position immediately using SetWindowPos.
+fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Error> {
+    unsafe {
+        let hwnd = HWND(placement.window_id as *mut c_void);
+        let rect = &placement.rect;
+
+        SetWindowPos(
+            hwnd,
+            None, // No z-order change with SWP_NOZORDER
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .map_err(|e| {
+            Win32Error::SetPositionFailed(format!(
+                "SetWindowPos failed for window {}: {}",
+                placement.window_id,
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Cloak a window (hide from view but keep in Alt-Tab).
-pub fn cloak_window(_hwnd: WindowId) -> Result<(), Win32Error> {
-    // TODO: Implement using DwmSetWindowAttribute with DWMWA_CLOAK
-    tracing::warn!("cloak_window not yet implemented");
+///
+/// Cloaked windows are hidden visually but remain in the taskbar
+/// and can still receive focus via Alt-Tab.
+pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
+    unsafe {
+        let hwnd = HWND(hwnd as *mut c_void);
+        let cloak_value: u32 = 1; // TRUE = cloak
+
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &cloak_value as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        if result.is_err() {
+            return Err(Win32Error::CloakFailed(format!(
+                "DwmSetWindowAttribute(CLOAK=1) failed for {:?}",
+                hwnd
+            )));
+        }
+    }
     Ok(())
 }
 
 /// Uncloak a window (make visible again).
-pub fn uncloak_window(_hwnd: WindowId) -> Result<(), Win32Error> {
-    // TODO: Implement using DwmSetWindowAttribute with DWMWA_CLOAK
-    tracing::warn!("uncloak_window not yet implemented");
+pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
+    unsafe {
+        let hwnd = HWND(hwnd as *mut c_void);
+        let cloak_value: u32 = 0; // FALSE = uncloak
+
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &cloak_value as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        if result.is_err() {
+            return Err(Win32Error::CloakFailed(format!(
+                "DwmSetWindowAttribute(CLOAK=0) failed for {:?}",
+                hwnd
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -165,33 +683,572 @@ pub enum WindowEvent {
     MovedOrResized(WindowId),
 }
 
+/// Global sender for window events from WinEvent callbacks.
+///
+/// This uses a thread-safe channel because WinEvent callbacks run on Windows'
+/// internal thread pool and we need to forward events to the async runtime.
+static EVENT_SENDER: std::sync::OnceLock<mpsc::Sender<WindowEvent>> = std::sync::OnceLock::new();
+
 /// Handle for installed event hooks.
+///
+/// Dropping this handle will unhook all installed event hooks.
 pub struct EventHookHandle {
-    // TODO: Store HWINEVENTHOOK handles
-    _private: (),
+    hooks: Vec<HWINEVENTHOOK>,
 }
 
 impl Drop for EventHookHandle {
     fn drop(&mut self) {
-        // TODO: UnhookWinEvent
+        for hook in &self.hooks {
+            unsafe {
+                if !UnhookWinEvent(*hook).as_bool() {
+                    tracing::warn!("Failed to unhook WinEvent: {:?}", hook);
+                }
+            }
+        }
+        tracing::debug!("Unhooked {} WinEvent hooks", self.hooks.len());
     }
 }
 
 /// Install WinEvent hooks to receive window lifecycle events.
 ///
 /// Returns a handle that must be kept alive to receive events.
-/// Events are sent to the provided callback.
-pub fn install_event_hooks<F>(_callback: F) -> Result<EventHookHandle, Win32Error>
-where
-    F: Fn(WindowEvent) + Send + 'static,
-{
-    // TODO: Implement using SetWinEventHook
-    // - EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY
-    // - EVENT_SYSTEM_FOREGROUND
-    // - EVENT_OBJECT_LOCATIONCHANGE
-    // - EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND
-    tracing::warn!("install_event_hooks not yet implemented");
-    Ok(EventHookHandle { _private: () })
+/// Also returns a receiver channel for the events.
+///
+/// # Events Hooked
+/// - Window creation (EVENT_OBJECT_CREATE)
+/// - Window destruction (EVENT_OBJECT_DESTROY)
+/// - Foreground change (EVENT_SYSTEM_FOREGROUND)
+/// - Minimize/restore (EVENT_SYSTEM_MINIMIZESTART/END)
+/// - Move/resize (EVENT_OBJECT_LOCATIONCHANGE)
+pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEvent>), Win32Error> {
+    // Create channel for events
+    let (tx, rx) = mpsc::channel();
+
+    // Store sender globally for callback access
+    EVENT_SENDER
+        .set(tx)
+        .map_err(|_| Win32Error::HookInstallFailed("Event sender already initialized".to_string()))?;
+
+    let mut hooks = Vec::new();
+
+    // Define events to hook: (min_event, max_event)
+    let event_ranges = [
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY),      // Create/Destroy
+        (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND), // Foreground
+        (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), // Minimize
+        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE), // Move/Resize
+        (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS),         // Focus within app
+    ];
+
+    unsafe {
+        for (min_event, max_event) in event_ranges {
+            let hook = SetWinEventHook(
+                min_event,
+                max_event,
+                None,                           // No DLL, use callback
+                Some(win_event_callback),       // Our callback
+                0,                              // All processes
+                0,                              // All threads
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+
+            if hook.is_invalid() {
+                // Clean up any hooks we've installed
+                for h in &hooks {
+                    let _ = UnhookWinEvent(*h);
+                }
+                return Err(Win32Error::HookInstallFailed(format!(
+                    "SetWinEventHook failed for events {}-{}",
+                    min_event, max_event
+                )));
+            }
+
+            hooks.push(hook);
+        }
+    }
+
+    tracing::info!("Installed {} WinEvent hooks", hooks.len());
+    Ok((EventHookHandle { hooks }, rx))
+}
+
+/// Callback function for WinEvent hooks.
+///
+/// This runs on Windows' thread pool, so we forward events to the channel.
+unsafe extern "system" fn win_event_callback(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    // Only handle window-level events (not child objects like menus)
+    if id_object != OBJID_WINDOW {
+        return;
+    }
+
+    // Ignore invalid HWNDs
+    if hwnd.0.is_null() {
+        return;
+    }
+
+    // Get the top-level window (in case we got a child window event)
+    let root_hwnd = GetAncestor(hwnd, GA_ROOT);
+    let hwnd = if root_hwnd.0.is_null() { hwnd } else { root_hwnd };
+
+    let window_id = hwnd.0 as WindowId;
+
+    // Map event to our WindowEvent type
+    let window_event = match event {
+        EVENT_OBJECT_CREATE => {
+            // Quick filter: skip windows that don't look manageable
+            if !IsWindowVisible(hwnd).as_bool() {
+                return;
+            }
+            WindowEvent::Created(window_id)
+        }
+        EVENT_OBJECT_DESTROY => WindowEvent::Destroyed(window_id),
+        EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => WindowEvent::Focused(window_id),
+        EVENT_SYSTEM_MINIMIZESTART => WindowEvent::Minimized(window_id),
+        EVENT_SYSTEM_MINIMIZEEND => WindowEvent::Restored(window_id),
+        EVENT_OBJECT_LOCATIONCHANGE => {
+            // Only track visible windows
+            if !IsWindowVisible(hwnd).as_bool() {
+                return;
+            }
+            WindowEvent::MovedOrResized(window_id)
+        }
+        _ => return,
+    };
+
+    // Send event through channel
+    if let Some(sender) = EVENT_SENDER.get() {
+        // Use try_send to avoid blocking if channel is full
+        let _ = sender.send(window_event);
+    }
+}
+
+// ============================================================================
+// Global Hotkey Support
+// ============================================================================
+
+/// Unique identifier for a registered hotkey.
+pub type HotkeyId = i32;
+
+/// Keyboard modifiers for hotkeys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+}
+
+impl Modifiers {
+    /// Create modifiers with only the Win key.
+    pub fn win() -> Self {
+        Self { win: true, ..Default::default() }
+    }
+
+    /// Create modifiers with Win + Shift.
+    pub fn win_shift() -> Self {
+        Self { win: true, shift: true, ..Default::default() }
+    }
+
+    /// Create modifiers with Alt.
+    pub fn alt() -> Self {
+        Self { alt: true, ..Default::default() }
+    }
+
+    /// Convert to Win32 HOT_KEY_MODIFIERS flags.
+    pub fn to_win32(&self) -> HOT_KEY_MODIFIERS {
+        let mut mods = MOD_NOREPEAT; // Prevent key repeat
+        if self.ctrl {
+            mods |= MOD_CONTROL;
+        }
+        if self.alt {
+            mods |= MOD_ALT;
+        }
+        if self.shift {
+            mods |= MOD_SHIFT;
+        }
+        if self.win {
+            mods |= MOD_WIN;
+        }
+        mods
+    }
+}
+
+/// A hotkey definition with modifiers and virtual key code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hotkey {
+    /// The unique ID for this hotkey.
+    pub id: HotkeyId,
+    /// Modifier keys (Ctrl, Alt, Shift, Win).
+    pub modifiers: Modifiers,
+    /// Virtual key code (e.g., 'H' = 0x48).
+    pub vk: u32,
+}
+
+impl Hotkey {
+    /// Create a new hotkey definition.
+    pub fn new(id: HotkeyId, modifiers: Modifiers, vk: u32) -> Self {
+        Self { id, modifiers, vk }
+    }
+}
+
+/// Event emitted when a hotkey is pressed.
+#[derive(Debug, Clone, Copy)]
+pub struct HotkeyEvent {
+    /// The ID of the hotkey that was pressed.
+    pub id: HotkeyId,
+}
+
+/// Global sender for hotkey events.
+static HOTKEY_SENDER: std::sync::OnceLock<mpsc::Sender<HotkeyEvent>> = std::sync::OnceLock::new();
+
+/// Custom message to signal the hotkey thread to stop.
+const WM_QUIT_HOTKEY_THREAD: u32 = WM_USER + 1;
+
+/// Handle for the hotkey message window and thread.
+///
+/// Dropping this handle will unregister all hotkeys and stop the message loop.
+pub struct HotkeyHandle {
+    hwnd: HWND,
+    thread: Option<std::thread::JoinHandle<()>>,
+    registered_ids: Vec<HotkeyId>,
+}
+
+impl HotkeyHandle {
+    /// Returns the number of successfully registered hotkeys.
+    pub fn registered_count(&self) -> usize {
+        self.registered_ids.len()
+    }
+}
+
+impl Drop for HotkeyHandle {
+    fn drop(&mut self) {
+        // Unregister all hotkeys
+        unsafe {
+            for id in &self.registered_ids {
+                let _ = UnregisterHotKey(Some(self.hwnd), *id);
+            }
+        }
+        tracing::debug!("Unregistered {} hotkeys", self.registered_ids.len());
+
+        // Signal the message loop to quit
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_QUIT_HOTKEY_THREAD,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+
+        // Wait for thread to finish
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Register global hotkeys and start listening for them.
+///
+/// Returns a handle that must be kept alive to receive hotkey events,
+/// and a channel receiver for hotkey events.
+///
+/// # Arguments
+/// * `hotkeys` - List of hotkeys to register
+///
+/// # Returns
+/// * Handle to manage the hotkeys (drop to unregister)
+/// * Receiver for hotkey press events
+pub fn register_hotkeys(
+    hotkeys: Vec<Hotkey>,
+) -> Result<(HotkeyHandle, mpsc::Receiver<HotkeyEvent>), Win32Error> {
+    // Create channel for events
+    let (tx, rx) = mpsc::channel();
+
+    // Store sender globally
+    HOTKEY_SENDER
+        .set(tx)
+        .map_err(|_| Win32Error::HotkeyRegistrationFailed("Hotkey sender already initialized".to_string()))?;
+
+    // Create the message window and register hotkeys on a separate thread
+    // We send isize (raw pointer value) instead of HWND because HWND is !Send
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(isize, Vec<HotkeyId>), Win32Error>>();
+    let hotkeys_clone = hotkeys.clone();
+
+    let thread = std::thread::spawn(move || {
+        unsafe {
+            // Register window class
+            let class_name: Vec<u16> = "OpenNiriHotkeyClass\0".encode_utf16().collect();
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(hotkey_window_proc),
+                lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            // Create message-only window
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                windows::core::PCWSTR(class_name.as_ptr()),
+                None,
+                Default::default(),
+                0, 0, 0, 0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            );
+
+            if hwnd.is_err() {
+                let _ = init_tx.send(Err(Win32Error::HotkeyRegistrationFailed(
+                    "Failed to create message window".to_string(),
+                )));
+                return;
+            }
+
+            let hwnd = hwnd.unwrap();
+            let mut registered_ids = Vec::new();
+
+            // Register all hotkeys
+            for hotkey in &hotkeys_clone {
+                let result = RegisterHotKey(
+                    Some(hwnd),
+                    hotkey.id,
+                    hotkey.modifiers.to_win32(),
+                    hotkey.vk,
+                );
+
+                if result.is_ok() {
+                    registered_ids.push(hotkey.id);
+                    tracing::debug!("Registered hotkey {} (vk=0x{:X})", hotkey.id, hotkey.vk);
+                } else {
+                    tracing::warn!(
+                        "Failed to register hotkey {} (vk=0x{:X}) - may be in use",
+                        hotkey.id,
+                        hotkey.vk
+                    );
+                }
+            }
+
+            // Send initialization result (hwnd as isize for Send safety)
+            let hwnd_raw = hwnd.0 as isize;
+            let _ = init_tx.send(Ok((hwnd_raw, registered_ids)));
+
+            // Message loop
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, Some(hwnd), 0, 0).as_bool() {
+                if msg.message == WM_QUIT_HOTKEY_THREAD {
+                    break;
+                }
+                let _ = DispatchMessageW(&msg);
+            }
+        }
+    });
+
+    // Wait for initialization
+    let (hwnd_raw, registered_ids) = init_rx
+        .recv()
+        .map_err(|_| Win32Error::HotkeyRegistrationFailed("Thread initialization failed".to_string()))??;
+
+    // Reconstruct HWND from raw pointer
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+
+    if registered_ids.is_empty() && !hotkeys.is_empty() {
+        tracing::warn!("No hotkeys were successfully registered");
+    } else {
+        tracing::info!(
+            "Registered {}/{} hotkeys",
+            registered_ids.len(),
+            hotkeys.len()
+        );
+    }
+
+    Ok((
+        HotkeyHandle {
+            hwnd,
+            thread: Some(thread),
+            registered_ids,
+        },
+        rx,
+    ))
+}
+
+/// Window procedure for the hotkey message window.
+unsafe extern "system" fn hotkey_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    match msg {
+        WM_HOTKEY => {
+            let hotkey_id = wparam.0 as HotkeyId;
+            tracing::debug!("Hotkey {} pressed", hotkey_id);
+
+            // Send event through channel
+            if let Some(sender) = HOTKEY_SENDER.get() {
+                let _ = sender.send(HotkeyEvent { id: hotkey_id });
+            }
+
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Common virtual key codes for hotkey registration.
+pub mod vk {
+    // Letters
+    pub const A: u32 = 0x41;
+    pub const B: u32 = 0x42;
+    pub const C: u32 = 0x43;
+    pub const D: u32 = 0x44;
+    pub const E: u32 = 0x45;
+    pub const F: u32 = 0x46;
+    pub const G: u32 = 0x47;
+    pub const H: u32 = 0x48;
+    pub const I: u32 = 0x49;
+    pub const J: u32 = 0x4A;
+    pub const K: u32 = 0x4B;
+    pub const L: u32 = 0x4C;
+    pub const M: u32 = 0x4D;
+    pub const N: u32 = 0x4E;
+    pub const O: u32 = 0x4F;
+    pub const P: u32 = 0x50;
+    pub const Q: u32 = 0x51;
+    pub const R: u32 = 0x52;
+    pub const S: u32 = 0x53;
+    pub const T: u32 = 0x54;
+    pub const U: u32 = 0x55;
+    pub const V: u32 = 0x56;
+    pub const W: u32 = 0x57;
+    pub const X: u32 = 0x58;
+    pub const Y: u32 = 0x59;
+    pub const Z: u32 = 0x5A;
+
+    // Numbers
+    pub const N0: u32 = 0x30;
+    pub const N1: u32 = 0x31;
+    pub const N2: u32 = 0x32;
+    pub const N3: u32 = 0x33;
+    pub const N4: u32 = 0x34;
+    pub const N5: u32 = 0x35;
+    pub const N6: u32 = 0x36;
+    pub const N7: u32 = 0x37;
+    pub const N8: u32 = 0x38;
+    pub const N9: u32 = 0x39;
+
+    // Function keys
+    pub const F1: u32 = 0x70;
+    pub const F2: u32 = 0x71;
+    pub const F3: u32 = 0x72;
+    pub const F4: u32 = 0x73;
+    pub const F5: u32 = 0x74;
+    pub const F6: u32 = 0x75;
+    pub const F7: u32 = 0x76;
+    pub const F8: u32 = 0x77;
+    pub const F9: u32 = 0x78;
+    pub const F10: u32 = 0x79;
+    pub const F11: u32 = 0x7A;
+    pub const F12: u32 = 0x7B;
+
+    // Navigation
+    pub const LEFT: u32 = 0x25;
+    pub const UP: u32 = 0x26;
+    pub const RIGHT: u32 = 0x27;
+    pub const DOWN: u32 = 0x28;
+
+    // Other
+    pub const TAB: u32 = 0x09;
+    pub const SPACE: u32 = 0x20;
+    pub const ENTER: u32 = 0x0D;
+    pub const ESCAPE: u32 = 0x1B;
+
+    // Punctuation (for common shortcuts)
+    pub const MINUS: u32 = 0xBD;      // '-'
+    pub const EQUALS: u32 = 0xBB;     // '='
+    pub const BRACKET_LEFT: u32 = 0xDB;   // '['
+    pub const BRACKET_RIGHT: u32 = 0xDD;  // ']'
+    pub const COMMA: u32 = 0xBC;      // ','
+    pub const PERIOD: u32 = 0xBE;     // '.'
+}
+
+/// Parse a virtual key code from a key name string.
+///
+/// Supports single letters (A-Z), numbers (0-9), function keys (F1-F12),
+/// and special keys (Left, Right, Up, Down, Tab, Space, Enter, Escape).
+pub fn parse_vk(key: &str) -> Option<u32> {
+    let key = key.trim().to_uppercase();
+
+    // Single letter
+    if key.len() == 1 {
+        let c = key.chars().next()?;
+        if c.is_ascii_uppercase() {
+            return Some(c as u32);
+        }
+        if c.is_ascii_digit() {
+            return Some(c as u32);
+        }
+    }
+
+    // Function keys
+    if key.starts_with('F') && key.len() <= 3 {
+        if let Ok(n) = key[1..].parse::<u32>() {
+            if (1..=12).contains(&n) {
+                return Some(0x6F + n); // F1=0x70, F2=0x71, ...
+            }
+        }
+    }
+
+    // Named keys
+    match key.as_str() {
+        "LEFT" => Some(vk::LEFT),
+        "RIGHT" => Some(vk::RIGHT),
+        "UP" => Some(vk::UP),
+        "DOWN" => Some(vk::DOWN),
+        "TAB" => Some(vk::TAB),
+        "SPACE" => Some(vk::SPACE),
+        "ENTER" | "RETURN" => Some(vk::ENTER),
+        "ESCAPE" | "ESC" => Some(vk::ESCAPE),
+        "MINUS" | "-" => Some(vk::MINUS),
+        "EQUALS" | "PLUS" | "=" => Some(vk::EQUALS),
+        _ => None,
+    }
+}
+
+/// Parse a hotkey string like "Win+H" or "Ctrl+Alt+Left".
+///
+/// Returns modifiers and virtual key code if valid.
+pub fn parse_hotkey_string(s: &str) -> Option<(Modifiers, u32)> {
+    let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut modifiers = Modifiers::default();
+
+    // Last part is the key, rest are modifiers
+    for part in &parts[..parts.len() - 1] {
+        match part.to_uppercase().as_str() {
+            "CTRL" | "CONTROL" => modifiers.ctrl = true,
+            "ALT" => modifiers.alt = true,
+            "SHIFT" => modifiers.shift = true,
+            "WIN" | "SUPER" | "META" => modifiers.win = true,
+            _ => return None, // Unknown modifier
+        }
+    }
+
+    // Parse the key
+    let key = parts.last()?;
+    let vk = parse_vk(key)?;
+
+    Some((modifiers, vk))
 }
 
 #[cfg(test)]
@@ -202,7 +1259,280 @@ mod tests {
     fn test_platform_config_default() {
         let config = PlatformConfig::default();
         assert_eq!(config.hide_strategy, HideStrategy::Cloak);
-        assert_eq!(config.buffer_zone, 1000);
         assert!(config.use_deferred_positioning);
+    }
+
+    #[test]
+    #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
+    fn test_enumerate_monitors() {
+        let result = enumerate_monitors();
+        if let Ok(monitors) = result {
+            assert!(!monitors.is_empty(), "At least one monitor should exist");
+            for monitor in &monitors {
+                assert!(monitor.rect.width > 0, "Monitor width should be positive");
+                assert!(monitor.rect.height > 0, "Monitor height should be positive");
+                assert!(
+                    monitor.work_area.width > 0,
+                    "Work area width should be positive"
+                );
+                assert!(
+                    monitor.work_area.height > 0,
+                    "Work area height should be positive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
+    fn test_get_primary_monitor() {
+        let result = get_primary_monitor();
+        if let Ok(primary) = result {
+            assert!(primary.is_primary, "Primary monitor should be marked as primary");
+            assert!(primary.rect.width > 0);
+            assert!(primary.work_area.width > 0);
+        }
+    }
+
+    #[test]
+    fn test_monitor_contains_point() {
+        let monitor = MonitorInfo {
+            id: 1,
+            rect: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1040),
+            is_primary: true,
+            device_name: "DISPLAY1".to_string(),
+        };
+
+        // Point inside monitor
+        assert!(monitor.contains_point(960, 540));
+        // Point at origin
+        assert!(monitor.contains_point(0, 0));
+        // Point just inside right edge
+        assert!(monitor.contains_point(1919, 540));
+        // Point outside (right edge)
+        assert!(!monitor.contains_point(1920, 540));
+        // Point outside (negative)
+        assert!(!monitor.contains_point(-1, 0));
+    }
+
+    #[test]
+    fn test_monitor_contains_rect_center() {
+        let monitor = MonitorInfo {
+            id: 1,
+            rect: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1040),
+            is_primary: true,
+            device_name: "DISPLAY1".to_string(),
+        };
+
+        // Window centered in monitor
+        let window = Rect::new(100, 100, 800, 600);
+        assert!(monitor.contains_rect_center(&window));
+
+        // Window mostly outside but center inside
+        let window2 = Rect::new(-300, 100, 800, 600);
+        assert!(monitor.contains_rect_center(&window2)); // Center at 100, 400
+
+        // Window with center outside
+        let window3 = Rect::new(1800, 100, 800, 600);
+        assert!(!monitor.contains_rect_center(&window3)); // Center at 2200, 400
+    }
+
+    #[test]
+    fn test_find_monitor_for_rect() {
+        let monitors = vec![
+            MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".to_string(),
+            },
+            MonitorInfo {
+                id: 2,
+                rect: Rect::new(1920, 0, 1920, 1080),
+                work_area: Rect::new(1920, 0, 1920, 1080),
+                is_primary: false,
+                device_name: "DISPLAY2".to_string(),
+            },
+        ];
+
+        // Window on first monitor
+        let window1 = Rect::new(100, 100, 800, 600);
+        let found = find_monitor_for_rect(&monitors, &window1);
+        assert_eq!(found.unwrap().id, 1);
+
+        // Window on second monitor
+        let window2 = Rect::new(2000, 100, 800, 600);
+        let found = find_monitor_for_rect(&monitors, &window2);
+        assert_eq!(found.unwrap().id, 2);
+    }
+
+    #[test]
+    fn test_monitors_by_position() {
+        let monitors = vec![
+            MonitorInfo {
+                id: 2,
+                rect: Rect::new(1920, 0, 1920, 1080),
+                work_area: Rect::new(1920, 0, 1920, 1080),
+                is_primary: false,
+                device_name: "DISPLAY2".to_string(),
+            },
+            MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".to_string(),
+            },
+        ];
+
+        let sorted = monitors_by_position(&monitors);
+        assert_eq!(sorted[0].id, 1); // Left monitor first
+        assert_eq!(sorted[1].id, 2); // Right monitor second
+    }
+
+    #[test]
+    fn test_monitor_to_left_right() {
+        let monitors = vec![
+            MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".to_string(),
+            },
+            MonitorInfo {
+                id: 2,
+                rect: Rect::new(1920, 0, 1920, 1080),
+                work_area: Rect::new(1920, 0, 1920, 1080),
+                is_primary: false,
+                device_name: "DISPLAY2".to_string(),
+            },
+        ];
+
+        // From monitor 1, go right
+        let right = monitor_to_right(&monitors, 1);
+        assert_eq!(right.unwrap().id, 2);
+
+        // From monitor 2, go left
+        let left = monitor_to_left(&monitors, 2);
+        assert_eq!(left.unwrap().id, 1);
+
+        // From monitor 1, can't go left (edge)
+        let no_left = monitor_to_left(&monitors, 1);
+        assert!(no_left.is_none());
+
+        // From monitor 2, can't go right (edge)
+        let no_right = monitor_to_right(&monitors, 2);
+        assert!(no_right.is_none());
+    }
+
+    #[test]
+    fn test_parse_vk() {
+        // Letters
+        assert_eq!(parse_vk("H"), Some(vk::H));
+        assert_eq!(parse_vk("h"), Some(vk::H));
+        assert_eq!(parse_vk("L"), Some(vk::L));
+
+        // Numbers
+        assert_eq!(parse_vk("1"), Some(vk::N1));
+        assert_eq!(parse_vk("0"), Some(vk::N0));
+
+        // Function keys
+        assert_eq!(parse_vk("F1"), Some(vk::F1));
+        assert_eq!(parse_vk("F12"), Some(vk::F12));
+        assert_eq!(parse_vk("f5"), Some(vk::F5));
+
+        // Navigation
+        assert_eq!(parse_vk("Left"), Some(vk::LEFT));
+        assert_eq!(parse_vk("RIGHT"), Some(vk::RIGHT));
+
+        // Special keys
+        assert_eq!(parse_vk("Tab"), Some(vk::TAB));
+        assert_eq!(parse_vk("Space"), Some(vk::SPACE));
+        assert_eq!(parse_vk("Enter"), Some(vk::ENTER));
+        assert_eq!(parse_vk("Escape"), Some(vk::ESCAPE));
+
+        // Invalid
+        assert_eq!(parse_vk("Invalid"), None);
+        assert_eq!(parse_vk("F13"), None);
+    }
+
+    #[test]
+    fn test_parse_hotkey_string() {
+        // Win+H
+        let (mods, vk) = parse_hotkey_string("Win+H").unwrap();
+        assert!(mods.win);
+        assert!(!mods.ctrl);
+        assert!(!mods.alt);
+        assert!(!mods.shift);
+        assert_eq!(vk, super::vk::H);
+
+        // Ctrl+Alt+Left
+        let (mods, vk) = parse_hotkey_string("Ctrl+Alt+Left").unwrap();
+        assert!(mods.ctrl);
+        assert!(mods.alt);
+        assert!(!mods.win);
+        assert_eq!(vk, super::vk::LEFT);
+
+        // Win+Shift+L
+        let (mods, vk) = parse_hotkey_string("Win+Shift+L").unwrap();
+        assert!(mods.win);
+        assert!(mods.shift);
+        assert_eq!(vk, super::vk::L);
+
+        // Case insensitive
+        let (mods, _) = parse_hotkey_string("win+shift+h").unwrap();
+        assert!(mods.win);
+        assert!(mods.shift);
+
+        // Invalid modifier
+        assert!(parse_hotkey_string("Foo+H").is_none());
+
+        // Invalid key
+        assert!(parse_hotkey_string("Win+InvalidKey").is_none());
+    }
+
+    #[test]
+    fn test_modifiers_to_win32() {
+        let mods = Modifiers::win();
+        let flags = mods.to_win32();
+        assert!(flags.contains(MOD_WIN));
+        assert!(flags.contains(MOD_NOREPEAT));
+        assert!(!flags.contains(MOD_CONTROL));
+
+        let mods = Modifiers { ctrl: true, alt: true, shift: true, win: false };
+        let flags = mods.to_win32();
+        assert!(flags.contains(MOD_CONTROL));
+        assert!(flags.contains(MOD_ALT));
+        assert!(flags.contains(MOD_SHIFT));
+        assert!(!flags.contains(MOD_WIN));
+    }
+
+    #[test]
+    fn test_win32_error_display() {
+        // Verify error types have proper Display implementations
+        let set_pos_err = Win32Error::SetPositionFailed("test error".to_string());
+        let display = format!("{}", set_pos_err);
+        assert!(display.contains("test error"));
+        assert!(display.contains("position"));
+
+        let cloak_err = Win32Error::CloakFailed("cloak failed".to_string());
+        let display = format!("{}", cloak_err);
+        assert!(display.contains("cloak"));
+
+        let window_not_found = Win32Error::WindowNotFound(12345);
+        let display = format!("{}", window_not_found);
+        assert!(display.contains("12345"));
+    }
+
+    #[test]
+    fn test_apply_placements_empty() {
+        // Verify empty placements succeed without error
+        let config = PlatformConfig::default();
+        let result = apply_placements(&[], &config);
+        assert!(result.is_ok());
     }
 }

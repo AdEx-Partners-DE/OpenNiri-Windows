@@ -2,7 +2,7 @@
 
 ## Overview
 
-OpenNiri-Windows is structured as a Rust workspace with four crates, each with distinct responsibilities.
+OpenNiri-Windows is structured as a Rust workspace with five crates, each with distinct responsibilities.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -48,13 +48,41 @@ OpenNiri-Windows is structured as a Rust workspace with four crates, each with d
 - `Rect`: Screen coordinates rectangle
 
 **Key Functions**:
-- `insert_window()`: Add a window to the workspace
-- `remove_window()`: Remove a window
+- `insert_window() -> Result<(), LayoutError>`: Add a window to the workspace (rejects duplicates)
+- `insert_window_in_column() -> Result<(), LayoutError>`: Stack a window in an existing column (rejects duplicates)
+- `remove_window() -> Result<(), LayoutError>`: Remove a window (with focus policy)
 - `focus_left/right/up/down()`: Navigation
+- `focus_window(id) -> Result`: Focus a specific window by ID
+- `set_focus(col, win) -> Result`: Set focus with validation
+- `focused_column_index()`, `focused_window_index_in_column()`: Focus getters
+- `columns()`, `column(idx)`, `scroll_offset()`: State getters
+- `find_window_location(id) -> Option<(col, win)>`: Locate a window
+- `window_count() -> usize`: Total windows across all columns
+- `contains_window(id) -> bool`: Check if window exists
+- `gap()`, `set_gap()`, `outer_gap()`, `set_outer_gap()`: Gap configuration
+- `default_column_width()`, `set_default_column_width()`: Column width config
+- `centering_mode()`, `set_centering_mode()`: Centering mode config
 - `compute_placements()`: Calculate window positions given a viewport
 - `ensure_focused_visible()`: Adjust scroll offset for focus
 
-**Dependencies**: None (pure Rust + serde)
+**Error Variants**:
+- `LayoutError::DuplicateWindow`: Window ID already exists
+- `LayoutError::WindowNotFound`: Window ID not in workspace
+- `LayoutError::ColumnOutOfBounds`: Invalid column index
+- `LayoutError::WindowIndexOutOfBounds`: Invalid window index in column
+
+**Invariants (Current Implementation)**:
+- No duplicate `WindowId` values (insertions return `LayoutError::DuplicateWindow`)
+- Column widths are clamped to a minimum width (100px)
+- Gap fields are private; setters clamp to >= 0 (defensive clamping also in calculations)
+- Scroll offset is clamped when using `scroll_by()` and `ensure_focused_visible()`
+- Focus remains valid after window removal (policy: next window, or previous if at end)
+- All internal arithmetic uses saturating operations to prevent overflow
+- Debug assertions validate invariants after mutations (debug builds only)
+
+**Note**: All state fields are private; use accessor methods and setters. Scrolling after focus changes is caller responsibility.
+
+**Dependencies**: None (pure Rust + serde + thiserror)
 
 **Testing**: Fully unit-testable without Win32 dependencies.
 
@@ -76,6 +104,17 @@ OpenNiri-Windows is structured as a Rust workspace with four crates, each with d
 - `SetWinEventHook`: Event hooks
 
 **Dependencies**: `windows-rs`, `openniri-core-layout`
+
+### openniri-ipc
+
+**Purpose**: Shared IPC protocol types for daemon-CLI communication.
+
+**Key Types**:
+- `IpcCommand`: Commands sent from CLI to daemon (FocusLeft/Right/Up/Down, MoveColumnLeft/Right, Resize, Scroll, QueryWorkspace, QueryFocused, Refresh, Apply, Stop)
+- `IpcResponse`: Responses from daemon (Ok, Error, WorkspaceState, FocusedWindow)
+- `PIPE_NAME`: Named pipe path (`\\.\pipe\openniri`)
+
+**Dependencies**: `serde`, `serde_json`, `thiserror`
 
 ### openniri-daemon
 
@@ -117,7 +156,7 @@ OpenNiri-Windows is structured as a Rust workspace with four crates, each with d
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Dependencies**: `tokio`, `openniri-core-layout`, `openniri-platform-win32`
+**Dependencies**: `tokio`, `openniri-core-layout`, `openniri-platform-win32`, `openniri-ipc`
 
 ### openniri-cli
 
@@ -134,7 +173,52 @@ OpenNiri-Windows is structured as a Rust workspace with four crates, each with d
 
 **IPC Protocol**: JSON over named pipe `\\.\pipe\openniri`
 
-**Dependencies**: `clap`, minimal
+**Dependencies**: `clap`, `tokio`, `openniri-ipc`
+
+---
+
+## Current Status (Reality Check)
+- `openniri-core-layout` is implemented and unit-tested (52 tests).
+- `openniri-platform-win32` has real Win32 implementations:
+  - `enumerate_windows()` - Uses EnumWindows with filtering
+  - `enumerate_monitors()` / `get_primary_monitor()` - Uses EnumDisplayMonitors
+  - `apply_placements()` - Uses DeferWindowPos for batched moves
+  - `cloak_window()` / `uncloak_window()` - Uses DwmSetWindowAttribute
+- `openniri-ipc` provides shared IPC types (`IpcCommand`, `IpcResponse`, `PIPE_NAME`).
+- `openniri-daemon` runs an async event loop with a named pipe IPC server.
+- `openniri-cli` sends IPC commands to the daemon and prints responses.
+
+---
+
+## Deviations, Lessons Learned, and Pivots
+- **Duplicate window IDs**: Early assumptions allowed duplicates; we now enforce uniqueness and return explicit errors.
+- **Insertion API**: `insert_window()` was assumed infallible; it now returns `Result` to surface duplicates and invalid input.
+- **Dimension safety**: We clamp column widths and `Rect` sizes to prevent negative or zero dimensions.
+- **Gap safety**: Gap fields are now private with clamping setters; defensive clamping also in calculations.
+- **Scroll precision**: Rounding is used to avoid sub-pixel jitter in placement computation.
+- **Full encapsulation**: All state and configuration fields are now private; use getters/setters to maintain invariants.
+- **Saturating arithmetic**: All internal arithmetic uses saturating operations to prevent overflow with extreme values.
+- **Debug assertions**: Internal invariants are validated after mutations (compiled out in release builds).
+- **Focus policy defined**: Removal in stacked columns follows a clear policy (next window, or previous if at end).
+- **API stability**: The library is pre-1.0; breaking changes may occur. `Column::remove_window()` returns `Option<usize>` (the removed index).
+
+---
+
+## Planned vs Implemented (Gap Summary)
+- **Implemented**:
+  - Core layout engine with 52 unit tests
+  - IPC protocol crate with 10 unit tests
+  - Win32 enumeration with filtering (visible, non-tool, non-cloaked, non-system windows)
+  - Monitor enumeration via EnumDisplayMonitors (dynamic viewport detection)
+  - Window positioning via DeferWindowPos batching
+  - DWM cloaking for off-screen windows
+  - Async daemon with named pipe IPC server
+  - CLI sends real IPC commands and receives responses (with timeout)
+  - WinEvent hooks for real-time window tracking (create/destroy/focus/minimize/restore)
+- **Pending**:
+  - Configuration file support
+  - Multi-monitor workspace support
+- **Next Steps**: Add configuration file support, implement multi-monitor workspaces.
 
 ## Data Flow
 
@@ -190,13 +274,19 @@ OpenNiri-Windows is structured as a Rust workspace with four crates, each with d
 
 ```rust
 Workspace {
-    columns: Vec<Column>,        // Ordered left-to-right
-    focused_column: usize,       // Index of focused column
-    focused_window_in_column: usize,
-    scroll_offset: f64,          // Viewport position
-    gap: i32,
-    outer_gap: i32,
-    centering_mode: CenteringMode,
+    // All fields are private - use accessor methods and setters
+
+    // Layout state
+    columns: Vec<Column>,               // Use columns(), column(idx)
+    focused_column: usize,              // Use focused_column_index()
+    focused_window_in_column: usize,    // Use focused_window_index_in_column()
+    scroll_offset: f64,                 // Use scroll_offset()
+
+    // Configuration (use getters/setters)
+    gap: i32,                           // Use gap(), set_gap() - clamped >= 0
+    outer_gap: i32,                     // Use outer_gap(), set_outer_gap() - clamped >= 0
+    default_column_width: i32,          // Use default_column_width(), set_default_column_width()
+    centering_mode: CenteringMode,      // Use centering_mode(), set_centering_mode()
 }
 ```
 

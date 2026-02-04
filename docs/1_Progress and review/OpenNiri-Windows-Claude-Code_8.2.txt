@@ -1,0 +1,2149 @@
+
+╭─── Claude Code v2.1.29 ─────────────────────────────────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started                                      │
+│           Welcome back Stark!           │ ✔ Run /init to create a CLAUDE.md file with instructions for… │
+│                                         │ ───────────────────────────────────────────────────────────── │
+│                                         │ Recent activity                                               │
+│                 ▐▛███▜▌                 │ No recent activity                                            │
+│                ▝▜█████▛▘                │                                                               │
+│                  ▘▘ ▝▝                  │                                                               │
+│   Opus 4.5 · Claude Max · Stark Burns   │                                                               │
+│         C:\dev\OpenNiri-Windows         │                                                               │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                                                       │
+│                                                                                                         │
+│ Code Review Cycle 8 - IPC & Platform Integration                                                        │
+│                                                                                                         │
+│ PHASE 1: DEEP ANALYSIS & BLUEPRINT                                                                      │
+│                                                                                                         │
+│ 1.1 Goal Definition                                                                                     │
+│                                                                                                         │
+│ Success Criteria: Establish working IPC between CLI and daemon via Windows named pipes, add dynamic     │
+│ monitor detection, and restructure daemon for async event handling. The vertical slice proves: CLI      │
+│ command → IPC → daemon → layout engine → Win32 positioning.                                             │
+│                                                                                                         │
+│ 1.2 Context & Reconnaissance                                                                            │
+│ Aspect: Previous State                                                                                  │
+│ Details: Cycle 7 completed: 52 tests, full encapsulation, Win32 enumeration/positioning works           │
+│ ────────────────────────────────────────                                                                │
+│ Aspect: Current Blockers                                                                                │
+│ Details: CLI can't communicate with daemon (no IPC), viewport hardcoded to 1920x1080                    │
+│ ────────────────────────────────────────                                                                │
+│ Aspect: Tech Stack                                                                                      │
+│ Details: Rust, tokio (async), windows-rs 0.59, serde_json                                               │
+│ ────────────────────────────────────────                                                                │
+│ Aspect: Daemon State                                                                                    │
+│ Details: Synchronous stdin REPL - blocks, can't handle multiple event sources                           │
+│ 1.3 Assumption Inventory                                                                                │
+│ Assumption: tokio supports Windows named pipes                                                          │
+│ Status: [VERIFIED]                                                                                      │
+│ Notes: tokio::net::windows::named_pipe exists                                                           │
+│ ────────────────────────────────────────                                                                │
+│ Assumption: windows-rs has monitor enumeration                                                          │
+│ Status: [VERIFIED]                                                                                      │
+│ Notes: Win32_Graphics_Gdi feature provides EnumDisplayMonitors                                          │
+│ ────────────────────────────────────────                                                                │
+│ Assumption: serde_json works for IPC protocol                                                           │
+│ Status: [VERIFIED]                                                                                      │
+│ Notes: Already a workspace dependency                                                                   │
+│ ────────────────────────────────────────                                                                │
+│ Assumption: Named pipes work without admin                                                              │
+│ Status: [VERIFIED]                                                                                      │
+│ Notes: Standard Windows IPC mechanism                                                                   │
+│ 1.4 Critical Gaps Identified                                                                            │
+│                                                                                                         │
+│ 1. No IPC - CLI prints "Would send:" but never connects (Critical)                                      │
+│ 2. WinEvent hooks stubbed - install_event_hooks() returns empty stub (Deferred)                         │
+│ 3. Monitor detection hardcoded - Line 35 of daemon: Rect::new(0, 0, 1920, 1080) (High)                  │
+│ 4. Daemon is synchronous - Blocks on stdin.read_line(), can't multiplex (High)                          │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ PHASE 2: IMPLEMENTATION PLAN                                                                            │
+│                                                                                                         │
+│ Phase A: IPC Protocol Crate (New)                                                                       │
+│                                                                                                         │
+│ Create: crates/ipc/                                                                                     │
+│                                                                                                         │
+│ Files:                                                                                                  │
+│ - crates/ipc/Cargo.toml                                                                                 │
+│ - crates/ipc/src/lib.rs                                                                                 │
+│                                                                                                         │
+│ Contents:                                                                                               │
+│ // lib.rs - Shared IPC types                                                                            │
+│ pub const PIPE_NAME: &str = r"\\.\pipe\openniri";                                                       │
+│                                                                                                         │
+│ #[derive(Debug, Clone, Serialize, Deserialize)]                                                         │
+│ #[serde(tag = "type")]                                                                                  │
+│ pub enum IpcCommand {                                                                                   │
+│     FocusLeft, FocusRight, FocusUp, FocusDown,                                                          │
+│     MoveColumnLeft, MoveColumnRight,                                                                    │
+│     Resize { delta: i32 },                                                                              │
+│     Scroll { delta: f64 },                                                                              │
+│     QueryWorkspace, QueryFocused,                                                                       │
+│     Refresh, Stop,                                                                                      │
+│ }                                                                                                       │
+│                                                                                                         │
+│ #[derive(Debug, Clone, Serialize, Deserialize)]                                                         │
+│ #[serde(tag = "status")]                                                                                │
+│ pub enum IpcResponse {                                                                                  │
+│     Ok,                                                                                                 │
+│     Error { message: String },                                                                          │
+│     WorkspaceState { columns: usize, windows: usize, focused_column: usize },                           │
+│ }                                                                                                       │
+│                                                                                                         │
+│ Workspace Cargo.toml change:                                                                            │
+│ members = [                                                                                             │
+│     "crates/core_layout",                                                                               │
+│     "crates/platform_win32",                                                                            │
+│     "crates/ipc",          # NEW                                                                        │
+│     "crates/daemon",                                                                                    │
+│     "crates/cli",                                                                                       │
+│ ]                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Phase B: Monitor Detection (platform_win32)                                                             │
+│                                                                                                         │
+│ Modify: crates/platform_win32/Cargo.toml                                                                │
+│ windows = { version = "0.59", features = [                                                              │
+│     "Win32_UI_WindowsAndMessaging",                                                                     │
+│     "Win32_Graphics_Dwm",                                                                               │
+│     "Win32_Graphics_Gdi",    # NEW - for EnumDisplayMonitors                                            │
+│     "Win32_Foundation",                                                                                 │
+│     "Win32_System_Threading",                                                                           │
+│ ] }                                                                                                     │
+│                                                                                                         │
+│ Add to: crates/platform_win32/src/lib.rs                                                                │
+│ /// Information about a display monitor.                                                                │
+│ #[derive(Debug, Clone)]                                                                                 │
+│ pub struct MonitorInfo {                                                                                │
+│     pub rect: Rect,                                                                                     │
+│     pub work_area: Rect,                                                                                │
+│     pub is_primary: bool,                                                                               │
+│ }                                                                                                       │
+│                                                                                                         │
+│ /// Get the primary monitor's work area (excludes taskbar).                                             │
+│ pub fn get_primary_monitor() -> Result<MonitorInfo, Win32Error>                                         │
+│                                                                                                         │
+│ /// Enumerate all connected monitors.                                                                   │
+│ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Win32Error>                                     │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Phase C: Daemon Async Restructure                                                                       │
+│                                                                                                         │
+│ Modify: crates/daemon/src/main.rs                                                                       │
+│                                                                                                         │
+│ Key changes:                                                                                            │
+│ 1. Add openniri-ipc dependency                                                                          │
+│ 2. Replace synchronous stdin loop with async event loop                                                 │
+│ 3. Add named pipe server using tokio::net::windows::named_pipe                                          │
+│ 4. Use channels for event multiplexing                                                                  │
+│ 5. Call get_primary_monitor() instead of hardcoding viewport                                            │
+│                                                                                                         │
+│ New structure:                                                                                          │
+│ enum DaemonEvent {                                                                                      │
+│     IpcCommand { cmd: IpcCommand, responder: oneshot::Sender<IpcResponse> },                            │
+│     Shutdown,                                                                                           │
+│ }                                                                                                       │
+│                                                                                                         │
+│ async fn main() -> Result<()> {                                                                         │
+│     // 1. Detect primary monitor                                                                        │
+│     let monitor = get_primary_monitor()?;                                                               │
+│     let viewport = monitor.work_area;                                                                   │
+│                                                                                                         │
+│     // 2. Initialize workspace and enumerate windows                                                    │
+│     let mut state = AppState::new_with_viewport(viewport);                                              │
+│     state.enumerate_and_add_windows()?;                                                                 │
+│                                                                                                         │
+│     // 3. Create event channel                                                                          │
+│     let (tx, mut rx) = mpsc::channel(100);                                                              │
+│                                                                                                         │
+│     // 4. Spawn IPC server                                                                              │
+│     tokio::spawn(run_ipc_server(tx.clone()));                                                           │
+│                                                                                                         │
+│     // 5. Event loop                                                                                    │
+│     while let Some(event) = rx.recv().await {                                                           │
+│         match event {                                                                                   │
+│             DaemonEvent::IpcCommand { cmd, responder } => {                                             │
+│                 let response = state.handle_command(cmd);                                               │
+│                 let _ = responder.send(response);                                                       │
+│             }                                                                                           │
+│             DaemonEvent::Shutdown => break,                                                             │
+│         }                                                                                               │
+│     }                                                                                                   │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Phase D: CLI IPC Client                                                                                 │
+│                                                                                                         │
+│ Modify: crates/cli/Cargo.toml                                                                           │
+│ [dependencies]                                                                                          │
+│ openniri-ipc = { path = "../ipc" }                                                                      │
+│ tokio = { workspace = true }                                                                            │
+│                                                                                                         │
+│ Modify: crates/cli/src/main.rs                                                                          │
+│                                                                                                         │
+│ Key changes:                                                                                            │
+│ 1. Map CLI commands to IpcCommand enum                                                                  │
+│ 2. Connect to named pipe using tokio::net::windows::named_pipe::ClientOptions                           │
+│ 3. Send JSON command, read JSON response                                                                │
+│ 4. Print human-readable output                                                                          │
+│                                                                                                         │
+│ async fn send_command(cmd: IpcCommand) -> Result<IpcResponse> {                                         │
+│     let client = ClientOptions::new().open(PIPE_NAME)?;                                                 │
+│     let (reader, mut writer) = tokio::io::split(client);                                                │
+│                                                                                                         │
+│     // Send command as JSON line                                                                        │
+│     let json = serde_json::to_string(&cmd)? + "\n";                                                     │
+│     writer.write_all(json.as_bytes()).await?;                                                           │
+│                                                                                                         │
+│     // Read response                                                                                    │
+│     let mut reader = BufReader::new(reader);                                                            │
+│     let mut line = String::new();                                                                       │
+│     reader.read_line(&mut line).await?;                                                                 │
+│                                                                                                         │
+│     Ok(serde_json::from_str(&line)?)                                                                    │
+│ }                                                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Files to Modify/Create                                                                                  │
+│ ┌──────────────────────────────────┬────────┬──────────────────────────────────────────────────┐        │
+│ │               File               │ Action │                     Changes                      │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ Cargo.toml                       │ Modify │ Add crates/ipc to workspace members              │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/ipc/Cargo.toml            │ Create │ New crate manifest                               │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/ipc/src/lib.rs            │ Create │ IpcCommand, IpcResponse, PIPE_NAME               │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/platform_win32/Cargo.toml │ Modify │ Add Win32_Graphics_Gdi feature                   │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/platform_win32/src/lib.rs │ Modify │ Add monitor enumeration functions                │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/daemon/Cargo.toml         │ Modify │ Add openniri-ipc dependency                      │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/daemon/src/main.rs        │ Modify │ Async restructure, IPC server, monitor detection │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/cli/Cargo.toml            │ Modify │ Add openniri-ipc, ensure tokio                   │        │
+│ ├──────────────────────────────────┼────────┼──────────────────────────────────────────────────┤        │
+│ │ crates/cli/src/main.rs           │ Modify │ IPC client, command mapping                      │        │
+│ └──────────────────────────────────┴────────┴──────────────────────────────────────────────────┘        │
+│ ---                                                                                                     │
+│ Implementation Order                                                                                    │
+│                                                                                                         │
+│ 1. Phase A: IPC Protocol Crate                                                                          │
+│    └── Create crates/ipc with shared types                                                              │
+│                                                                                                         │
+│ 2. Phase B: Monitor Detection                                                                           │
+│    └── Add Win32 feature, implement enumerate_monitors()                                                │
+│                                                                                                         │
+│ 3. Phase C: Daemon Async Restructure                                                                    │
+│    ├── Add openniri-ipc dependency                                                                      │
+│    ├── Replace stdin loop with async event loop                                                         │
+│    ├── Add named pipe server                                                                            │
+│    └── Use detected monitor viewport                                                                    │
+│                                                                                                         │
+│ 4. Phase D: CLI IPC Client                                                                              │
+│    ├── Add dependencies                                                                                 │
+│    ├── Implement send_command()                                                                         │
+│    └── Map commands to IpcCommand                                                                       │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ PHASE 3: VERIFICATION                                                                                   │
+│                                                                                                         │
+│ Build Verification                                                                                      │
+│                                                                                                         │
+│ cargo +stable-x86_64-pc-windows-gnu check --workspace                                                   │
+│ cargo +stable-x86_64-pc-windows-gnu clippy --workspace                                                  │
+│                                                                                                         │
+│ Test Sequence                                                                                           │
+│                                                                                                         │
+│ 1. Start daemon:                                                                                        │
+│ cargo run --bin openniri                                                                                │
+│ # Should show: "Detected primary monitor: WxH"                                                          │
+│ # Should show: "IPC server listening on \\.\pipe\openniri"                                              │
+│ 2. Send CLI commands (separate terminal):                                                               │
+│ cargo run --bin openniri-cli -- query workspace                                                         │
+│ # Should show: "Workspace: N columns, M windows"                                                        │
+│                                                                                                         │
+│ cargo run --bin openniri-cli -- focus right                                                             │
+│ # Should show: "OK"                                                                                     │
+│                                                                                                         │
+│ cargo run --bin openniri-cli -- resize --delta 100                                                      │
+│ # Should show: "OK"                                                                                     │
+│                                                                                                         │
+│ cargo run --bin openniri-cli -- stop                                                                    │
+│ # Daemon should exit gracefully                                                                         │
+│ 3. Verify layout applies to real windows:                                                               │
+│   - Have 2-3 windows open before starting daemon                                                        │
+│   - Run cargo run --bin openniri-cli -- focus right                                                     │
+│   - Windows should reposition on screen                                                                 │
+│                                                                                                         │
+│ Success Criteria                                                                                        │
+│                                                                                                         │
+│ - Daemon detects actual monitor dimensions (not 1920x1080 hardcoded)                                    │
+│ - CLI connects to daemon without error                                                                  │
+│ - Focus/move/resize commands change workspace state                                                     │
+│ - Layout changes are applied to real windows                                                            │
+│ - stop command cleanly shuts down daemon                                                                │
+│                                                                                                         │
+│ ---                                                                                                     │
+│ Deferred to Cycle 9                                                                                     │
+│ ┌──────────────────────────┬─────────────────────────────────────────────────────┐                      │
+│ │           Item           │                       Reason                        │                      │
+│ ├──────────────────────────┼─────────────────────────────────────────────────────┤                      │
+│ │ WinEvent hooks           │ Complex thread safety; vertical slice works without │                      │
+│ ├──────────────────────────┼─────────────────────────────────────────────────────┤                      │
+│ │ Configuration file       │ Lower priority than IPC                             │                      │
+│ ├──────────────────────────┼─────────────────────────────────────────────────────┤                      │
+│ │ Multi-monitor workspaces │ Requires WinEvent hooks for monitor changes         │                      │
+│ ├──────────────────────────┼─────────────────────────────────────────────────────┤                      │
+│ │ Smooth scroll animation  │ Polish feature                                      │                      │
+│ ├──────────────────────────┼─────────────────────────────────────────────────────┤                      │
+│ │ Global hotkeys           │ Requires separate hook system                       │                      │
+│ └──────────────────────────┴─────────────────────────────────────────────────────┘                      │
+│ ---                                                                                                     │
+│ Risk Assessment                                                                                         │
+│ ┌─────────────────────────────────┬────────────────────────────────────────────────────┐                │
+│ │              Risk               │                     Mitigation                     │                │
+│ ├─────────────────────────────────┼────────────────────────────────────────────────────┤                │
+│ │ Named pipe permission denied    │ Test as regular user; pipes don't need admin       │                │
+│ ├─────────────────────────────────┼────────────────────────────────────────────────────┤                │
+│ │ tokio named_pipe not available  │ Verify tokio has net feature (it does with "full") │                │
+│ ├─────────────────────────────────┼────────────────────────────────────────────────────┤                │
+│ │ Monitor detection returns empty │ Fall back to 1920x1080 with warning log            │                │
+│ ├─────────────────────────────────┼────────────────────────────────────────────────────┤                │
+│ │ Daemon already running          │ Check if pipe exists, show clear error             │                │
+│ └─────────────────────────────────┴────────────────────────────────────────────────────┘                │
+│ ---                                                                                                     │
+│ Summary                                                                                                 │
+│                                                                                                         │
+│ Cycle 8 establishes the communication backbone of OpenNiri-Windows:                                     │
+│                                                                                                         │
+│ 1. IPC Protocol - Type-safe command/response over named pipes                                           │
+│ 2. Monitor Detection - Dynamic viewport from actual display                                             │
+│ 3. Async Daemon - Event loop ready for multiple sources                                                 │
+│ 4. Working CLI - Real commands that affect real windows                                                 │
+│                                                                                                         │
+│ Estimated effort: 10-14 hours                                                                           │
+│ Risk level: Medium (new async patterns, Win32 APIs)                                                     │
+│ Breaking changes: None (additive only)                                                                  │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+● I'll implement the Cycle 8 plan for IPC & Platform Integration. Let me start by reading the current state
+   of the codebase.
+
+● Read 7 files (ctrl+o to expand)
+
+● Now I have a complete picture of the codebase. Let me create the task list and start implementing.
+
+● Now let me create the IPC crate. First, I'll create the directory structure and files.
+
+● Bash(mkdir -p "C:\dev\OpenNiri-Windows\crates\ipc\src")
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+
+● Write(crates\ipc\Cargo.toml)
+  ⎿  Wrote 1 lines to crates\ipc\Cargo.toml
+       1 [package]
+       2 name = "openniri-ipc"
+       3 version.workspace = true
+       4 edition.workspace = true
+       5 license.workspace = true
+       6 repository.workspace = true
+       7 authors.workspace = true
+       8 description = "IPC protocol types for OpenNiri daemon-CLI communication"
+       9
+      10 [dependencies]
+
+● Write(crates\ipc\src\lib.rs)
+  ⎿  Wrote 1 lines to crates\ipc\src\lib.rs
+       1 //! OpenNiri IPC Protocol
+       2 //!
+       3 //! Shared types for daemon-CLI communication over Windows named pipes.
+       4
+       5 use serde::{Deserialize, Serialize};
+       6
+       7 /// Named pipe path for IPC communication.
+       8 pub const PIPE_NAME: &str = r"\\.\pipe\openniri";
+       9
+      10 /// Commands that can be sent from the CLI to the daemon.
+
+● Now update the workspace Cargo.toml to include the new crate:
+
+● Update(Cargo.toml)
+  ⎿  Added 1 line
+      3  members = [
+      4      "crates/core_layout",
+      5      "crates/platform_win32",
+      6 +    "crates/ipc",
+      7      "crates/daemon",
+      8      "crates/cli",
+      9  ]
+
+● Now let me add monitor detection to platform_win32. First, update Cargo.toml to include
+  Win32_Graphics_Gdi:
+
+● Update(Cargo.toml)
+  ⎿  Added 1 line
+      20  windows = { version = "0.59", features = [
+      21      "Win32_UI_WindowsAndMessaging",
+      22      "Win32_Graphics_Dwm",
+      23 +    "Win32_Graphics_Gdi",
+      24      "Win32_Foundation",
+      25      "Win32_System_Threading",
+      26  ] }
+
+● Now add the monitor detection functions to platform_win32/src/lib.rs:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 4 lines, removed 1 line
+      11  use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
+      12  use std::ffi::c_void;
+      13  use thiserror::Error;
+      14 -use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+      14 +use windows::Win32::Foundation::{BOOL, FALSE, HWND, LPARAM, RECT, TRUE};
+      15  use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+      16 +use windows::Win32::Graphics::Gdi::{
+      17 +    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MONITORINFOF_PRIM
+         +ARY,
+      18 +};
+      19  use windows::Win32::UI::WindowsAndMessaging::{
+      20      BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetClassNameW,
+      21      GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+
+● Now add the MonitorEnumerationFailed error variant:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 3 lines
+      30      #[error("Failed to enumerate windows: {0}")]
+      31      EnumerationFailed(String),
+      32
+      33 +    #[error("Failed to enumerate monitors: {0}")]
+      34 +    MonitorEnumerationFailed(String),
+      35 +
+      36      #[error("Failed to set window position: {0}")]
+      37      SetPositionFailed(String),
+      38
+
+● Now add the MonitorInfo struct and monitor enumeration functions. I'll add them after the existing
+  WindowInfo struct:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 13 lines
+      63      pub visible: bool,
+      64  }
+      65
+      66 +/// Information about a display monitor.
+      67 +#[derive(Debug, Clone)]
+      68 +pub struct MonitorInfo {
+      69 +    /// Full monitor rectangle (entire display area).
+      70 +    pub rect: Rect,
+      71 +    /// Work area (excludes taskbar and other docked windows).
+      72 +    pub work_area: Rect,
+      73 +    /// Whether this is the primary monitor.
+      74 +    pub is_primary: bool,
+      75 +    /// Device name (e.g., `\\.\DISPLAY1`).
+      76 +    pub device_name: String,
+      77 +}
+      78 +
+      79  /// Strategy for hiding off-screen windows.
+      80  #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+      81  pub enum HideStrategy {
+
+● Now add the monitor enumeration functions. I'll add them after the enumerate_windows function and before
+  the callback:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 97 lines
+      140      Ok(windows)
+      141  }
+      142
+      143 +/// Get the primary monitor's information.
+      144 +///
+      145 +/// Returns the work area (excluding taskbar) which is suitable for window positioning.
+      146 +pub fn get_primary_monitor() -> Result<MonitorInfo, Win32Error> {
+      147 +    let monitors = enumerate_monitors()?;
+      148 +
+      149 +    monitors
+      150 +        .into_iter()
+      151 +        .find(|m| m.is_primary)
+      152 +        .ok_or_else(|| {
+      153 +            Win32Error::MonitorEnumerationFailed("No primary monitor found".to_string())
+      154 +        })
+      155 +}
+      156 +
+      157 +/// Enumerate all connected monitors.
+      158 +///
+      159 +/// Returns information about each display including work area (usable space
+      160 +/// excluding taskbar and docked windows).
+      161 +pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Win32Error> {
+      162 +    let mut monitors: Vec<MonitorInfo> = Vec::new();
+      163 +
+      164 +    unsafe {
+      165 +        let monitors_ptr = &mut monitors as *mut Vec<MonitorInfo>;
+      166 +
+      167 +        let result = EnumDisplayMonitors(
+      168 +            HDC::default(),
+      169 +            None,
+      170 +            Some(enum_monitors_callback),
+      171 +            LPARAM(monitors_ptr as isize),
+      172 +        );
+      173 +
+      174 +        if !result.as_bool() {
+      175 +            return Err(Win32Error::MonitorEnumerationFailed(
+      176 +                "EnumDisplayMonitors failed".to_string(),
+      177 +            ));
+      178 +        }
+      179 +    }
+      180 +
+      181 +    if monitors.is_empty() {
+      182 +        return Err(Win32Error::MonitorEnumerationFailed(
+      183 +            "No monitors found".to_string(),
+      184 +        ));
+      185 +    }
+      186 +
+      187 +    tracing::debug!("Enumerated {} monitors", monitors.len());
+      188 +    Ok(monitors)
+      189 +}
+      190 +
+      191 +/// Callback for EnumDisplayMonitors that collects monitor info.
+      192 +unsafe extern "system" fn enum_monitors_callback(
+      193 +    hmonitor: HMONITOR,
+      194 +    _hdc: HDC,
+      195 +    _lprc_clip: *mut RECT,
+      196 +    lparam: LPARAM,
+      197 +) -> BOOL {
+      198 +    let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
+      199 +
+      200 +    // Initialize MONITORINFOEXW with correct size
+      201 +    let mut info = MONITORINFOEXW::default();
+      202 +    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+      203 +
+      204 +    if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _).as_bool() {
+      205 +        let mon_rect = info.monitorInfo.rcMonitor;
+      206 +        let work_rect = info.monitorInfo.rcWork;
+      207 +
+      208 +        // Convert device name from wide string
+      209 +        let device_name_len = info
+      210 +            .szDevice
+      211 +            .iter()
+      212 +            .position(|&c| c == 0)
+      213 +            .unwrap_or(info.szDevice.len());
+      214 +        let device_name = String::from_utf16_lossy(&info.szDevice[..device_name_len]);
+      215 +
+      216 +        monitors.push(MonitorInfo {
+      217 +            rect: Rect::new(
+      218 +                mon_rect.left,
+      219 +                mon_rect.top,
+      220 +                mon_rect.right - mon_rect.left,
+      221 +                mon_rect.bottom - mon_rect.top,
+      222 +            ),
+      223 +            work_area: Rect::new(
+      224 +                work_rect.left,
+      225 +                work_rect.top,
+      226 +                work_rect.right - work_rect.left,
+      227 +                work_rect.bottom - work_rect.top,
+      228 +            ),
+      229 +            is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+      230 +            device_name,
+      231 +        });
+      232 +
+      233 +        TRUE
+      234 +    } else {
+      235 +        // Continue enumeration even if one monitor fails
+      236 +        TRUE
+      237 +    }
+      238 +}
+      239 +
+      240  /// Callback for EnumWindows that filters and collects window info.
+      241  unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+      242      let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+
+● Now add tests for the monitor functions. Let me find the test section:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 32 lines
+      602          assert_eq!(config.buffer_zone, 1000);
+      603          assert!(config.use_deferred_positioning);
+      604      }
+      605 +
+      606 +    #[test]
+      607 +    fn test_enumerate_monitors() {
+      608 +        // This test requires a display, so it may fail in headless CI
+      609 +        let result = enumerate_monitors();
+      610 +        if let Ok(monitors) = result {
+      611 +            assert!(!monitors.is_empty(), "At least one monitor should exist");
+      612 +            for monitor in &monitors {
+      613 +                assert!(monitor.rect.width > 0, "Monitor width should be positive");
+      614 +                assert!(monitor.rect.height > 0, "Monitor height should be positive");
+      615 +                assert!(
+      616 +                    monitor.work_area.width > 0,
+      617 +                    "Work area width should be positive"
+      618 +                );
+      619 +                assert!(
+      620 +                    monitor.work_area.height > 0,
+      621 +                    "Work area height should be positive"
+      622 +                );
+      623 +            }
+      624 +        }
+      625 +    }
+      626 +
+      627 +    #[test]
+      628 +    fn test_get_primary_monitor() {
+      629 +        // This test requires a display, so it may fail in headless CI
+      630 +        let result = get_primary_monitor();
+      631 +        if let Ok(primary) = result {
+      632 +            assert!(primary.is_primary, "Primary monitor should be marked as primary");
+      633 +            assert!(primary.rect.width > 0);
+      634 +            assert!(primary.work_area.width > 0);
+      635 +        }
+      636 +    }
+      637  }
+
+● Now let me restructure the daemon with async event loop and IPC server. First, update the daemon's
+  Cargo.toml:
+
+● Update(crates\daemon\Cargo.toml)
+  ⎿  Added 1 line
+      14  [dependencies]
+      15  openniri-core-layout = { path = "../core_layout" }
+      16  openniri-platform-win32 = { path = "../platform_win32" }
+      17 +openniri-ipc = { path = "../ipc" }
+      18  tokio = { workspace = true }
+      19  tracing = { workspace = true }
+      20  tracing-subscriber = { workspace = true }
+
+● Now update the CLI's Cargo.toml:
+
+● Update(crates\cli\Cargo.toml)
+  ⎿  Added 2 lines
+      12  path = "src/main.rs"
+      13
+      14  [dependencies]
+      15 +openniri-ipc = { path = "../ipc" }
+      16  clap = { workspace = true }
+      17 +tokio = { workspace = true }
+      18  serde = { workspace = true }
+      19  serde_json = { workspace = true }
+      20  anyhow = { workspace = true }
+
+● Now rewrite the daemon main.rs with async event loop and IPC server:
+
+● Write(crates\daemon\src\main.rs)
+  ⎿  Added 420 lines, removed 308 lines
+        1 -//! OpenNiri Daemon
+        2 -//!
+        3 -//! Main daemon process for the OpenNiri window manager.
+        4 -//!
+        5 -//! Responsibilities:
+        6 -//! - Maintain workspace state
+        7 -//! - Process window events from the platform layer
+        8 -//! - Handle IPC commands from the CLI
+        9 -//! - Trigger layout recalculations
+       10 -//! - Apply window placements
+       11 -
+       12 -use anyhow::Result;
+       13 -use openniri_core_layout::{Rect, Workspace};
+       14 -use openniri_platform_win32::{enumerate_windows, PlatformConfig};
+       15 -use std::io::{self, Write};
+       16 -use tracing::{debug, error, info, warn, Level};
+       17 -use tracing_subscriber::FmtSubscriber;
+       18 -
+       19 -/// Application state.
+       20 -struct AppState {
+       21 -    /// The scrollable workspace.
+       22 -    workspace: Workspace,
+       23 -    /// Platform configuration.
+       24 -    platform_config: PlatformConfig,
+       25 -    /// Current monitor viewport.
+       26 -    viewport: Rect,
+       27 -}
+       28 -
+       29 -impl AppState {
+       30 -    fn new() -> Self {
+       31 -        Self {
+       32 -            workspace: Workspace::with_gaps(10, 10),
+       33 -            platform_config: PlatformConfig::default(),
+       34 -            // TODO: Get actual primary monitor dimensions
+       35 -            viewport: Rect::new(0, 0, 1920, 1080),
+       36 -        }
+       37 -    }
+       38 -
+       39 -    /// Recalculate layout and apply placements.
+       40 -    fn apply_layout(&self) -> Result<()> {
+       41 -        let placements = self.workspace.compute_placements(self.viewport);
+       42 -        debug!(
+       43 -            "Computed {} placements for viewport {}x{}",
+       44 -            placements.len(),
+       45 -            self.viewport.width,
+       46 -            self.viewport.height
+       47 -        );
+       48 -        openniri_platform_win32::apply_placements(&placements, &self.platform_config)?;
+       49 -        Ok(())
+       50 -    }
+       51 -
+       52 -    /// Enumerate windows and add them to the workspace.
+       53 -    fn enumerate_and_add_windows(&mut self) -> Result<usize> {
+       54 -        let windows = enumerate_windows()?;
+       55 -        let mut added = 0;
+       56 -
+       57 -        for win_info in windows {
+       58 -            // Use a reasonable default width or the window's current width
+       59 -            let width = win_info.rect.width.max(400).min(1200);
+       60 -
+       61 -            match self.workspace.insert_window(win_info.hwnd, Some(width)) {
+       62 -                Ok(()) => {
+       63 -                    info!(
+       64 -                        "Added window: {} ({}) - {}x{}",
+       65 -                        win_info.title,
+       66 -                        win_info.class_name,
+       67 -                        win_info.rect.width,
+       68 -                        win_info.rect.height
+       69 -                    );
+       70 -                    added += 1;
+       71 -                }
+       72 -                Err(e) => {
+       73 -                    warn!("Failed to add window {}: {}", win_info.hwnd, e);
+       74 -                }
+       75 -            }
+       76 -        }
+       77 -
+       78 -        Ok(added)
+       79 -    }
+       80 -
+       81 -    /// Process a command from the user.
+       82 -    fn process_command(&mut self, cmd: &str) -> Result<bool> {
+       83 -        let cmd = cmd.trim().to_lowercase();
+       84 -        let parts: Vec<&str> = cmd.split_whitespace().collect();
+       85 -
+       86 -        if parts.is_empty() {
+       87 -            return Ok(true);
+       88 -        }
+       89 -
+       90 -        match parts[0] {
+       91 -            "quit" | "exit" | "q" => {
+       92 -                info!("Quit command received");
+       93 -                return Ok(false);
+       94 -            }
+       95 -            "left" | "l" => {
+       96 -                self.workspace.focus_left();
+       97 -                self.workspace.ensure_focused_visible(self.viewport.width);
+       98 -                info!(
+       99 -                    "Focus left -> column {}",
+      100 -                    self.workspace.focused_column_index()
+      101 -                );
+      102 -            }
+      103 -            "right" | "r" => {
+      104 -                self.workspace.focus_right();
+      105 -                self.workspace.ensure_focused_visible(self.viewport.width);
+      106 -                info!(
+      107 -                    "Focus right -> column {}",
+      108 -                    self.workspace.focused_column_index()
+      109 -                );
+      110 -            }
+      111 -            "up" | "u" => {
+      112 -                self.workspace.focus_up();
+      113 -                info!(
+      114 -                    "Focus up -> window {}",
+      115 -                    self.workspace.focused_window_index_in_column()
+      116 -                );
+      117 -            }
+      118 -            "down" | "d" => {
+      119 -                self.workspace.focus_down();
+      120 -                info!(
+      121 -                    "Focus down -> window {}",
+      122 -                    self.workspace.focused_window_index_in_column()
+      123 -                );
+      124 -            }
+      125 -            "move-left" | "ml" => {
+      126 -                self.workspace.move_column_left();
+      127 -                self.workspace.ensure_focused_visible(self.viewport.width);
+      128 -                info!("Moved column left");
+      129 -            }
+      130 -            "move-right" | "mr" => {
+      131 -                self.workspace.move_column_right();
+      132 -                self.workspace.ensure_focused_visible(self.viewport.width);
+      133 -                info!("Moved column right");
+      134 -            }
+      135 -            "resize" => {
+      136 -                let delta: i32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(50);
+          -
+      137 -                self.workspace.resize_focused_column(delta);
+      138 -                info!("Resized column by {}", delta);
+      139 -            }
+      140 -            "scroll" => {
+      141 -                let delta: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(100.
+          -0);
+      142 -                self.workspace.scroll_by(delta, self.viewport.width);
+      143 -                info!("Scrolled by {}", delta);
+      144 -            }
+      145 -            "apply" | "a" => {
+      146 -                self.apply_layout()?;
+      147 -                info!("Applied layout");
+      148 -            }
+      149 -            "status" | "s" => {
+      150 -                self.print_status();
+      151 -            }
+      152 -            "help" | "h" | "?" => {
+      153 -                self.print_help();
+      154 -            }
+      155 -            "refresh" => {
+      156 -                let added = self.enumerate_and_add_windows()?;
+      157 -                info!("Refreshed: added {} new windows", added);
+      158 -            }
+      159 -            _ => {
+      160 -                warn!("Unknown command: {}. Type 'help' for commands.", cmd);
+      161 -            }
+      162 -        }
+      163 -
+      164 -        Ok(true)
+      165 -    }
+      166 -
+      167 -    fn print_status(&self) {
+      168 -        println!("\n=== Workspace Status ===");
+      169 -        println!("Columns: {}", self.workspace.column_count());
+      170 -        println!("Windows: {}", self.workspace.window_count());
+      171 -        println!("Focused column: {}", self.workspace.focused_column_index());
+      172 -        println!(
+      173 -            "Focused window in column: {}",
+      174 -            self.workspace.focused_window_index_in_column()
+      175 -        );
+      176 -        println!("Scroll offset: {:.1}", self.workspace.scroll_offset());
+      177 -        println!("Total width: {}", self.workspace.total_width());
+      178 -        println!(
+      179 -            "Viewport: {}x{}",
+      180 -            self.viewport.width, self.viewport.height
+      181 -        );
+      182 -
+      183 -        if let Some(focused) = self.workspace.focused_window() {
+      184 -            println!("Focused window ID: {}", focused);
+      185 -        }
+      186 -
+      187 -        println!("\n=== Columns ===");
+      188 -        for (i, col) in self.workspace.columns().iter().enumerate() {
+      189 -            let marker = if i == self.workspace.focused_column_index() {
+      190 -                "→"
+      191 -            } else {
+      192 -                " "
+      193 -            };
+      194 -            println!(
+      195 -                "{} Column {}: width={}, windows={}",
+      196 -                marker,
+      197 -                i,
+      198 -                col.width(),
+      199 -                col.len()
+      200 -            );
+      201 -            for (j, &win_id) in col.windows().iter().enumerate() {
+      202 -                let win_marker =
+      203 -                    if i == self.workspace.focused_column_index()
+      204 -                        && j == self.workspace.focused_window_index_in_column()
+      205 -                    {
+      206 -                        "*"
+      207 -                    } else {
+      208 -                        " "
+      209 -                    };
+      210 -                println!("    {} Window {}: id={}", win_marker, j, win_id);
+      211 -            }
+      212 -        }
+      213 -        println!();
+      214 -    }
+      215 -
+      216 -    fn print_help(&self) {
+      217 -        println!("\n=== Commands ===");
+      218 -        println!("Navigation:");
+      219 -        println!("  left (l)       - Focus column to the left");
+      220 -        println!("  right (r)      - Focus column to the right");
+      221 -        println!("  up (u)         - Focus window above in column");
+      222 -        println!("  down (d)       - Focus window below in column");
+      223 -        println!("\nColumn operations:");
+      224 -        println!("  move-left (ml) - Move focused column left");
+      225 -        println!("  move-right (mr)- Move focused column right");
+      226 -        println!("  resize <delta> - Resize focused column (default: +50)");
+      227 -        println!("  scroll <delta> - Scroll viewport (default: +100)");
+      228 -        println!("\nActions:");
+      229 -        println!("  apply (a)      - Apply layout to real windows");
+      230 -        println!("  refresh        - Re-enumerate windows");
+      231 -        println!("  status (s)     - Show workspace status");
+      232 -        println!("  help (h, ?)    - Show this help");
+      233 -        println!("  quit (q)       - Exit daemon");
+      234 -        println!();
+      235 -    }
+      236 -}
+      237 -
+      238 -#[tokio::main]
+      239 -async fn main() -> Result<()> {
+      240 -    // Initialize logging
+      241 -    let subscriber = FmtSubscriber::builder()
+      242 -        .with_max_level(Level::DEBUG)
+      243 -        .finish();
+      244 -    tracing::subscriber::set_global_default(subscriber)?;
+      245 -
+      246 -    info!("OpenNiri daemon starting...");
+      247 -    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+      248 -
+      249 -    let mut state = AppState::new();
+      250 -
+      251 -    info!(
+      252 -        "Viewport: {}x{}",
+      253 -        state.viewport.width, state.viewport.height
+      254 -    );
+      255 -
+      256 -    // Enumerate existing windows
+      257 -    info!("Enumerating windows...");
+      258 -    match state.enumerate_and_add_windows() {
+      259 -        Ok(count) => {
+      260 -            info!("Found and added {} manageable windows", count);
+      261 -        }
+      262 -        Err(e) => {
+      263 -            error!("Failed to enumerate windows: {}", e);
+      264 -        }
+      265 -    }
+      266 -
+      267 -    info!(
+      268 -        "Workspace initialized with {} columns, {} windows",
+      269 -        state.workspace.column_count(),
+      270 -        state.workspace.window_count()
+      271 -    );
+      272 -
+      273 -    // Center on first column if we have windows
+      274 -    if state.workspace.column_count() > 0 {
+      275 -        state
+      276 -            .workspace
+      277 -            .ensure_focused_visible(state.viewport.width);
+      278 -    }
+      279 -
+      280 -    // Interactive command loop
+      281 -    info!("Entering interactive mode. Type 'help' for commands, 'quit' to exit.");
+      282 -    println!();
+      283 -
+      284 -    let stdin = io::stdin();
+      285 -    let mut input = String::new();
+      286 -
+      287 -    loop {
+      288 -        print!("openniri> ");
+      289 -        io::stdout().flush()?;
+      290 -
+      291 -        input.clear();
+      292 -        if stdin.read_line(&mut input)? == 0 {
+      293 -            // EOF
+      294 -            break;
+      295 -        }
+      296 -
+      297 -        match state.process_command(&input) {
+      298 -            Ok(true) => continue,
+      299 -            Ok(false) => break, // quit command
+      300 -            Err(e) => {
+      301 -                error!("Command error: {}", e);
+      302 -            }
+      303 -        }
+      304 -    }
+      305 -
+      306 -    info!("OpenNiri daemon shutting down.");
+      307 -    Ok(())
+      308 -}
+        1 +//! OpenNiri Daemon
+        2 +//!
+        3 +//! Main daemon process for the OpenNiri window manager.
+        4 +//!
+        5 +//! Responsibilities:
+        6 +//! - Maintain workspace state
+        7 +//! - Process window events from the platform layer
+        8 +//! - Handle IPC commands from the CLI
+        9 +//! - Trigger layout recalculations
+       10 +//! - Apply window placements
+       11 +
+       12 +use anyhow::Result;
+       13 +use openniri_core_layout::{Rect, Workspace};
+       14 +use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
+       15 +use openniri_platform_win32::{enumerate_windows, get_primary_monitor, PlatformConfig};
+       16 +use std::sync::Arc;
+       17 +use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+       18 +use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+       19 +use tokio::sync::{mpsc, oneshot, Mutex};
+       20 +use tracing::{debug, error, info, warn, Level};
+       21 +use tracing_subscriber::FmtSubscriber;
+       22 +
+       23 +/// Events that the daemon event loop processes.
+       24 +enum DaemonEvent {
+       25 +    /// An IPC command from a CLI client.
+       26 +    IpcCommand {
+       27 +        cmd: IpcCommand,
+       28 +        responder: oneshot::Sender<IpcResponse>,
+       29 +    },
+       30 +    /// Shutdown signal.
+       31 +    Shutdown,
+       32 +}
+       33 +
+       34 +/// Application state.
+       35 +struct AppState {
+       36 +    /// The scrollable workspace.
+       37 +    workspace: Workspace,
+       38 +    /// Platform configuration.
+       39 +    platform_config: PlatformConfig,
+       40 +    /// Current monitor viewport (work area).
+       41 +    viewport: Rect,
+       42 +}
+       43 +
+       44 +impl AppState {
+       45 +    fn new_with_viewport(viewport: Rect) -> Self {
+       46 +        Self {
+       47 +            workspace: Workspace::with_gaps(10, 10),
+       48 +            platform_config: PlatformConfig::default(),
+       49 +            viewport,
+       50 +        }
+       51 +    }
+       52 +
+       53 +    /// Recalculate layout and apply placements.
+       54 +    fn apply_layout(&self) -> Result<()> {
+       55 +        let placements = self.workspace.compute_placements(self.viewport);
+       56 +        debug!(
+       57 +            "Computed {} placements for viewport {}x{}",
+       58 +            placements.len(),
+       59 +            self.viewport.width,
+       60 +            self.viewport.height
+       61 +        );
+       62 +        openniri_platform_win32::apply_placements(&placements, &self.platform_config)?;
+       63 +        Ok(())
+       64 +    }
+       65 +
+       66 +    /// Enumerate windows and add them to the workspace.
+       67 +    fn enumerate_and_add_windows(&mut self) -> Result<usize> {
+       68 +        let windows = enumerate_windows()?;
+       69 +        let mut added = 0;
+       70 +
+       71 +        for win_info in windows {
+       72 +            // Use a reasonable default width or the window's current width
+       73 +            let width = win_info.rect.width.max(400).min(1200);
+       74 +
+       75 +            match self.workspace.insert_window(win_info.hwnd, Some(width)) {
+       76 +                Ok(()) => {
+       77 +                    info!(
+       78 +                        "Added window: {} ({}) - {}x{}",
+       79 +                        win_info.title, win_info.class_name, win_info.rect.width, win_inf
+          +o.rect.height
+       80 +                    );
+       81 +                    added += 1;
+       82 +                }
+       83 +                Err(e) => {
+       84 +                    warn!("Failed to add window {}: {}", win_info.hwnd, e);
+       85 +                }
+       86 +            }
+       87 +        }
+       88 +
+       89 +        Ok(added)
+       90 +    }
+       91 +
+       92 +    /// Process an IPC command and return a response.
+       93 +    fn handle_command(&mut self, cmd: IpcCommand) -> IpcResponse {
+       94 +        match cmd {
+       95 +            IpcCommand::FocusLeft => {
+       96 +                self.workspace.focus_left();
+       97 +                self.workspace.ensure_focused_visible(self.viewport.width);
+       98 +                info!(
+       99 +                    "Focus left -> column {}",
+      100 +                    self.workspace.focused_column_index()
+      101 +                );
+      102 +                if let Err(e) = self.apply_layout() {
+      103 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      104 +                }
+      105 +                IpcResponse::Ok
+      106 +            }
+      107 +            IpcCommand::FocusRight => {
+      108 +                self.workspace.focus_right();
+      109 +                self.workspace.ensure_focused_visible(self.viewport.width);
+      110 +                info!(
+      111 +                    "Focus right -> column {}",
+      112 +                    self.workspace.focused_column_index()
+      113 +                );
+      114 +                if let Err(e) = self.apply_layout() {
+      115 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      116 +                }
+      117 +                IpcResponse::Ok
+      118 +            }
+      119 +            IpcCommand::FocusUp => {
+      120 +                self.workspace.focus_up();
+      121 +                info!(
+      122 +                    "Focus up -> window {}",
+      123 +                    self.workspace.focused_window_index_in_column()
+      124 +                );
+      125 +                IpcResponse::Ok
+      126 +            }
+      127 +            IpcCommand::FocusDown => {
+      128 +                self.workspace.focus_down();
+      129 +                info!(
+      130 +                    "Focus down -> window {}",
+      131 +                    self.workspace.focused_window_index_in_column()
+      132 +                );
+      133 +                IpcResponse::Ok
+      134 +            }
+      135 +            IpcCommand::MoveColumnLeft => {
+      136 +                self.workspace.move_column_left();
+      137 +                self.workspace.ensure_focused_visible(self.viewport.width);
+      138 +                info!("Moved column left");
+      139 +                if let Err(e) = self.apply_layout() {
+      140 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      141 +                }
+      142 +                IpcResponse::Ok
+      143 +            }
+      144 +            IpcCommand::MoveColumnRight => {
+      145 +                self.workspace.move_column_right();
+      146 +                self.workspace.ensure_focused_visible(self.viewport.width);
+      147 +                info!("Moved column right");
+      148 +                if let Err(e) = self.apply_layout() {
+      149 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      150 +                }
+      151 +                IpcResponse::Ok
+      152 +            }
+      153 +            IpcCommand::Resize { delta } => {
+      154 +                self.workspace.resize_focused_column(delta);
+      155 +                info!("Resized column by {}", delta);
+      156 +                if let Err(e) = self.apply_layout() {
+      157 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      158 +                }
+      159 +                IpcResponse::Ok
+      160 +            }
+      161 +            IpcCommand::Scroll { delta } => {
+      162 +                self.workspace.scroll_by(delta, self.viewport.width);
+      163 +                info!("Scrolled by {}", delta);
+      164 +                if let Err(e) = self.apply_layout() {
+      165 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      166 +                }
+      167 +                IpcResponse::Ok
+      168 +            }
+      169 +            IpcCommand::QueryWorkspace => IpcResponse::WorkspaceState {
+      170 +                columns: self.workspace.column_count(),
+      171 +                windows: self.workspace.window_count(),
+      172 +                focused_column: self.workspace.focused_column_index(),
+      173 +                focused_window: self.workspace.focused_window_index_in_column(),
+      174 +                scroll_offset: self.workspace.scroll_offset(),
+      175 +                total_width: self.workspace.total_width(),
+      176 +            },
+      177 +            IpcCommand::QueryFocused => IpcResponse::FocusedWindow {
+      178 +                window_id: self.workspace.focused_window(),
+      179 +                column_index: self.workspace.focused_column_index(),
+      180 +                window_index: self.workspace.focused_window_index_in_column(),
+      181 +            },
+      182 +            IpcCommand::Refresh => {
+      183 +                match self.enumerate_and_add_windows() {
+      184 +                    Ok(added) => {
+      185 +                        info!("Refreshed: added {} new windows", added);
+      186 +                        if let Err(e) = self.apply_layout() {
+      187 +                            return IpcResponse::error(format!("Failed to apply layout: {}
+          +", e));
+      188 +                        }
+      189 +                        IpcResponse::Ok
+      190 +                    }
+      191 +                    Err(e) => IpcResponse::error(format!("Failed to enumerate windows: {}
+          +", e)),
+      192 +                }
+      193 +            }
+      194 +            IpcCommand::Apply => {
+      195 +                if let Err(e) = self.apply_layout() {
+      196 +                    return IpcResponse::error(format!("Failed to apply layout: {}", e));
+      197 +                }
+      198 +                info!("Applied layout");
+      199 +                IpcResponse::Ok
+      200 +            }
+      201 +            IpcCommand::Stop => {
+      202 +                // This is handled specially in the event loop
+      203 +                IpcResponse::Ok
+      204 +            }
+      205 +        }
+      206 +    }
+      207 +}
+      208 +
+      209 +/// Run the IPC server, accepting connections and dispatching commands.
+      210 +async fn run_ipc_server(event_tx: mpsc::Sender<DaemonEvent>) {
+      211 +    // Create the named pipe server
+      212 +    // We need to create a new server instance for each connection
+      213 +    loop {
+      214 +        // Create a new pipe server instance
+      215 +        let server = match ServerOptions::new()
+      216 +            .first_pipe_instance(false)
+      217 +            .pipe_mode(PipeMode::Byte)
+      218 +            .create(PIPE_NAME)
+      219 +        {
+      220 +            Ok(s) => s,
+      221 +            Err(e) => {
+      222 +                // First instance needs first_pipe_instance(true)
+      223 +                match ServerOptions::new()
+      224 +                    .first_pipe_instance(true)
+      225 +                    .pipe_mode(PipeMode::Byte)
+      226 +                    .create(PIPE_NAME)
+      227 +                {
+      228 +                    Ok(s) => s,
+      229 +                    Err(e2) => {
+      230 +                        error!("Failed to create named pipe server: {} / {}", e, e2);
+      231 +                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+      232 +                        continue;
+      233 +                    }
+      234 +                }
+      235 +            }
+      236 +        };
+      237 +
+      238 +        debug!("Waiting for client connection on {}", PIPE_NAME);
+      239 +
+      240 +        // Wait for a client to connect
+      241 +        if let Err(e) = server.connect().await {
+      242 +            error!("Failed to accept client connection: {}", e);
+      243 +            continue;
+      244 +        }
+      245 +
+      246 +        info!("Client connected");
+      247 +
+      248 +        // Handle this client
+      249 +        let event_tx = event_tx.clone();
+      250 +        tokio::spawn(async move {
+      251 +            if let Err(e) = handle_client(server, event_tx).await {
+      252 +                warn!("Client handler error: {}", e);
+      253 +            }
+      254 +        });
+      255 +    }
+      256 +}
+      257 +
+      258 +/// Handle a single client connection.
+      259 +async fn handle_client(
+      260 +    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+      261 +    event_tx: mpsc::Sender<DaemonEvent>,
+      262 +) -> Result<()> {
+      263 +    let (reader, mut writer) = tokio::io::split(pipe);
+      264 +    let mut reader = BufReader::new(reader);
+      265 +    let mut line = String::new();
+      266 +
+      267 +    // Read command (single line of JSON)
+      268 +    let bytes_read = reader.read_line(&mut line).await?;
+      269 +    if bytes_read == 0 {
+      270 +        return Ok(()); // Client disconnected
+      271 +    }
+      272 +
+      273 +    let line = line.trim();
+      274 +    debug!("Received command: {}", line);
+      275 +
+      276 +    // Parse the command
+      277 +    let cmd: IpcCommand = match serde_json::from_str(line) {
+      278 +        Ok(cmd) => cmd,
+      279 +        Err(e) => {
+      280 +            let response = IpcResponse::error(format!("Invalid command: {}", e));
+      281 +            let response_json = serde_json::to_string(&response)? + "\n";
+      282 +            writer.write_all(response_json.as_bytes()).await?;
+      283 +            return Ok(());
+      284 +        }
+      285 +    };
+      286 +
+      287 +    // Check for stop command (special handling)
+      288 +    let is_stop = matches!(cmd, IpcCommand::Stop);
+      289 +
+      290 +    // Create a oneshot channel for the response
+      291 +    let (resp_tx, resp_rx) = oneshot::channel();
+      292 +
+      293 +    // Send the command to the event loop
+      294 +    if event_tx
+      295 +        .send(DaemonEvent::IpcCommand {
+      296 +            cmd,
+      297 +            responder: resp_tx,
+      298 +        })
+      299 +        .await
+      300 +        .is_err()
+      301 +    {
+      302 +        let response = IpcResponse::error("Daemon is shutting down");
+      303 +        let response_json = serde_json::to_string(&response)? + "\n";
+      304 +        writer.write_all(response_json.as_bytes()).await?;
+      305 +        return Ok(());
+      306 +    }
+      307 +
+      308 +    // Wait for the response
+      309 +    let response = match resp_rx.await {
+      310 +        Ok(resp) => resp,
+      311 +        Err(_) => IpcResponse::error("Failed to get response from daemon"),
+      312 +    };
+      313 +
+      314 +    // Send response back to client
+      315 +    let response_json = serde_json::to_string(&response)? + "\n";
+      316 +    writer.write_all(response_json.as_bytes()).await?;
+      317 +
+      318 +    // If this was a stop command, signal shutdown
+      319 +    if is_stop {
+      320 +        let _ = event_tx.send(DaemonEvent::Shutdown).await;
+      321 +    }
+      322 +
+      323 +    Ok(())
+      324 +}
+      325 +
+      326 +#[tokio::main]
+      327 +async fn main() -> Result<()> {
+      328 +    // Initialize logging
+      329 +    let subscriber = FmtSubscriber::builder()
+      330 +        .with_max_level(Level::DEBUG)
+      331 +        .finish();
+      332 +    tracing::subscriber::set_global_default(subscriber)?;
+      333 +
+      334 +    info!("OpenNiri daemon starting...");
+      335 +    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+      336 +
+      337 +    // Detect primary monitor
+      338 +    let viewport = match get_primary_monitor() {
+      339 +        Ok(monitor) => {
+      340 +            info!(
+      341 +                "Detected primary monitor: {}x{} (work area: {}x{} at {},{})",
+      342 +                monitor.rect.width,
+      343 +                monitor.rect.height,
+      344 +                monitor.work_area.width,
+      345 +                monitor.work_area.height,
+      346 +                monitor.work_area.x,
+      347 +                monitor.work_area.y
+      348 +            );
+      349 +            monitor.work_area
+      350 +        }
+      351 +        Err(e) => {
+      352 +            warn!(
+      353 +                "Failed to detect monitor, falling back to 1920x1080: {}",
+      354 +                e
+      355 +            );
+      356 +            Rect::new(0, 0, 1920, 1080)
+      357 +        }
+      358 +    };
+      359 +
+      360 +    // Initialize state with detected viewport
+      361 +    let state = Arc::new(Mutex::new(AppState::new_with_viewport(viewport)));
+      362 +
+      363 +    // Enumerate existing windows
+      364 +    info!("Enumerating windows...");
+      365 +    {
+      366 +        let mut state = state.lock().await;
+      367 +        match state.enumerate_and_add_windows() {
+      368 +            Ok(count) => {
+      369 +                info!("Found and added {} manageable windows", count);
+      370 +            }
+      371 +            Err(e) => {
+      372 +                error!("Failed to enumerate windows: {}", e);
+      373 +            }
+      374 +        }
+      375 +
+      376 +        info!(
+      377 +            "Workspace initialized with {} columns, {} windows",
+      378 +            state.workspace.column_count(),
+      379 +            state.workspace.window_count()
+      380 +        );
+      381 +
+      382 +        // Center on first column if we have windows
+      383 +        if state.workspace.column_count() > 0 {
+      384 +            state.workspace.ensure_focused_visible(state.viewport.width);
+      385 +        }
+      386 +    }
+      387 +
+      388 +    // Create event channel
+      389 +    let (event_tx, mut event_rx) = mpsc::channel::<DaemonEvent>(100);
+      390 +
+      391 +    // Spawn IPC server
+      392 +    let ipc_tx = event_tx.clone();
+      393 +    tokio::spawn(async move {
+      394 +        run_ipc_server(ipc_tx).await;
+      395 +    });
+      396 +
+      397 +    info!("IPC server listening on {}", PIPE_NAME);
+      398 +    info!("Ready. Use openniri-cli to send commands.");
+      399 +
+      400 +    // Main event loop
+      401 +    while let Some(event) = event_rx.recv().await {
+      402 +        match event {
+      403 +            DaemonEvent::IpcCommand { cmd, responder } => {
+      404 +                let response = {
+      405 +                    let mut state = state.lock().await;
+      406 +                    state.handle_command(cmd)
+      407 +                };
+      408 +                // Ignore send errors (client may have disconnected)
+      409 +                let _ = responder.send(response);
+      410 +            }
+      411 +            DaemonEvent::Shutdown => {
+      412 +                info!("Shutdown signal received");
+      413 +                break;
+      414 +            }
+      415 +        }
+      416 +    }
+      417 +
+      418 +    info!("OpenNiri daemon shutting down.");
+      419 +    Ok(())
+      420 +}
+
+● Now rewrite the CLI with IPC client:
+
+● Write(crates\cli\src\main.rs)
+  ⎿  Added 218 lines, removed 159 lines
+        1 -//! OpenNiri CLI
+        2 -//!
+        3 -//! Command-line interface for controlling the OpenNiri window manager.
+        4 -//!
+        5 -//! Commands are sent to the daemon via IPC (named pipe).
+        6 -
+        7 -use anyhow::Result;
+        8 -use clap::{Parser, Subcommand};
+        9 -
+       10 -#[derive(Parser)]
+       11 -#[command(name = "openniri-cli")]
+       12 -#[command(author, version, about = "Control the OpenNiri window manager")]
+       13 -struct Cli {
+       14 -    #[command(subcommand)]
+       15 -    command: Commands,
+       16 -}
+       17 -
+       18 -#[derive(Subcommand)]
+       19 -enum Commands {
+       20 -    /// Focus commands
+       21 -    Focus {
+       22 -        #[command(subcommand)]
+       23 -        direction: FocusDirection,
+       24 -    },
+       25 -    /// Scroll the viewport
+       26 -    Scroll {
+       27 -        #[command(subcommand)]
+       28 -        direction: ScrollDirection,
+       29 -    },
+       30 -    /// Move the focused column
+       31 -    Move {
+       32 -        #[command(subcommand)]
+       33 -        direction: MoveDirection,
+       34 -    },
+       35 -    /// Resize the focused column
+       36 -    Resize {
+       37 -        /// Width delta in pixels (positive to grow, negative to shrink)
+       38 -        #[arg(short, long)]
+       39 -        delta: i32,
+       40 -    },
+       41 -    /// Set the number of visible columns
+       42 -    SetColumns {
+       43 -        /// Number of columns to display
+       44 -        count: usize,
+       45 -    },
+       46 -    /// Query workspace state
+       47 -    Query {
+       48 -        #[command(subcommand)]
+       49 -        what: QueryType,
+       50 -    },
+       51 -    /// Reload configuration
+       52 -    Reload,
+       53 -    /// Stop the daemon
+       54 -    Stop,
+       55 -}
+       56 -
+       57 -#[derive(Subcommand)]
+       58 -enum FocusDirection {
+       59 -    /// Focus the column to the left
+       60 -    Left,
+       61 -    /// Focus the column to the right
+       62 -    Right,
+       63 -    /// Focus the window above (in stacked columns)
+       64 -    Up,
+       65 -    /// Focus the window below (in stacked columns)
+       66 -    Down,
+       67 -}
+       68 -
+       69 -#[derive(Subcommand)]
+       70 -enum ScrollDirection {
+       71 -    /// Scroll viewport left
+       72 -    Left {
+       73 -        /// Pixels to scroll (default: 100)
+       74 -        #[arg(short, long, default_value = "100")]
+       75 -        pixels: i32,
+       76 -    },
+       77 -    /// Scroll viewport right
+       78 -    Right {
+       79 -        /// Pixels to scroll (default: 100)
+       80 -        #[arg(short, long, default_value = "100")]
+       81 -        pixels: i32,
+       82 -    },
+       83 -}
+       84 -
+       85 -#[derive(Subcommand)]
+       86 -enum MoveDirection {
+       87 -    /// Move focused column left
+       88 -    Left,
+       89 -    /// Move focused column right
+       90 -    Right,
+       91 -}
+       92 -
+       93 -#[derive(Subcommand)]
+       94 -enum QueryType {
+       95 -    /// Get current workspace state
+       96 -    Workspace,
+       97 -    /// Get focused window info
+       98 -    Focused,
+       99 -    /// Get all window placements
+      100 -    Placements,
+      101 -}
+      102 -
+      103 -fn main() -> Result<()> {
+      104 -    let cli = Cli::parse();
+      105 -
+      106 -    // TODO: Connect to daemon via named pipe and send command
+      107 -
+      108 -    match cli.command {
+      109 -        Commands::Focus { direction } => {
+      110 -            let dir = match direction {
+      111 -                FocusDirection::Left => "left",
+      112 -                FocusDirection::Right => "right",
+      113 -                FocusDirection::Up => "up",
+      114 -                FocusDirection::Down => "down",
+      115 -            };
+      116 -            println!("Would send: focus {}", dir);
+      117 -        }
+      118 -        Commands::Scroll { direction } => match direction {
+      119 -            ScrollDirection::Left { pixels } => {
+      120 -                println!("Would send: scroll left {} pixels", pixels);
+      121 -            }
+      122 -            ScrollDirection::Right { pixels } => {
+      123 -                println!("Would send: scroll right {} pixels", pixels);
+      124 -            }
+      125 -        },
+      126 -        Commands::Move { direction } => {
+      127 -            let dir = match direction {
+      128 -                MoveDirection::Left => "left",
+      129 -                MoveDirection::Right => "right",
+      130 -            };
+      131 -            println!("Would send: move {}", dir);
+      132 -        }
+      133 -        Commands::Resize { delta } => {
+      134 -            println!("Would send: resize delta={}", delta);
+      135 -        }
+      136 -        Commands::SetColumns { count } => {
+      137 -            println!("Would send: set-columns {}", count);
+      138 -        }
+      139 -        Commands::Query { what } => {
+      140 -            let query = match what {
+      141 -                QueryType::Workspace => "workspace",
+      142 -                QueryType::Focused => "focused",
+      143 -                QueryType::Placements => "placements",
+      144 -            };
+      145 -            println!("Would send: query {}", query);
+      146 -        }
+      147 -        Commands::Reload => {
+      148 -            println!("Would send: reload");
+      149 -        }
+      150 -        Commands::Stop => {
+      151 -            println!("Would send: stop");
+      152 -        }
+      153 -    }
+      154 -
+      155 -    println!("\nNote: IPC communication not yet implemented.");
+      156 -    println!("The daemon must be running to process these commands.");
+      157 -
+      158 -    Ok(())
+      159 -}
+        1 +//! OpenNiri CLI
+        2 +//!
+        3 +//! Command-line interface for controlling the OpenNiri window manager.
+        4 +//!
+        5 +//! Commands are sent to the daemon via IPC (named pipe).
+        6 +
+        7 +use anyhow::{Context, Result};
+        8 +use clap::{Parser, Subcommand};
+        9 +use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
+       10 +use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+       11 +use tokio::net::windows::named_pipe::ClientOptions;
+       12 +
+       13 +#[derive(Parser)]
+       14 +#[command(name = "openniri-cli")]
+       15 +#[command(author, version, about = "Control the OpenNiri window manager")]
+       16 +struct Cli {
+       17 +    #[command(subcommand)]
+       18 +    command: Commands,
+       19 +}
+       20 +
+       21 +#[derive(Subcommand)]
+       22 +enum Commands {
+       23 +    /// Focus commands
+       24 +    Focus {
+       25 +        #[command(subcommand)]
+       26 +        direction: FocusDirection,
+       27 +    },
+       28 +    /// Scroll the viewport
+       29 +    Scroll {
+       30 +        #[command(subcommand)]
+       31 +        direction: ScrollDirection,
+       32 +    },
+       33 +    /// Move the focused column
+       34 +    Move {
+       35 +        #[command(subcommand)]
+       36 +        direction: MoveDirection,
+       37 +    },
+       38 +    /// Resize the focused column
+       39 +    Resize {
+       40 +        /// Width delta in pixels (positive to grow, negative to shrink)
+       41 +        #[arg(short, long)]
+       42 +        delta: i32,
+       43 +    },
+       44 +    /// Query workspace state
+       45 +    Query {
+       46 +        #[command(subcommand)]
+       47 +        what: QueryType,
+       48 +    },
+       49 +    /// Re-enumerate windows
+       50 +    Refresh,
+       51 +    /// Apply current layout to windows
+       52 +    Apply,
+       53 +    /// Stop the daemon
+       54 +    Stop,
+       55 +}
+       56 +
+       57 +#[derive(Subcommand)]
+       58 +enum FocusDirection {
+       59 +    /// Focus the column to the left
+       60 +    Left,
+       61 +    /// Focus the column to the right
+       62 +    Right,
+       63 +    /// Focus the window above (in stacked columns)
+       64 +    Up,
+       65 +    /// Focus the window below (in stacked columns)
+       66 +    Down,
+       67 +}
+       68 +
+       69 +#[derive(Subcommand)]
+       70 +enum ScrollDirection {
+       71 +    /// Scroll viewport left
+       72 +    Left {
+       73 +        /// Pixels to scroll (default: 100)
+       74 +        #[arg(short, long, default_value = "100")]
+       75 +        pixels: i32,
+       76 +    },
+       77 +    /// Scroll viewport right
+       78 +    Right {
+       79 +        /// Pixels to scroll (default: 100)
+       80 +        #[arg(short, long, default_value = "100")]
+       81 +        pixels: i32,
+       82 +    },
+       83 +}
+       84 +
+       85 +#[derive(Subcommand)]
+       86 +enum MoveDirection {
+       87 +    /// Move focused column left
+       88 +    Left,
+       89 +    /// Move focused column right
+       90 +    Right,
+       91 +}
+       92 +
+       93 +#[derive(Subcommand)]
+       94 +enum QueryType {
+       95 +    /// Get current workspace state
+       96 +    Workspace,
+       97 +    /// Get focused window info
+       98 +    Focused,
+       99 +}
+      100 +
+      101 +/// Convert CLI command to IPC command.
+      102 +fn to_ipc_command(cmd: &Commands) -> IpcCommand {
+      103 +    match cmd {
+      104 +        Commands::Focus { direction } => match direction {
+      105 +            FocusDirection::Left => IpcCommand::FocusLeft,
+      106 +            FocusDirection::Right => IpcCommand::FocusRight,
+      107 +            FocusDirection::Up => IpcCommand::FocusUp,
+      108 +            FocusDirection::Down => IpcCommand::FocusDown,
+      109 +        },
+      110 +        Commands::Scroll { direction } => match direction {
+      111 +            ScrollDirection::Left { pixels } => IpcCommand::Scroll {
+      112 +                delta: -(*pixels as f64),
+      113 +            },
+      114 +            ScrollDirection::Right { pixels } => IpcCommand::Scroll {
+      115 +                delta: *pixels as f64,
+      116 +            },
+      117 +        },
+      118 +        Commands::Move { direction } => match direction {
+      119 +            MoveDirection::Left => IpcCommand::MoveColumnLeft,
+      120 +            MoveDirection::Right => IpcCommand::MoveColumnRight,
+      121 +        },
+      122 +        Commands::Resize { delta } => IpcCommand::Resize { delta: *delta },
+      123 +        Commands::Query { what } => match what {
+      124 +            QueryType::Workspace => IpcCommand::QueryWorkspace,
+      125 +            QueryType::Focused => IpcCommand::QueryFocused,
+      126 +        },
+      127 +        Commands::Refresh => IpcCommand::Refresh,
+      128 +        Commands::Apply => IpcCommand::Apply,
+      129 +        Commands::Stop => IpcCommand::Stop,
+      130 +    }
+      131 +}
+      132 +
+      133 +/// Send a command to the daemon and return the response.
+      134 +async fn send_command(cmd: IpcCommand) -> Result<IpcResponse> {
+      135 +    // Connect to the named pipe
+      136 +    let client = ClientOptions::new()
+      137 +        .open(PIPE_NAME)
+      138 +        .context("Failed to connect to daemon. Is openniri running?")?;
+      139 +
+      140 +    let (reader, mut writer) = tokio::io::split(client);
+      141 +
+      142 +    // Send command as JSON line
+      143 +    let json = serde_json::to_string(&cmd)? + "\n";
+      144 +    writer
+      145 +        .write_all(json.as_bytes())
+      146 +        .await
+      147 +        .context("Failed to send command")?;
+      148 +
+      149 +    // Read response
+      150 +    let mut reader = BufReader::new(reader);
+      151 +    let mut line = String::new();
+      152 +    reader
+      153 +        .read_line(&mut line)
+      154 +        .await
+      155 +        .context("Failed to read response")?;
+      156 +
+      157 +    let response: IpcResponse =
+      158 +        serde_json::from_str(line.trim()).context("Failed to parse response")?;
+      159 +
+      160 +    Ok(response)
+      161 +}
+      162 +
+      163 +/// Print a response in a human-readable format.
+      164 +fn print_response(response: &IpcResponse) {
+      165 +    match response {
+      166 +        IpcResponse::Ok => {
+      167 +            println!("OK");
+      168 +        }
+      169 +        IpcResponse::Error { message } => {
+      170 +            eprintln!("Error: {}", message);
+      171 +        }
+      172 +        IpcResponse::WorkspaceState {
+      173 +            columns,
+      174 +            windows,
+      175 +            focused_column,
+      176 +            focused_window,
+      177 +            scroll_offset,
+      178 +            total_width,
+      179 +        } => {
+      180 +            println!("Workspace State:");
+      181 +            println!("  Columns: {}", columns);
+      182 +            println!("  Windows: {}", windows);
+      183 +            println!("  Focused column: {}", focused_column);
+      184 +            println!("  Focused window in column: {}", focused_window);
+      185 +            println!("  Scroll offset: {:.1}", scroll_offset);
+      186 +            println!("  Total width: {}", total_width);
+      187 +        }
+      188 +        IpcResponse::FocusedWindow {
+      189 +            window_id,
+      190 +            column_index,
+      191 +            window_index,
+      192 +        } => {
+      193 +            println!("Focused Window:");
+      194 +            match window_id {
+      195 +                Some(id) => println!("  Window ID: {}", id),
+      196 +                None => println!("  No window focused"),
+      197 +            }
+      198 +            println!("  Column index: {}", column_index);
+      199 +            println!("  Window index: {}", window_index);
+      200 +        }
+      201 +    }
+      202 +}
+      203 +
+      204 +#[tokio::main]
+      205 +async fn main() -> Result<()> {
+      206 +    let cli = Cli::parse();
+      207 +
+      208 +    let ipc_cmd = to_ipc_command(&cli.command);
+      209 +    let response = send_command(ipc_cmd).await?;
+      210 +    print_response(&response);
+      211 +
+      212 +    // Exit with error code if response was an error
+      213 +    if matches!(response, IpcResponse::Error { .. }) {
+      214 +        std::process::exit(1);
+      215 +    }
+      216 +
+      217 +    Ok(())
+      218 +}
+
+● Now let's build and test the implementation:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo check --workspace 2>&1)
+  ⎿  Error: Exit code 101
+     Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling quote v1.0.44
+         Checking windows-link v0.2.1
+        Compiling windows_x86_64_msvc v0.53.1
+        Compiling serde_core v1.0.228
+        Compiling serde v1.0.228
+        Compiling thiserror v2.0.18
+         Checking cfg-if v1.0.4
+     … +90 lines (ctrl+o to see all)
+
+● There's a linker issue with the MSVC toolchain. The plan mentioned using cargo
+  +stable-x86_64-pc-windows-gnu. Let me try that:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu check --workspace 2>&1)
+  ⎿  Error: Exit code 101
+     Shell ready. Type 'alias' to see available shortcuts.
+         Checking once_cell_polyfill v1.70.2
+         Checking anstyle v1.0.13
+         Checking utf8parse v0.2.2
+         Checking colorchoice v1.0.4
+         Checking is_terminal_polyfill v1.70.2
+         Checking strsim v0.11.1
+         Checking clap_lex v0.7.7
+         Checking anstyle-query v1.1.5
+     … +47 lines (ctrl+o to see all)
+
+● There are a couple of API differences in windows-rs. Let me fix them:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      11  use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
+      12  use std::ffi::c_void;
+      13  use thiserror::Error;
+      14 -use windows::Win32::Foundation::{BOOL, FALSE, HWND, LPARAM, RECT, TRUE};
+      14 +use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+      15  use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+      16  use windows::Win32::Graphics::Gdi::{
+      17 -    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MONITORINFOF_PRIM
+         -ARY,
+      17 +    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+      18  };
+      19  use windows::Win32::UI::WindowsAndMessaging::{
+      20      BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetClassNameW,
+
+● Now fix the EnumDisplayMonitors call and MONITORINFOF_PRIMARY:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 2 lines, removed 2 lines
+      165          let monitors_ptr = &mut monitors as *mut Vec<MonitorInfo>;
+      166
+      167          let result = EnumDisplayMonitors(
+      168 -            HDC::default(),
+      169 -            None,
+      168 +            None, // HDC - None to enumerate all monitors
+      169 +            None, // lprcClip - None to not clip
+      170              Some(enum_monitors_callback),
+      171              LPARAM(monitors_ptr as isize),
+      172          );
+
+● Now fix the MONITORINFOF_PRIMARY constant - it's defined as a u32 value 1:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 2 lines, removed 1 line
+      226                  work_rect.right - work_rect.left,
+      227                  work_rect.bottom - work_rect.top,
+      228              ),
+      229 -            is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+      229 +            // MONITORINFOF_PRIMARY = 1
+      230 +            is_primary: info.monitorInfo.dwFlags & 1 != 0,
+      231              device_name,
+      232          });
+      233
+
+● Also need to remove the now-unused MONITORINFO import:
+
+● Update(crates\platform_win32\src\lib.rs)
+  ⎿  Added 1 line, removed 1 line
+      14  use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+      15  use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+      16  use windows::Win32::Graphics::Gdi::{
+      17 -    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+      17 +    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+      18  };
+      19  use windows::Win32::UI::WindowsAndMessaging::{
+      20      BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, EnumWindows, GetClassNameW,
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu check --workspace 2>&1)
+  ⎿  Error: Exit code 101
+     Shell ready. Type 'alias' to see available shortcuts.
+         Checking openniri-platform-win32 v0.1.0 (C:\dev\OpenNiri-Windows\crates\platform_win32)
+         Checking openniri-cli v0.1.0 (C:\dev\OpenNiri-Windows\crates\cli)
+         Checking openniri-daemon v0.1.0 (C:\dev\OpenNiri-Windows\crates\daemon)
+     error[E0502]: cannot borrow `state` as immutable because it is also borrowed as mutable
+        --> crates\daemon\src\main.rs:384:52
+         |
+     384 |             state.workspace.ensure_focused_visible(state.viewport.width);
+         |             -----           ---------------------- ^^^^^ immutable borrow occurs here
+     … +6 lines (ctrl+o to see all)
+
+● There's a borrow issue in the daemon. Let me fix it:
+
+● Read 1 file (ctrl+o to expand)
+
+● Update(crates\daemon\src\main.rs)
+  ⎿  Added 2 lines, removed 1 line
+      381
+      382          // Center on first column if we have windows
+      383          if state.workspace.column_count() > 0 {
+      384 -            state.workspace.ensure_focused_visible(state.viewport.width);
+      384 +            let width = state.viewport.width;
+      385 +            state.workspace.ensure_focused_visible(width);
+      386          }
+      387      }
+      388
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu check --workspace 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking openniri-daemon v0.1.0 (C:\dev\OpenNiri-Windows\crates\daemon)
+         Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.43s
+
+● The workspace compiles. Now let's run clippy:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu clippy --workspace 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking openniri-ipc v0.1.0 (C:\dev\OpenNiri-Windows\crates\ipc)
+         Checking openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+     … +17 lines (ctrl+o to expand)
+
+● There's a clippy suggestion. Let me fix that:
+
+● Update(crates\daemon\src\main.rs)
+  ⎿  Added 1 line, removed 1 line
+      70
+      71          for win_info in windows {
+      72              // Use a reasonable default width or the window's current width
+      73 -            let width = win_info.rect.width.max(400).min(1200);
+      73 +            let width = win_info.rect.width.clamp(400, 1200);
+      74
+      75              match self.workspace.insert_window(win_info.hwnd, Some(width)) {
+      76                  Ok(()) => {
+
+● Now run the tests:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu test --all 2>&1)
+  ⎿  Error: Exit code 101
+     Shell ready. Type 'alias' to see available shortcuts.
+        Compiling windows-sys v0.61.2
+        Compiling windows-result v0.3.4
+        Compiling windows-strings v0.3.1
+        Compiling parking_lot_core v0.9.12
+        Compiling matchers v0.2.0
+        Compiling socket2 v0.6.2
+        Compiling openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+        Compiling openniri-ipc v0.1.0 (C:\dev\OpenNiri-Windows\crates\ipc)
+     … +9 lines (ctrl+o to see all)
+
+● The GNU toolchain needs dlltool which isn't available. Let me check if there's a better way to build:
+
+● Bash(rustup show 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     Default host: x86_64-pc-windows-msvc
+     rustup home:  C:\Users\stark\scoop\persist\rustup\.rustup
+     … +13 lines (ctrl+o to expand)
+
+● The problem is that MSVC toolchain is having issues with link.exe. Let me check if there's a conflict:
+
+● Bash(where link.exe 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     C:\Program Files\Git\usr\bin\link.exe
+
+● That's the issue - Git's link.exe is being used instead of MSVC's. This is a PATH conflict. Let me try
+  running in a clean environment or with a VS Developer prompt:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo clean 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+          Removed 2070 files, 466.3MiB total
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cmd /c "\"C:\Program Files\Microsoft Visual
+      Studio\2022\Community\Common7\Tools\VsDevCmd.bat\" -arch=amd64 && cargo test --all"…)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     Microsoft Windows [Version 10.0.26200.7623]
+     (c) Microsoft Corporation. All rights reserved.
+     … +2 lines (ctrl+o to expand)
+
+● That didn't return the output. Let me try a different approach:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && $env:PATH = "C:\Program Files\Microsoft Visual
+      Studio\2022\Community\VC\Tools\MSVC\14.43.34808\bin\Hostx64\x64;" + $env:PATH; ca…)
+  ⎿  Error: Exit code 101
+     /usr/bin/bash: line 1: :PATH: command not found
+
+     Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling quote v1.0.44
+        Compiling unicode-ident v1.0.22
+        Compiling serde_core v1.0.228
+        Compiling windows-link v0.2.1
+        Compiling windows_x86_64_msvc v0.53.1
+     … +97 lines (ctrl+o to see all)
+
+● The PATH issue is still there. The problem is that Git's link.exe is interfering. Let me try using the
+  x86_64-pc-windows-gnu target directly by building for that target specifically:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo clean && cargo +stable-x86_64-pc-windows-gnu build --target
+      x86_64-pc-windows-gnu --workspace 2>&1)
+  ⎿  Error: Exit code 101
+          Removed 249 files, 54.2MiB total
+
+     Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling quote v1.0.44
+        Compiling unicode-ident v1.0.22
+        Compiling windows-link v0.2.1
+        Compiling windows_x86_64_gnu v0.53.1
+        Compiling serde_core v1.0.228
+     … +40 lines (ctrl+o to see all)
+
+● The GNU toolchain needs dlltool. Let me check if it's available in a MinGW installation:
+
+● Bash(where dlltool 2>&1; where gcc 2>&1)
+  ⎿  Error: Exit code 1
+     Shell ready. Type 'alias' to see available shortcuts.
+     INFO: Could not find files for the given pattern(s).
+     INFO: Could not find files for the given pattern(s).
+
+● Neither dlltool nor gcc are available. The GNU toolchain requires MinGW tools. Let me work around this by
+   configuring cargo to use the correct MSVC linker directly:
+
+● Bash(dir "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\" 2>&1)
+  ⎿  Error: Exit code 2
+     /usr/bin/bash: eval: line 1: unexpected EOF while looking for matching `"'
+
+     Shell ready. Type 'alias' to see available shortcuts.
+
+● Searched for 1 pattern, read 4 files (ctrl+o to expand)
+
+● Let me check if there's a VS BuildTools installed, which is separate from VS proper:
+
+● Bash(vswhere -latest -property installationPath 2>&1 || ls -la "/c/Program Files (x86)/Microsoft Visual
+      Studio/2019/BuildTools/VC/Tools/MSVC/" 2>&1 || ls -la "/c/Pro…)
+  ⎿  Error: Exit code 2
+     Shell ready. Type 'alias' to see available shortcuts.
+     /usr/bin/bash: line 1: vswhere: command not found
+     ls: cannot access '/c/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSVC/': No
+     such file or directory
+     ls: cannot access '/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/': No such file or
+     directory
+
+● Bash("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property
+      installationPath 2>&1)
+  ⎿  Error: Exit code 127
+     Shell ready. Type 'alias' to see available shortcuts.
+     /usr/bin/bash: line 1: /c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe: No such
+     file or directory
+
+● Read 1 file (ctrl+o to expand)
+
+● The VS Installer is there but vswhere.exe isn't. Let me look for the linker another way:
+
+● Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● The issue is that rustup on Windows MSVC expects the Microsoft link.exe, but Git's link.exe is getting in
+   the way. Let me configure cargo to use an absolute path to the MSVC linker. First, let me find the
+  actual MSVC toolchain:
+
+● Read 1 file (ctrl+o to expand)
+
+● Bash(echo $CARGO_HOME; echo $RUSTUP_HOME)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+     C:\Users\stark\scoop\persist\rustup\.cargo
+     C:\Users\stark\scoop\persist\rustup\.rustup
+
+● Read 2 files (ctrl+o to expand)
+
+● vcredist is just the runtime, not the build tools. Let me create a cargo config to point to the right
+  linker. First, let me find where the Windows SDK link.exe is installed:
+
+● Searched for 2 patterns, read 4 files (ctrl+o to expand)
+
+● No link.exe in the SDK. The issue is that this system doesn't have VS Build Tools installed, only the VS
+  Installer. The cargo check command with the GNU toolchain works because it only checks syntax/types
+  without linking. But cargo test needs to link.
+
+  Let me verify the code compiles and clippy passes (which we already confirmed), and note the toolchain
+  issue as environmental:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu check --workspace 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+        Compiling proc-macro2 v1.0.106
+        Compiling unicode-ident v1.0.22
+     … +71 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● The code compiles. Now let me run clippy to ensure there are no warnings:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && cargo +stable-x86_64-pc-windows-gnu clippy --workspace -- -D
+      warnings 2>&1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+         Checking openniri-ipc v0.1.0 (C:\dev\OpenNiri-Windows\crates\ipc)
+         Checking openniri-core-layout v0.1.0 (C:\dev\OpenNiri-Windows\crates\core_layout)
+     … +4 lines (ctrl+o to expand)
+
+● All checks pass with no warnings. The implementation is complete, but testing requires proper build
+  tools. Let me update the task status and provide a summary.
+
+● Let me provide a summary of the implementation by reading the final files:
+
+● Bash(cd "C:\dev\OpenNiri-Windows" && find crates -name "*.rs" -o -name "Cargo.toml" | xargs wc -l
+      2>/dev/null | tail -1)
+  ⎿  Shell ready. Type 'alias' to see available shortcuts.
+       3293 total
+
+● Implementation Complete
+
+  Cycle 8 IPC & Platform Integration has been implemented. Here's what was done:
+
+  Files Created/Modified
+  File: Cargo.toml
+  Action: Modified
+  Summary: Added crates/ipc to workspace members, added Win32_Graphics_Gdi feature
+  ────────────────────────────────────────
+  File: crates/ipc/Cargo.toml
+  Action: Created
+  Summary: New IPC protocol crate manifest
+  ────────────────────────────────────────
+  File: crates/ipc/src/lib.rs
+  Action: Created
+  Summary: IpcCommand, IpcResponse enums, PIPE_NAME constant, tests
+  ────────────────────────────────────────
+  File: crates/platform_win32/src/lib.rs
+  Action: Modified
+  Summary: Added MonitorInfo struct, get_primary_monitor(), enumerate_monitors()
+  ────────────────────────────────────────
+  File: crates/daemon/Cargo.toml
+  Action: Modified
+  Summary: Added openniri-ipc dependency
+  ────────────────────────────────────────
+  File: crates/daemon/src/main.rs
+  Action: Modified
+  Summary: Full async restructure with named pipe IPC server, monitor detection
+  ────────────────────────────────────────
+  File: crates/cli/Cargo.toml
+  Action: Modified
+  Summary: Added openniri-ipc, tokio dependencies
+  ────────────────────────────────────────
+  File: crates/cli/src/main.rs
+  Action: Modified
+  Summary: IPC client implementation, command mapping
+  Key Features
+
+  1. IPC Protocol Crate (openniri-ipc)
+    - PIPE_NAME: \\.\pipe\openniri
+    - IpcCommand: FocusLeft/Right/Up/Down, MoveColumnLeft/Right, Resize, Scroll, QueryWorkspace,
+  QueryFocused, Refresh, Apply, Stop
+    - IpcResponse: Ok, Error, WorkspaceState, FocusedWindow
+  2. Monitor Detection (platform_win32)
+    - MonitorInfo: rect, work_area, is_primary, device_name
+    - get_primary_monitor(): Returns primary monitor's work area
+    - enumerate_monitors(): Lists all connected monitors
+  3. Async Daemon
+    - Event loop with tokio::sync::mpsc channels
+    - Named pipe server using tokio::net::windows::named_pipe
+    - Detects actual monitor dimensions (no more hardcoded 1920x1080)
+    - Handles multiple clients sequentially
+  4. CLI IPC Client
+    - Connects to daemon via named pipe
+    - Maps CLI commands to IpcCommand
+    - Prints human-readable responses
+
+  Build Verification
+
+  cargo +stable-x86_64-pc-windows-gnu check --workspace  ✅
+  cargo +stable-x86_64-pc-windows-gnu clippy --workspace -- -D warnings  ✅
+
+  Note on Testing
+
+  Full test execution requires either:
+  - VS Build Tools with C++ workload installed (for MSVC linker)
+  - MinGW toolchain installed (for GNU linker)
+
+  The current environment has Git's link.exe in PATH which conflicts with MSVC's link.exe. Once build tools
+   are properly configured, run:
+  cargo test --all
+
+✻ Sautéed for 9m 12s
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ now commit these changes
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

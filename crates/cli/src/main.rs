@@ -4,8 +4,19 @@
 //!
 //! Commands are sent to the daemon via IPC (named pipe).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use directories::ProjectDirs;
+use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::time::timeout;
+
+/// Connection timeout for IPC commands.
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(name = "openniri-cli")]
@@ -38,18 +49,36 @@ enum Commands {
         #[arg(short, long)]
         delta: i32,
     },
-    /// Set the number of visible columns
-    SetColumns {
-        /// Number of columns to display
-        count: usize,
+    /// Focus a different monitor
+    FocusMonitor {
+        #[command(subcommand)]
+        direction: MonitorDirection,
+    },
+    /// Move the focused window to a different monitor
+    MoveToMonitor {
+        #[command(subcommand)]
+        direction: MonitorDirection,
     },
     /// Query workspace state
     Query {
         #[command(subcommand)]
         what: QueryType,
     },
-    /// Reload configuration
+    /// Re-enumerate windows
+    Refresh,
+    /// Apply current layout to windows
+    Apply,
+    /// Reload configuration from file
     Reload,
+    /// Generate default configuration file
+    Init {
+        /// Output path (default: %APPDATA%/openniri/config.toml)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Overwrite existing config file
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Stop the daemon
     Stop,
 }
@@ -91,69 +120,242 @@ enum MoveDirection {
 }
 
 #[derive(Subcommand)]
+enum MonitorDirection {
+    /// Focus/move to the monitor on the left
+    Left,
+    /// Focus/move to the monitor on the right
+    Right,
+}
+
+#[derive(Subcommand)]
 enum QueryType {
     /// Get current workspace state
     Workspace,
     /// Get focused window info
     Focused,
-    /// Get all window placements
-    Placements,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // TODO: Connect to daemon via named pipe and send command
-
-    match cli.command {
-        Commands::Focus { direction } => {
-            let dir = match direction {
-                FocusDirection::Left => "left",
-                FocusDirection::Right => "right",
-                FocusDirection::Up => "up",
-                FocusDirection::Down => "down",
-            };
-            println!("Would send: focus {}", dir);
-        }
-        Commands::Scroll { direction } => match direction {
-            ScrollDirection::Left { pixels } => {
-                println!("Would send: scroll left {} pixels", pixels);
-            }
-            ScrollDirection::Right { pixels } => {
-                println!("Would send: scroll right {} pixels", pixels);
-            }
+/// Convert CLI command to IPC command.
+fn to_ipc_command(cmd: &Commands) -> IpcCommand {
+    match cmd {
+        Commands::Focus { direction } => match direction {
+            FocusDirection::Left => IpcCommand::FocusLeft,
+            FocusDirection::Right => IpcCommand::FocusRight,
+            FocusDirection::Up => IpcCommand::FocusUp,
+            FocusDirection::Down => IpcCommand::FocusDown,
         },
-        Commands::Move { direction } => {
-            let dir = match direction {
-                MoveDirection::Left => "left",
-                MoveDirection::Right => "right",
-            };
-            println!("Would send: move {}", dir);
+        Commands::Scroll { direction } => match direction {
+            ScrollDirection::Left { pixels } => IpcCommand::Scroll {
+                delta: -(*pixels as f64),
+            },
+            ScrollDirection::Right { pixels } => IpcCommand::Scroll {
+                delta: *pixels as f64,
+            },
+        },
+        Commands::Move { direction } => match direction {
+            MoveDirection::Left => IpcCommand::MoveColumnLeft,
+            MoveDirection::Right => IpcCommand::MoveColumnRight,
+        },
+        Commands::Resize { delta } => IpcCommand::Resize { delta: *delta },
+        Commands::FocusMonitor { direction } => match direction {
+            MonitorDirection::Left => IpcCommand::FocusMonitorLeft,
+            MonitorDirection::Right => IpcCommand::FocusMonitorRight,
+        },
+        Commands::MoveToMonitor { direction } => match direction {
+            MonitorDirection::Left => IpcCommand::MoveWindowToMonitorLeft,
+            MonitorDirection::Right => IpcCommand::MoveWindowToMonitorRight,
+        },
+        Commands::Query { what } => match what {
+            QueryType::Workspace => IpcCommand::QueryWorkspace,
+            QueryType::Focused => IpcCommand::QueryFocused,
+        },
+        Commands::Refresh => IpcCommand::Refresh,
+        Commands::Apply => IpcCommand::Apply,
+        Commands::Reload => IpcCommand::Reload,
+        Commands::Init { .. } => unreachable!("Init is handled separately"),
+        Commands::Stop => IpcCommand::Stop,
+    }
+}
+
+/// Send a command to the daemon and return the response (with timeout).
+async fn send_command(cmd: IpcCommand) -> Result<IpcResponse> {
+    timeout(IPC_TIMEOUT, send_command_inner(cmd))
+        .await
+        .context("Timed out waiting for daemon response")?
+}
+
+/// Inner implementation without timeout.
+async fn send_command_inner(cmd: IpcCommand) -> Result<IpcResponse> {
+    // Connect to the named pipe
+    let client = ClientOptions::new()
+        .open(PIPE_NAME)
+        .context("Failed to connect to daemon. Is openniri running?")?;
+
+    let (reader, mut writer) = tokio::io::split(client);
+
+    // Send command as JSON line
+    let json = serde_json::to_string(&cmd)? + "\n";
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .context("Failed to send command")?;
+
+    // Read response
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .context("Failed to read response")?;
+
+    let response: IpcResponse =
+        serde_json::from_str(line.trim()).context("Failed to parse response")?;
+
+    Ok(response)
+}
+
+/// Print a response in a human-readable format.
+fn print_response(response: &IpcResponse) {
+    match response {
+        IpcResponse::Ok => {
+            println!("OK");
         }
-        Commands::Resize { delta } => {
-            println!("Would send: resize delta={}", delta);
+        IpcResponse::Error { message } => {
+            eprintln!("Error: {}", message);
         }
-        Commands::SetColumns { count } => {
-            println!("Would send: set-columns {}", count);
+        IpcResponse::WorkspaceState {
+            columns,
+            windows,
+            focused_column,
+            focused_window,
+            scroll_offset,
+            total_width,
+        } => {
+            println!("Workspace State:");
+            println!("  Columns: {}", columns);
+            println!("  Windows: {}", windows);
+            println!("  Focused column: {}", focused_column);
+            println!("  Focused window in column: {}", focused_window);
+            println!("  Scroll offset: {:.1}", scroll_offset);
+            println!("  Total width: {}", total_width);
         }
-        Commands::Query { what } => {
-            let query = match what {
-                QueryType::Workspace => "workspace",
-                QueryType::Focused => "focused",
-                QueryType::Placements => "placements",
-            };
-            println!("Would send: query {}", query);
-        }
-        Commands::Reload => {
-            println!("Would send: reload");
-        }
-        Commands::Stop => {
-            println!("Would send: stop");
+        IpcResponse::FocusedWindow {
+            window_id,
+            column_index,
+            window_index,
+        } => {
+            println!("Focused Window:");
+            match window_id {
+                Some(id) => println!("  Window ID: {}", id),
+                None => println!("  No window focused"),
+            }
+            println!("  Column index: {}", column_index);
+            println!("  Window index: {}", window_index);
         }
     }
+}
 
-    println!("\nNote: IPC communication not yet implemented.");
-    println!("The daemon must be running to process these commands.");
+/// Generate default configuration content.
+fn generate_default_config() -> String {
+    r#"# OpenNiri Windows Configuration
+# https://github.com/AdEx-Partners-DE/OpenNiri-Windows
+
+[layout]
+# Gap between columns in pixels
+gap = 10
+
+# Gap at the edges of the viewport in pixels
+outer_gap = 10
+
+# Default width for new columns in pixels
+default_column_width = 800
+
+# Minimum column width in pixels
+min_column_width = 400
+
+# Maximum column width in pixels
+max_column_width = 1600
+
+# Centering mode: "center" or "just_in_view"
+# - center: Always center the focused column
+# - just_in_view: Only scroll if focused column would be outside viewport
+centering_mode = "center"
+
+[appearance]
+# Use DWM cloaking for off-screen windows (keeps them in Alt-Tab)
+use_cloaking = true
+
+# Use batched window positioning for smoother updates
+use_deferred_positioning = true
+
+[behavior]
+# Automatically focus new windows when they appear
+focus_new_windows = true
+
+# Track focus changes from Windows (sync with Alt-Tab, etc.)
+track_focus_changes = true
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+"#
+    .to_string()
+}
+
+/// Get the default config file path.
+fn default_config_path() -> Option<PathBuf> {
+    ProjectDirs::from("com", "openniri", "openniri")
+        .map(|dirs| dirs.config_dir().join("config.toml"))
+}
+
+/// Handle the init command (generate default config).
+fn handle_init(output: Option<PathBuf>, force: bool) -> Result<()> {
+    let path = output.or_else(default_config_path).context(
+        "Could not determine config path. Use --output to specify a path.",
+    )?;
+
+    // Check if file exists
+    if path.exists() && !force {
+        anyhow::bail!(
+            "Config file already exists at: {}\nUse --force to overwrite.",
+            path.display()
+        );
+    }
+
+    // Create parent directories
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    // Write config file
+    let config_content = generate_default_config();
+    fs::write(&path, config_content)
+        .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+
+    println!("Created config file: {}", path.display());
+    println!("\nEdit this file to customize OpenNiri settings.");
+    println!("Run 'openniri-cli reload' to apply changes while daemon is running.");
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Handle init command separately (doesn't need IPC)
+    if let Commands::Init { output, force } = cli.command {
+        return handle_init(output, force);
+    }
+
+    let ipc_cmd = to_ipc_command(&cli.command);
+    let response = send_command(ipc_cmd).await?;
+    print_response(&response);
+
+    // Exit with error code if response was an error
+    if matches!(response, IpcResponse::Error { .. }) {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
