@@ -200,14 +200,18 @@ Swap the focused column with its neighbor:
 - **Move Left**: Swap with column to the left
 - **Move Right**: Swap with column to the right
 
-## Multi-Monitor Support (Future)
+## Multi-Monitor Support
 
-Each monitor will have:
+Each monitor has:
 - Its own workspace (infinite strip)
 - Its own scroll offset
-- Independent focus
+- Independent focus tracking
 
-Windows can be moved between monitors, effectively moving between workspaces.
+**Monitor Navigation**:
+- `FocusMonitorLeft/Right`: Move focus to adjacent monitor
+- `MoveWindowToMonitorLeft/Right`: Move focused window to adjacent monitor (focus follows)
+
+Windows can be moved between monitors, effectively moving between workspaces. Monitor adjacency is determined by physical position (x-coordinate comparison).
 
 ## Configuration
 
@@ -228,8 +232,69 @@ All configuration fields are accessed via getters and modified via setters that 
 
 ---
 
+## Global Hotkeys
+
+Global hotkeys allow keyboard-driven navigation without focusing the daemon window.
+
+### Hotkey Syntax
+
+Hotkeys are specified as strings: `Modifier+Modifier+Key`
+
+**Supported Modifiers**: `Win`, `Ctrl`, `Alt`, `Shift`
+
+**Example**: `Win+Shift+H` = Windows key + Shift + H
+
+### Default Bindings
+
+| Hotkey | Command |
+|--------|---------|
+| Win+H/J/K/L | Focus left/down/up/right |
+| Win+Shift+H/L | Move column left/right |
+| Win+Ctrl+H/L | Resize shrink/grow |
+| Win+Alt+H/L | Focus monitor left/right |
+| Win+Alt+Shift+H/L | Move window to monitor left/right |
+| Win+R | Refresh (re-enumerate windows) |
+
+### Live Reload
+
+Hotkey bindings are reloaded when the `reload` command is issued. The daemon:
+1. Unregisters all existing hotkeys (drops handle)
+2. Parses new hotkey config
+3. Registers new hotkeys
+4. Updates the command mapping
+
+---
+
+## Scroll Animations
+
+Viewport scrolling uses smooth animations for better visual feedback.
+
+### Animation Parameters
+
+- **Duration**: Configurable (default: 200ms)
+- **Tick Rate**: ~60 FPS (16ms intervals)
+- **Easing**: Configurable (default: ease-out)
+
+### Easing Functions
+
+| Mode | Description |
+|------|-------------|
+| Linear | Constant speed |
+| EaseIn | Slow start, fast end |
+| EaseOut | Fast start, slow end (default) |
+| EaseInOut | Slow start and end, fast middle |
+
+### Animation Lifecycle
+
+1. Focus change triggers `ensure_focused_visible_animated()`
+2. Animation state created with target scroll offset
+3. Animation timer starts (if not running)
+4. Each tick advances `elapsed_ms` and applies layout
+5. Timer stops when all animations complete
+
+---
+
 ## Implementation Gaps vs Intended Behavior
-- **Implemented**: Core layout (52 tests), IPC protocol (10 tests), Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout.
-- **Pending**: Config file support.
-- Multi-monitor support is still planned and not implemented.
+- **Implemented**: Core layout (79 tests), IPC protocol (10 tests), Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations.
+- **Pending**: Touchpad gesture support, per-window floating/rules.
 - Touchpad gesture input is planned but not implemented; current flow is keyboard/CLI oriented.

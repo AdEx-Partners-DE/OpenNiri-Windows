@@ -25,6 +25,15 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     /// Hotkey bindings.
     pub hotkeys: HotkeyConfig,
+    /// Window rules for per-window behavior.
+    #[serde(default)]
+    pub window_rules: Vec<WindowRule>,
+    /// Gesture bindings for touchpad support.
+    #[serde(default)]
+    pub gestures: GestureConfig,
+    /// Snap hint configuration.
+    #[serde(default)]
+    pub snap_hints: SnapHintConfig,
 }
 
 /// Layout-related configuration.
@@ -126,6 +135,16 @@ pub struct BehaviorConfig {
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Whether focus follows the mouse cursor.
+    /// When enabled, windows receive focus when the mouse enters them.
+    #[serde(default = "default_false")]
+    pub focus_follows_mouse: bool,
+
+    /// Delay in milliseconds before focus changes on mouse enter.
+    /// Only applies when focus_follows_mouse is true.
+    #[serde(default = "default_focus_delay")]
+    pub focus_follows_mouse_delay_ms: u32,
 }
 
 impl Default for BehaviorConfig {
@@ -134,6 +153,8 @@ impl Default for BehaviorConfig {
             focus_new_windows: true,
             track_focus_changes: true,
             log_level: default_log_level(),
+            focus_follows_mouse: false,
+            focus_follows_mouse_delay_ms: default_focus_delay(),
         }
     }
 }
@@ -165,6 +186,123 @@ fn default_true() -> bool {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_focus_delay() -> u32 {
+    100
+}
+
+// ============================================================================
+// Window Rules
+// ============================================================================
+
+/// A rule for per-window behavior.
+///
+/// Window rules are evaluated in order; the first matching rule wins.
+///
+/// # Example Config
+///
+/// ```toml
+/// [[window_rules]]
+/// match_class = "Chrome_WidgetWin_1"
+/// match_title = ".*DevTools.*"
+/// action = "float"
+///
+/// [[window_rules]]
+/// match_executable = "spotify.exe"
+/// action = "float"
+///
+/// [[window_rules]]
+/// match_class = "#32770"  # Windows dialogs
+/// action = "ignore"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowRule {
+    /// Regex pattern to match window class name.
+    #[serde(default)]
+    pub match_class: Option<String>,
+
+    /// Regex pattern to match window title.
+    #[serde(default)]
+    pub match_title: Option<String>,
+
+    /// Executable name to match (e.g., "notepad.exe").
+    #[serde(default)]
+    pub match_executable: Option<String>,
+
+    /// Action to take when the rule matches.
+    #[serde(default)]
+    pub action: WindowAction,
+
+    /// Fixed width for floating windows (optional).
+    #[serde(default)]
+    pub width: Option<i32>,
+
+    /// Fixed height for floating windows (optional).
+    #[serde(default)]
+    pub height: Option<i32>,
+}
+
+/// Action to take for a matching window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowAction {
+    /// Tile the window normally (default behavior).
+    #[default]
+    Tile,
+    /// Float the window outside the tiling layout.
+    Float,
+    /// Ignore the window (don't manage it at all).
+    Ignore,
+}
+
+impl WindowRule {
+    /// Check if this rule matches a window with the given properties.
+    ///
+    /// All specified match criteria must match for the rule to apply.
+    /// If no match criteria are specified, the rule matches nothing.
+    pub fn matches(&self, class_name: &str, title: &str, executable: &str) -> bool {
+        let has_any_criteria = self.match_class.is_some()
+            || self.match_title.is_some()
+            || self.match_executable.is_some();
+
+        if !has_any_criteria {
+            return false;
+        }
+
+        // Check class name if specified
+        if let Some(ref pattern) = self.match_class {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                if !re.is_match(class_name) {
+                    return false;
+                }
+            } else {
+                tracing::warn!("Invalid regex in window rule match_class: {}", pattern);
+                return false;
+            }
+        }
+
+        // Check title if specified
+        if let Some(ref pattern) = self.match_title {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                if !re.is_match(title) {
+                    return false;
+                }
+            } else {
+                tracing::warn!("Invalid regex in window rule match_title: {}", pattern);
+                return false;
+            }
+        }
+
+        // Check executable if specified (case-insensitive)
+        if let Some(ref exe) = self.match_executable {
+            if !executable.eq_ignore_ascii_case(exe) {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 /// Hotkey bindings configuration.
@@ -216,6 +354,103 @@ impl Default for HotkeyConfig {
         bindings.insert("Win+R".to_string(), "refresh".to_string());
 
         Self { bindings }
+    }
+}
+
+/// Gesture bindings for touchpad support.
+///
+/// Maps touchpad gestures to commands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GestureConfig {
+    /// Whether gesture support is enabled.
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+
+    /// Command for three-finger swipe left.
+    #[serde(default = "default_swipe_left")]
+    pub swipe_left: String,
+
+    /// Command for three-finger swipe right.
+    #[serde(default = "default_swipe_right")]
+    pub swipe_right: String,
+
+    /// Command for three-finger swipe up.
+    #[serde(default = "default_swipe_up")]
+    pub swipe_up: String,
+
+    /// Command for three-finger swipe down.
+    #[serde(default = "default_swipe_down")]
+    pub swipe_down: String,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_swipe_left() -> String {
+    "focus_left".to_string()
+}
+
+fn default_swipe_right() -> String {
+    "focus_right".to_string()
+}
+
+fn default_swipe_up() -> String {
+    "focus_up".to_string()
+}
+
+fn default_swipe_down() -> String {
+    "focus_down".to_string()
+}
+
+impl Default for GestureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            swipe_left: default_swipe_left(),
+            swipe_right: default_swipe_right(),
+            swipe_up: default_swipe_up(),
+            swipe_down: default_swipe_down(),
+        }
+    }
+}
+
+/// Configuration for visual snap hints.
+///
+/// Snap hints provide visual feedback during resize operations,
+/// showing column boundaries and snap targets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapHintConfig {
+    /// Whether snap hints are enabled.
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+
+    /// Duration to show hints in milliseconds.
+    #[serde(default = "default_hint_duration")]
+    pub duration_ms: u32,
+
+    /// Opacity of the hint overlay (0-255).
+    #[serde(default = "default_hint_opacity")]
+    pub opacity: u8,
+}
+
+fn default_hint_duration() -> u32 {
+    200
+}
+
+fn default_hint_opacity() -> u8 {
+    128
+}
+
+impl Default for SnapHintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            duration_ms: default_hint_duration(),
+            opacity: default_hint_opacity(),
+        }
     }
 }
 
@@ -445,5 +680,162 @@ mod tests {
         assert_eq!(clamped_small, 400); // Clamped to min
         assert_eq!(clamped_large, 1600); // Clamped to max
         assert_eq!(clamped_right, 800); // Unchanged
+    }
+
+    #[test]
+    fn test_window_rule_matches_class() {
+        let rule = WindowRule {
+            match_class: Some("Notepad".to_string()),
+            match_title: None,
+            match_executable: None,
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("Notepad", "Untitled - Notepad", "notepad.exe"));
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_matches_title_regex() {
+        let rule = WindowRule {
+            match_class: None,
+            match_title: Some(".*DevTools.*".to_string()),
+            match_executable: None,
+            action: WindowAction::Float,
+            width: Some(800),
+            height: Some(600),
+        };
+
+        assert!(rule.matches("Chrome_WidgetWin_1", "DevTools - localhost:3000", "chrome.exe"));
+        assert!(rule.matches("SomeClass", "Firefox DevTools", "firefox.exe"));
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_matches_executable() {
+        let rule = WindowRule {
+            match_class: None,
+            match_title: None,
+            match_executable: Some("spotify.exe".to_string()),
+            action: WindowAction::Float,
+            width: None,
+            height: None,
+        };
+
+        assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "spotify.exe"));
+        assert!(rule.matches("SpotifyClass", "Spotify - Song Title", "SPOTIFY.EXE")); // Case insensitive
+        assert!(!rule.matches("SpotifyClass", "Spotify - Song Title", "chrome.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_matches_combined() {
+        let rule = WindowRule {
+            match_class: Some("Chrome.*".to_string()),
+            match_title: Some(".*YouTube.*".to_string()),
+            match_executable: None,
+            action: WindowAction::Tile,
+            width: None,
+            height: None,
+        };
+
+        // Both patterns must match
+        assert!(rule.matches("Chrome_WidgetWin_1", "YouTube - Google Chrome", "chrome.exe"));
+        assert!(!rule.matches("Firefox", "YouTube - Mozilla Firefox", "firefox.exe")); // Class doesn't match
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe")); // Title doesn't match
+    }
+
+    #[test]
+    fn test_window_rule_no_criteria_matches_nothing() {
+        let rule = WindowRule {
+            match_class: None,
+            match_title: None,
+            match_executable: None,
+            action: WindowAction::Ignore,
+            width: None,
+            height: None,
+        };
+
+        assert!(!rule.matches("AnyClass", "Any Title", "any.exe"));
+    }
+
+    #[test]
+    fn test_window_rule_config_parse() {
+        let toml_str = r#"
+            [[window_rules]]
+            match_class = "Notepad"
+            action = "float"
+            width = 800
+            height = 600
+
+            [[window_rules]]
+            match_executable = "spotify.exe"
+            action = "float"
+
+            [[window_rules]]
+            match_title = ".*dialog.*"
+            action = "ignore"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.window_rules.len(), 3);
+
+        assert_eq!(config.window_rules[0].match_class, Some("Notepad".to_string()));
+        assert_eq!(config.window_rules[0].action, WindowAction::Float);
+        assert_eq!(config.window_rules[0].width, Some(800));
+        assert_eq!(config.window_rules[0].height, Some(600));
+
+        assert_eq!(config.window_rules[1].match_executable, Some("spotify.exe".to_string()));
+        assert_eq!(config.window_rules[1].action, WindowAction::Float);
+
+        assert_eq!(config.window_rules[2].match_title, Some(".*dialog.*".to_string()));
+        assert_eq!(config.window_rules[2].action, WindowAction::Ignore);
+    }
+
+    #[test]
+    fn test_window_action_default() {
+        let action = WindowAction::default();
+        assert_eq!(action, WindowAction::Tile);
+    }
+
+    #[test]
+    fn test_snap_hint_config_default() {
+        let config = SnapHintConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.duration_ms, 200);
+        assert_eq!(config.opacity, 128);
+    }
+
+    #[test]
+    fn test_snap_hint_config_serialization() {
+        let toml_str = r#"
+            [snap_hints]
+            enabled = true
+            duration_ms = 300
+            opacity = 200
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.snap_hints.enabled);
+        assert_eq!(config.snap_hints.duration_ms, 300);
+        assert_eq!(config.snap_hints.opacity, 200);
+    }
+
+    #[test]
+    fn test_focus_follows_mouse_default() {
+        let config = Config::default();
+        assert!(!config.behavior.focus_follows_mouse);
+        assert_eq!(config.behavior.focus_follows_mouse_delay_ms, 100);
+    }
+
+    #[test]
+    fn test_focus_follows_mouse_serialization() {
+        let toml_str = r#"
+            [behavior]
+            focus_follows_mouse = true
+            focus_follows_mouse_delay_ms = 200
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.behavior.focus_follows_mouse);
+        assert_eq!(config.behavior.focus_follows_mouse_delay_ms, 200);
     }
 }

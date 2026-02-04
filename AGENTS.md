@@ -18,7 +18,8 @@ Rust
 - Test: `cargo test --all`
 
 ## Workflow
-- Use Developer Command Prompt for MSVC toolchain when building.
+- Uses GNU/MinGW toolchain (configured in `.cargo/config.toml`)
+- Build commands work from any terminal (no need for MSVC Developer Prompt)
 
 ## Standard Workflow (Recommended)
 - Plan first for non-trivial changes (3+ steps or architectural decisions).

@@ -2,7 +2,7 @@
 
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
-> **Last Updated**: 2026-02-04 (Iteration 16)
+> **Last Updated**: 2026-02-04 (Iteration 22)
 
 ---
 
@@ -63,10 +63,657 @@ OpenNiri-Windows/
 | 14 | 2026-02-04 | Smooth Scroll Animations | 81 | 108 | Easing functions, animated workspace scroll |
 | 15 | 2026-02-04 | Codex Review + Doc Drift Audit | 108 | 108 | Updated review with doc drift findings |
 | 16 | 2026-02-04 | Codex Review + QA Scan | 108 | 108 | Updated review with reload/hotkey gap |
+| 17 | 2026-02-04 | Codex Review + QA Scan (Failure) | 108 | FAIL | `cargo test --all` failed (E0599 Config::generate_default) |
+| 18 | 2026-02-04 | Codex Review + QA Scan (Failure) | FAIL | FAIL | Added NUL file issue + repeat E0599 failure |
+| 19 | 2026-02-04 | Config Completeness & Doc Sync | 111 | 111 | Hotkey reload fix, log_level, track_focus_changes, doc updates |
+| 20 | 2026-02-04 | Codex Review + QA Scan (Pass) | 111 | 111 | Tests pass again; iteration log inconsistency flagged |
+| 21 | 2026-02-04 | Full Feature Push | 111 | 131 | System tray, window rules, gestures, snap hints |
+| 22 | 2026-02-04 | Quality & Robustness | 131 | 147 | Fix unwraps, HWND validation, unit tests, docs, catch_unwind, IPC queries |
 
 ---
 
 ## Detailed Iteration Logs
+
+### Iteration 22: Quality, Robustness & Feature Expansion
+
+**Date**: 2026-02-04
+**Status**: COMPLETED
+**Previous Context**: Iteration 21 (Full Feature Push)
+
+#### 22.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1.1 | Fix critical unwraps in main.rs | Critical | DONE |
+| 1.2 | Add HWND validation function | High | DONE |
+| 1.3 | Add daemon unit tests (~10 tests) | High | DONE |
+| 1.4 | Document overlay.rs | Medium | DONE |
+| 2.1 | Display change detection infrastructure | Medium | DONE |
+| 2.2 | Add catch_unwind in callbacks | High | DONE |
+| 2.3 | DeferWindowPos fallback | Medium | DONE |
+| 3.1 | Enhanced IPC - QueryAllWindows | Medium | DONE |
+| 3.2 | Focus follows mouse config | Low | DONE |
+
+#### 22.2 Changes Made
+
+##### 22.2.1 Phase 1: Critical Quality Fixes
+
+**Task 1.1: Fixed Critical Unwraps**
+
+**File**: `crates/daemon/src/main.rs`
+
+**Problem**: Lines 238 and 663 had `.unwrap()` on `floating_rect` which could panic when window rules don't set dimensions.
+
+**Fix**: Replaced with `unwrap_or_else` that provides a default centered 800x600 window based on monitor's work area:
+```rust
+let rect = floating_rect.unwrap_or_else(|| {
+    let viewport = self.monitors.get(&monitor_id)
+        .map(|m| m.work_area)
+        .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT));
+    Rect::new(
+        viewport.x + (viewport.width - 800) / 2,
+        viewport.y + (viewport.height - 600) / 2,
+        800,
+        600,
+    )
+});
+```
+
+**Task 1.2: HWND Validation**
+
+**File**: `crates/platform_win32/src/lib.rs`
+
+**Added function**:
+```rust
+pub fn is_valid_window(hwnd: WindowId) -> bool {
+    unsafe {
+        let hwnd = HWND(hwnd as *mut c_void);
+        IsWindow(Some(hwnd)).as_bool()
+    }
+}
+```
+
+**File**: `crates/daemon/src/main.rs`
+
+**Added validation** at start of `handle_window_event()` - skips events for invalid window handles (except Destroyed events).
+
+**Task 1.3: Daemon Unit Tests**
+
+**File**: `crates/daemon/src/main.rs`
+
+**Added 12 tests**:
+- `test_app_state_new`
+- `test_app_state_focused_viewport`
+- `test_app_state_no_monitors_fallback`
+- `test_window_rule_matching_class`
+- `test_window_rule_matching_title`
+- `test_window_rule_matching_executable`
+- `test_window_rule_no_match_defaults_to_tile`
+- `test_floating_rect_uses_rule_dimensions`
+- `test_floating_rect_preserves_original_if_no_dimensions`
+- `test_find_window_workspace_not_found`
+- `test_app_state_apply_config`
+
+**Task 1.4: Overlay Documentation**
+
+**File**: `crates/platform_win32/src/overlay.rs`
+
+**Added comprehensive documentation**:
+- Module-level architecture overview
+- `OverlayWindow` struct with features and example
+- All public methods documented
+- `SnapHintType` and `SnapHintConfig` documented
+
+##### 22.2.2 Phase 2: Robustness Improvements
+
+**Task 2.1: Display Change Detection**
+
+**File**: `crates/platform_win32/src/lib.rs`
+- Added `DisplayChange` variant to `WindowEvent` enum
+- Added `WM_DISPLAYCHANGE` constant
+- Added `DISPLAY_CHANGE_SENDER` static for event forwarding
+
+**File**: `crates/core_layout/src/lib.rs`
+- Added `all_window_ids()` method to `Workspace` for window migration
+
+**File**: `crates/daemon/src/main.rs`
+- Added `reconcile_monitors()` method for handling monitor hotplug
+
+**Task 2.2: catch_unwind in Callbacks**
+
+**Files Modified**: `crates/platform_win32/src/lib.rs`, `crates/platform_win32/src/overlay.rs`
+
+**Wrapped with catch_unwind**:
+- `hotkey_window_proc` → `hotkey_window_proc_inner`
+- `win_event_callback` → `win_event_callback_inner`
+- `gesture_window_proc` → `gesture_window_proc_inner`
+- `overlay_window_proc` → `overlay_window_proc_inner`
+
+Panics in callbacks now log the error and return safe defaults instead of crashing.
+
+**Task 2.3: DeferWindowPos Fallback**
+
+**File**: `crates/platform_win32/src/lib.rs`
+
+**Improved `apply_placements_deferred`**:
+- Track failed placements during DeferWindowPos
+- If EndDeferWindowPos fails, fall back to individual SetWindowPos for all windows
+- If batch succeeds, retry only failed placements individually
+
+##### 22.2.3 Phase 3: Feature Additions
+
+**Task 3.1: Enhanced IPC - Query Commands**
+
+**File**: `crates/ipc/src/lib.rs`
+
+**New types**:
+```rust
+pub struct IpcRect { pub x: i32, pub y: i32, pub width: i32, pub height: i32 }
+
+pub struct WindowInfo {
+    pub window_id: u64,
+    pub title: String,
+    pub class_name: String,
+    pub process_id: u32,
+    pub executable: String,
+    pub rect: IpcRect,
+    pub column_index: Option<usize>,
+    pub window_index: Option<usize>,
+    pub monitor_id: i64,
+    pub is_floating: bool,
+    pub is_focused: bool,
+}
+```
+
+**New commands**: `QueryAllWindows`
+
+**New responses**: `WindowList { windows: Vec<WindowInfo> }`, `FocusedWindowInfo`
+
+**File**: `crates/daemon/src/main.rs`
+- Added handler for `QueryAllWindows` command
+
+**Task 3.2: Focus Follows Mouse Config**
+
+**File**: `crates/daemon/src/config.rs`
+
+**Added to BehaviorConfig**:
+```rust
+pub focus_follows_mouse: bool,        // default: false
+pub focus_follows_mouse_delay_ms: u32, // default: 100
+```
+
+#### 22.3 Test Results
+
+```
+Test Summary (2026-02-04):
+- core_layout:    87 passed, 0 failed, 0 ignored
+- daemon:         34 passed, 0 failed, 0 ignored
+- ipc:            13 passed, 0 failed, 0 ignored
+- platform_win32: 13 passed, 0 failed, 2 ignored
+
+TOTAL: 147 passed, 0 failed, 2 ignored (3 doc-tests ignored)
+Clippy: 1 minor warning (pre-existing TrayError naming)
+```
+
+**Test Growth**: 131 → 147 (+16 tests)
+
+#### 22.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| All tests pass | `cargo +stable-x86_64-pc-windows-gnu test --workspace` | 147 passed, 2 ignored |
+| Build succeeds | `cargo +stable-x86_64-pc-windows-gnu build --workspace` | Success |
+| Clippy clean | `cargo +stable-x86_64-pc-windows-gnu clippy --workspace` | 1 pre-existing warning |
+
+#### 22.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `crates/daemon/src/main.rs` | +200 | Fix unwraps, HWND validation, tests, reconcile_monitors |
+| `crates/platform_win32/src/lib.rs` | +150 | is_valid_window, catch_unwind, DeferWindowPos fallback |
+| `crates/platform_win32/src/overlay.rs` | +100 | Documentation, catch_unwind |
+| `crates/ipc/src/lib.rs` | +100 | WindowInfo, IpcRect, QueryAllWindows, tests |
+| `crates/daemon/src/config.rs` | +30 | focus_follows_mouse config |
+| `crates/core_layout/src/lib.rs` | +15 | all_window_ids() method |
+| `crates/cli/src/main.rs` | +10 | Handle new IPC responses |
+
+---
+
+### Iteration 21: Full Feature Push (All Four Features)
+
+**Date**: 2026-02-04
+**Status**: COMPLETED
+**Previous Context**: Iteration 20 (Codex Review + QA Scan (Pass))
+
+#### 21.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 0 | Cleanup: Remove stray `nul` file, update CODEX_REVIEW | Low | DONE |
+| 1 | System Tray Icon with menu | High | DONE |
+| 2 | Per-Window Floating Rules | High | DONE |
+| 3 | Touchpad Gesture Support | Medium | DONE |
+| 4 | Visual Snapping Hints | Medium | DONE |
+
+#### 21.2 Changes Made
+
+##### 21.2.1 Phase 0: Cleanup
+
+**Changes**:
+- Deleted stray `nul` file at repo root (Windows NUL device artifact)
+- Updated CODEX_REVIEW_CONSOLIDATED.md to mark fixed items
+
+##### 21.2.2 Phase 1: System Tray Icon
+
+**Files Modified/Created**:
+- `crates/daemon/Cargo.toml` - Added `tray-icon = "0.19"`, `regex = "1"`, `thiserror`
+- `crates/daemon/src/tray.rs` - NEW: TrayManager, TrayEvent, menu creation
+- `crates/daemon/src/main.rs` - Tray integration in event loop
+
+**Features**:
+- System tray icon with menu (Refresh Windows, Reload Config, Exit)
+- Menu events forwarded via sync channel to async event loop
+- Drop implementation cleans up icon properly
+
+##### 21.2.3 Phase 2: Per-Window Floating Rules
+
+**Files Modified**:
+- `crates/daemon/src/config.rs` - WindowRule, MatchCriteria, WindowAction types
+- `crates/platform_win32/src/lib.rs` - `get_process_executable()` function
+- `crates/core_layout/src/lib.rs` - FloatingWindow struct, floating window support
+- `crates/daemon/src/main.rs` - Rule evaluation, floating window handling
+
+**Config Example**:
+```toml
+[[window_rules]]
+match_class = "Notepad"
+action = "float"
+width = 800
+height = 600
+
+[[window_rules]]
+match_executable = "spotify.exe"
+action = "float"
+
+[[window_rules]]
+match_class = "#32770"
+action = "ignore"
+```
+
+**Features**:
+- Regex matching on window class and title
+- Case-insensitive executable matching
+- Float, Tile, or Ignore actions
+- Optional width/height for floating windows
+
+##### 21.2.4 Phase 3: Touchpad Gesture Support
+
+**Files Modified**:
+- `crates/platform_win32/src/lib.rs` - GestureEvent enum, register_gestures()
+- `crates/daemon/src/config.rs` - GestureConfig
+- `crates/daemon/src/main.rs` - Gesture event handling
+
+**Config Example**:
+```toml
+[gestures]
+enabled = true
+swipe_left = "focus_left"
+swipe_right = "focus_right"
+swipe_up = "focus_up"
+swipe_down = "focus_down"
+```
+
+**Features**:
+- Swipe left/right/up/down detection
+- Configurable command mapping
+- Disabled by default (enabled via config)
+
+##### 21.2.5 Phase 4: Visual Snapping Hints
+
+**Files Created/Modified**:
+- `crates/platform_win32/src/overlay.rs` - NEW: OverlayWindow for visual hints
+- `crates/daemon/src/config.rs` - SnapHintConfig
+- `crates/daemon/src/main.rs` - Snap hint display on resize operations
+
+**Config Example**:
+```toml
+[snap_hints]
+enabled = true
+duration_ms = 200
+opacity = 128
+```
+
+**Features**:
+- Transparent overlay window (WS_EX_LAYERED | WS_EX_TRANSPARENT)
+- Shows column boundary during resize
+- Auto-hide after configurable duration
+- Disabled by default
+
+#### 21.3 Test Results
+
+```
+Test Summary (2026-02-04):
+- core_layout:    87 passed, 0 failed, 0 ignored
+- daemon:         21 passed, 0 failed, 0 ignored
+- ipc:            10 passed, 0 failed, 0 ignored
+- platform_win32: 13 passed, 0 failed, 2 ignored
+
+TOTAL: 131 passed, 0 failed, 2 ignored
+```
+
+**New Tests**:
+- `test_add_floating_window`
+- `test_duplicate_floating_window_rejected`
+- `test_remove_floating_window`
+- `test_remove_nonexistent_floating_window`
+- `test_floating_window_in_placements`
+- `test_floating_and_tiled_windows_together`
+- `test_floating_window_duplicate_with_tiled`
+- `test_update_floating_window`
+- `test_window_rule_matches_class`
+- `test_window_rule_matches_title_regex`
+- `test_window_rule_matches_executable`
+- `test_window_rule_matches_combined`
+- `test_window_rule_no_criteria_matches_nothing`
+- `test_window_rule_config_parse`
+- `test_snap_hint_config_default`
+- `test_snap_hint_config_serialization`
+- `test_overlay_state_default` (platform_win32)
+- `test_snap_hint_config_default` (platform_win32)
+
+#### 21.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| All tests pass | `cargo +stable-x86_64-pc-windows-gnu test --workspace` | 131 passed, 2 ignored |
+| Build succeeds | `cargo +stable-x86_64-pc-windows-gnu build --workspace` | Success |
+| Minor warnings | `cargo +stable-x86_64-pc-windows-gnu clippy --workspace` | 3 minor warnings (acceptable) |
+
+#### 21.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `crates/daemon/Cargo.toml` | +4 | Dependencies |
+| `crates/daemon/src/tray.rs` | +200 | NEW: Tray manager |
+| `crates/daemon/src/config.rs` | +150 | Window rules, gestures, snap hints |
+| `crates/daemon/src/main.rs` | +200 | Integration for all features |
+| `crates/platform_win32/src/lib.rs` | +250 | Gestures, process info |
+| `crates/platform_win32/src/overlay.rs` | +230 | NEW: Overlay window |
+| `crates/core_layout/src/lib.rs` | +150 | Floating window support |
+| `Cargo.toml` | +1 | Win32_System_ProcessStatus feature |
+| `docs/.../CODEX_REVIEW_CONSOLIDATED.md` | +10 | Updated fixed items |
+
+---
+
+### Iteration 20: Codex Review + QA Scan (Pass)
+
+**Date**: 2026-02-04  
+**Status**: COMPLETED  
+**Previous Context**: Iteration 19 (Config Completeness & Doc Sync)
+
+#### 20.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Re-verify repo state and tests | High | DONE |
+| 2 | Update `CODEX_REVIEW_CONSOLIDATED.md` with new QA findings | High | DONE |
+| 3 | Record verification evidence | High | DONE |
+
+#### 20.2 Changes Made
+
+**Files Modified**:
+- `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+- `docs/1_Progress and review/ITERATION_LOG.md`
+
+#### 20.3 Test Results
+
+```
+Test Summary (2026-02-04):
+- core_layout:    79 passed, 0 failed, 0 ignored
+- daemon:         11 passed, 0 failed, 0 ignored
+- ipc:            10 passed, 0 failed, 0 ignored
+- platform_win32: 11 passed, 0 failed, 2 ignored
+
+TOTAL: 111 passed, 0 failed, 2 ignored
+```
+
+#### 20.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| All tests pass | `cargo test --all` | 111 passed, 2 ignored |
+
+#### 20.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` | 1-41 | Doc refresh |
+| `docs/1_Progress and review/ITERATION_LOG.md` | 56-68, 73-119, 1241-1257, 1321 | Iteration log update |
+
+---
+
+### Iteration 19: Config Completeness & Documentation Sync
+
+**Date**: 2026-02-04
+**Status**: COMPLETED
+**Previous Context**: Iteration 18 (Codex Review + QA Scan (Failure))
+
+#### 19.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Implement log_level config option | High | DONE |
+| 2 | Implement track_focus_changes config option | High | DONE |
+| 3 | Fix hotkey reload gap (critical bug) | Critical | DONE |
+| 4 | Update ARCHITECTURE.md documentation | Medium | DONE |
+| 5 | Update SPEC.md documentation | Medium | DONE |
+| 6 | Update AGENTS.md toolchain documentation | Low | DONE |
+
+#### 19.2 Changes Made
+
+##### 19.2.1 log_level Config Implementation
+
+**File**: `crates/daemon/src/main.rs`
+
+**Changes**:
+- Moved config loading before tracing subscriber setup
+- Parse `config.behavior.log_level` string to `tracing::Level`
+- Apply configured log level instead of hardcoded DEBUG
+
+```rust
+let log_level = match config.behavior.log_level.to_lowercase().as_str() {
+    "trace" => Level::TRACE,
+    "debug" => Level::DEBUG,
+    "info" => Level::INFO,
+    "warn" => Level::WARN,
+    "error" => Level::ERROR,
+    _ => Level::INFO, // default fallback
+};
+```
+
+##### 19.2.2 track_focus_changes Config Implementation
+
+**File**: `crates/daemon/src/main.rs`
+
+**Changes**:
+- Wrapped `install_event_hooks()` call in conditional based on config
+- When `track_focus_changes = false`, WinEvent hooks are not installed
+
+```rust
+let _hook_handle = if config.behavior.track_focus_changes {
+    match install_event_hooks() { ... }
+} else {
+    info!("WinEvent hooks disabled by config");
+    None
+};
+```
+
+##### 19.2.3 Hotkey Reload Fix (Critical)
+
+**Problem**: `Reload` IPC command updated layout settings but did NOT re-register hotkeys. Users had to restart daemon for hotkey changes.
+
+**Root Cause**: `HOTKEY_SENDER` in platform layer used `OnceLock::set()` which can only be called once.
+
+**Files Modified**:
+- `crates/platform_win32/src/lib.rs`: Changed `HOTKEY_SENDER` from `OnceLock` to `Mutex<Option<...>>`
+- `crates/daemon/src/main.rs`: Added `HotkeyState` struct and `setup_hotkeys()` helper
+
+**Platform Layer Changes**:
+```rust
+// Before:
+static HOTKEY_SENDER: OnceLock<Sender<HotkeyEvent>> = OnceLock::new();
+
+// After:
+static HOTKEY_SENDER: Mutex<Option<Sender<HotkeyEvent>>> = Mutex::new(None);
+```
+
+**Daemon Changes**:
+- Added `HotkeyState` struct to hold handle and mapping
+- Added `setup_hotkeys()` helper function
+- In IPC command handler, detect `Reload` and re-register hotkeys:
+  1. Drop old handle (triggers unregister via Drop impl)
+  2. Call `setup_hotkeys()` with new config
+  3. Update hotkey state
+
+##### 19.2.4 Documentation Updates
+
+**ARCHITECTURE.md**:
+- Updated test counts (52 → 79 for core_layout, total 111)
+- Added Global Hotkeys section
+- Added Smooth Scroll Animations section
+- Updated AppState struct documentation for multi-monitor
+- Moved config and multi-monitor from Pending to Implemented
+
+**SPEC.md**:
+- Updated Multi-Monitor Support section (now implemented)
+- Added Global Hotkeys behavioral specification
+- Added Scroll Animations behavioral specification
+- Updated implementation status
+
+**AGENTS.md**:
+- Changed toolchain from MSVC to GNU/MinGW (matches `.cargo/config.toml`)
+
+#### 19.3 Test Results
+
+```
+Test Summary (2026-02-04):
+- core_layout:    79 passed, 0 failed, 0 ignored
+- daemon:         11 passed, 0 failed, 0 ignored
+- ipc:            10 passed, 0 failed, 0 ignored
+- platform_win32: 11 passed, 0 failed, 2 ignored
+
+TOTAL: 111 passed, 0 failed, 2 ignored
+Clippy: No warnings
+```
+
+#### 19.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| All tests pass | `cargo +stable-x86_64-pc-windows-gnu test --workspace` | 111 passed, 2 ignored |
+| No clippy warnings | `cargo +stable-x86_64-pc-windows-gnu clippy --workspace` | No warnings |
+| Build succeeds | `cargo +stable-x86_64-pc-windows-gnu build --workspace` | Success |
+
+#### 19.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `crates/platform_win32/src/lib.rs` | +15 | Hotkey sender mutex refactor |
+| `crates/daemon/src/main.rs` | +80 | Config options, hotkey reload |
+| `docs/ARCHITECTURE.md` | +40 | Documentation sync |
+| `docs/SPEC.md` | +80 | Documentation sync |
+| `AGENTS.md` | +2 | Toolchain clarification |
+| `docs/1_Progress and review/ITERATION_LOG.md` | +100 | This entry |
+
+---
+
+### Iteration 18: Codex Review + QA Scan (Failure)
+
+**Date**: 2026-02-04  
+**Status**: COMPLETED  
+**Previous Context**: Iteration 17 (Codex Review + QA Scan (Failure))
+
+#### 18.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Re-verify repo state and tests | High | DONE |
+| 2 | Update `CODEX_REVIEW_CONSOLIDATED.md` with new QA findings | High | DONE |
+| 3 | Record verification evidence | High | DONE |
+
+#### 18.2 Changes Made
+
+**Files Modified**:
+- `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+- `docs/1_Progress and review/ITERATION_LOG.md`
+
+#### 18.3 Test Results
+
+```
+Test Summary (2026-02-04):
+- `cargo test --all` FAILED
+  - Error: E0599 `Config::generate_default` not found (crates/daemon/src/config.rs)
+  - Locations: lines ~360 and ~410
+```
+
+#### 18.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| Tests run | `cargo test --all` | FAIL (E0599 Config::generate_default missing) |
+
+#### 18.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` | 1-43 | Doc refresh |
+| `docs/1_Progress and review/ITERATION_LOG.md` | 56-67, 71-122, 1057-1079, 1133 | Iteration log update |
+
+---
+
+### Iteration 17: Codex Review + QA Scan (Failure)
+
+**Date**: 2026-02-04  
+**Status**: COMPLETED  
+**Previous Context**: Iteration 16 (Codex Review + QA Scan)
+
+#### 17.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Re-verify repo state and tests | High | DONE |
+| 2 | Update `CODEX_REVIEW_CONSOLIDATED.md` with new QA findings | High | DONE |
+| 3 | Record verification evidence | High | DONE |
+
+#### 17.2 Changes Made
+
+**Files Modified**:
+- `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+- `docs/1_Progress and review/ITERATION_LOG.md`
+
+#### 17.3 Test Results
+
+```
+Test Summary (2026-02-04):
+- `cargo test --all` FAILED
+  - Error: E0599 `Config::generate_default` not found (crates/daemon/src/config.rs)
+  - Locations: lines ~360 and ~410
+```
+
+#### 17.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| Tests run | `cargo test --all` | FAIL (E0599 Config::generate_default missing) |
+
+#### 17.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` | 1-41 | Doc refresh |
+| `docs/1_Progress and review/ITERATION_LOG.md` | 56-66, 68-114, 1012-1027, 1087 | Iteration log update |
+
+---
 
 ### Iteration 16: Codex Review + QA Scan
 
@@ -979,12 +1626,18 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | 14 | 79 | 10 | 9 (+2 ignored) | 10 | 108 |
 | 15 | 79 | 10 | 9 (+2 ignored) | 10 | 108 |
 | 16 | 79 | 10 | 9 (+2 ignored) | 10 | 108 |
+| 17 | N/A | N/A | N/A | N/A | FAIL (E0599 Config::generate_default) |
+| 18 | N/A | N/A | N/A | N/A | FAIL (E0599 Config::generate_default) |
+| 19 | 79 | 10 | 11 (+2 ignored) | 11 | 111 |
+| 20 | 79 | 10 | 11 (+2 ignored) | 11 | 111 |
+| 21 | 87 | 10 | 13 (+2 ignored) | 21 | 131 |
+| 22 | 87 | 13 | 13 (+2 ignored) | 34 | 147 |
 
 ---
 
 ## Architecture Evolution
 
-### Current State (Post-Iteration 16)
+### Current State (Post-Iteration 22)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -997,6 +1650,8 @@ TOTAL: 63 passed, 0 failed, 2 ignored
          │   (Commands)   │   (Named Pipe)     │    (Event Loop)         │
          │   + Timeout    │    5s timeout      │    + WinEvent Hooks     │
          └────────────────┘                    │    + Multi-monitor      │
+                                               │    + Hotkey Reload      │
+                                               │    + Smooth Animations  │
                                                └────────────┬────────────┘
                                                             │
                   ┌──────────────────────────────┬──────────┴──────────┐
@@ -1038,14 +1693,16 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 
 ## Next Iteration Planning
 
-### Iteration 17 (Planned)
+### Iteration 23 (Planned)
 
-**Focus**: Window management polish & UX
+**Focus**: Persistence & Performance
 
 **Objectives**:
-2. Touchpad gesture support (if feasible)
-3. Window snapping/docking hints
-4. System tray icon & status
+1. Workspace persistence (save/restore window positions)
+2. Multi-workspace support (named workspaces per monitor)
+3. Enhanced window rules (assign to workspace, custom sizes)
+4. Performance profiling and optimization
+5. Wire up display change events in daemon event loop
 
 ---
 

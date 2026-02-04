@@ -252,6 +252,42 @@ fn print_response(response: &IpcResponse) {
             println!("  Column index: {}", column_index);
             println!("  Window index: {}", window_index);
         }
+        IpcResponse::WindowList { windows } => {
+            println!("Managed Windows ({} total):", windows.len());
+            for win in windows {
+                let location = if win.is_floating {
+                    "floating".to_string()
+                } else {
+                    format!("col {} win {}", win.column_index.unwrap_or(0), win.window_index.unwrap_or(0))
+                };
+                let focus_marker = if win.is_focused { " [FOCUSED]" } else { "" };
+                println!("  {} - {} ({}) [{}]{}", win.window_id, win.title, win.executable, location, focus_marker);
+            }
+        }
+        IpcResponse::FocusedWindowInfo { window } => {
+            match window {
+                Some(win) => {
+                    println!("Focused Window Info:");
+                    println!("  Window ID: {}", win.window_id);
+                    println!("  Title: {}", win.title);
+                    println!("  Class: {}", win.class_name);
+                    println!("  Executable: {}", win.executable);
+                    println!("  Position: ({}, {})", win.rect.x, win.rect.y);
+                    println!("  Size: {}x{}", win.rect.width, win.rect.height);
+                    println!("  Monitor: {}", win.monitor_id);
+                    if win.is_floating {
+                        println!("  Layout: floating");
+                    } else {
+                        println!("  Layout: tiled (col {}, win {})",
+                            win.column_index.unwrap_or(0),
+                            win.window_index.unwrap_or(0));
+                    }
+                }
+                None => {
+                    println!("No window is currently focused");
+                }
+            }
+        }
     }
 }
 

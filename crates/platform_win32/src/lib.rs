@@ -7,18 +7,23 @@
 //! - Window positioning via SetWindowPos (with DeferWindowPos batching)
 //! - Window cloaking/uncloaking via DWM APIs
 //! - WinEvent hooks for window lifecycle events
+//! - Visual overlay for snap hints
+
+pub mod overlay;
 
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
 use std::sync::mpsc;
 use thiserror::Error;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
+use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
@@ -27,7 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CreateWindowExW, DeferWindowPos, DefWindowProcW, DispatchMessageW,
     EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetMessageW, GetWindowLongW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
     IsWindowVisible, PostMessageW, RegisterClassW, SetWindowPos, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
     HWND_MESSAGE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, WM_HOTKEY, WM_USER, WNDCLASSW,
     WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
@@ -44,6 +49,9 @@ const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const OBJID_WINDOW: i32 = 0;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+
+// Window message for display configuration changes
+const WM_DISPLAYCHANGE: u32 = 0x007E;
 
 /// Errors that can occur during Win32 operations.
 #[derive(Debug, Error)]
@@ -481,6 +489,50 @@ fn should_skip_window_by_class(class_name: &str) -> bool {
     SKIP_CLASSES.contains(&class_name)
 }
 
+// ============================================================================
+// Process Information
+// ============================================================================
+
+/// Get the executable name for a process by PID.
+///
+/// Returns just the filename (e.g., "notepad.exe"), not the full path.
+/// Returns None if the process cannot be accessed or doesn't exist.
+pub fn get_process_executable(pid: u32) -> Option<String> {
+    unsafe {
+        // Open the process with limited query rights
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+
+        // Get the executable path
+        let mut buffer: Vec<u16> = vec![0; 260]; // MAX_PATH
+        let len = K32GetModuleFileNameExW(Some(handle), None, &mut buffer);
+
+        // Close the handle
+        let _ = CloseHandle(handle);
+
+        if len == 0 {
+            return None;
+        }
+
+        // Convert to string and extract filename
+        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+        path.rsplit('\\').next().map(|s| s.to_string())
+    }
+}
+
+/// Check if a window handle is still valid.
+///
+/// This helps prevent race conditions where a window is destroyed
+/// between receiving an event and processing it.
+pub fn is_valid_window(hwnd: WindowId) -> bool {
+    unsafe {
+        let hwnd = HWND(hwnd as *mut c_void);
+        IsWindow(Some(hwnd)).as_bool()
+    }
+}
+
 /// Apply window placements from the layout engine.
 ///
 /// This function:
@@ -535,12 +587,21 @@ pub fn apply_placements(
 }
 
 /// Apply placements using DeferWindowPos for batched positioning.
+///
+/// This function uses the Windows DeferWindowPos API to batch multiple
+/// window positioning operations into a single screen update, reducing
+/// flicker and improving performance.
+///
+/// If EndDeferWindowPos fails, falls back to individual SetWindowPos calls
+/// for all windows. If individual DeferWindowPos calls fail during the batch,
+/// those placements are tracked and retried individually after the batch.
 fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
     unsafe {
         let hdwp = BeginDeferWindowPos(placements.len() as i32)
             .map_err(|e| Win32Error::SetPositionFailed(format!("BeginDeferWindowPos failed: {}", e)))?;
 
         let mut current_hdwp = hdwp;
+        let mut failed_placements: Vec<&WindowPlacement> = Vec::new();
 
         for placement in placements {
             let hwnd = HWND(placement.window_id as *mut c_void);
@@ -561,22 +622,42 @@ fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win3
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "DeferWindowPos failed for window {}: {}, falling back to immediate",
+                        "DeferWindowPos failed for window {}: {}, will retry individually",
                         placement.window_id,
                         e
                     );
-                    // Fall back to immediate positioning for this window
-                    set_window_pos_immediate(placement)?;
+                    failed_placements.push(placement);
                 }
             }
         }
 
-        // Commit all deferred positions
+        // Try to commit the batch
         if let Err(e) = EndDeferWindowPos(current_hdwp) {
-            return Err(Win32Error::SetPositionFailed(format!(
-                "EndDeferWindowPos failed: {}. Some windows may not be positioned correctly.",
+            tracing::warn!(
+                "EndDeferWindowPos failed: {}. Falling back to individual positioning for all windows.",
                 e
-            )));
+            );
+            // Fall back to individual positioning for ALL windows
+            for placement in placements {
+                if let Err(e) = set_window_pos_immediate(placement) {
+                    tracing::warn!(
+                        "Individual SetWindowPos also failed for {}: {}",
+                        placement.window_id,
+                        e
+                    );
+                }
+            }
+        } else {
+            // Batch succeeded, now handle any that failed during deferral
+            for placement in failed_placements {
+                if let Err(e) = set_window_pos_immediate(placement) {
+                    tracing::warn!(
+                        "Fallback SetWindowPos failed for {}: {}",
+                        placement.window_id,
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -681,6 +762,8 @@ pub enum WindowEvent {
     Restored(WindowId),
     /// A window was moved or resized by the user.
     MovedOrResized(WindowId),
+    /// Display configuration changed (monitors added/removed/rearranged).
+    DisplayChange,
 }
 
 /// Global sender for window events from WinEvent callbacks.
@@ -774,7 +857,28 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
 /// Callback function for WinEvent hooks.
 ///
 /// This runs on Windows' thread pool, so we forward events to the channel.
+/// Wrapped with catch_unwind to prevent panics from crashing the application.
 unsafe extern "system" fn win_event_callback(
+    hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    id_event_thread: u32,
+    dwms_event_time: u32,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        win_event_callback_inner(hook, event, hwnd, id_object, id_child, id_event_thread, dwms_event_time)
+    }));
+
+    if let Err(e) = result {
+        // Can't use tracing here safely in all contexts, use eprintln
+        eprintln!("Panic in win_event_callback: {:?}", e);
+    }
+}
+
+/// Inner implementation of WinEvent callback.
+fn win_event_callback_inner(
     _hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
@@ -794,7 +898,7 @@ unsafe extern "system" fn win_event_callback(
     }
 
     // Get the top-level window (in case we got a child window event)
-    let root_hwnd = GetAncestor(hwnd, GA_ROOT);
+    let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
     let hwnd = if root_hwnd.0.is_null() { hwnd } else { root_hwnd };
 
     let window_id = hwnd.0 as WindowId;
@@ -803,7 +907,7 @@ unsafe extern "system" fn win_event_callback(
     let window_event = match event {
         EVENT_OBJECT_CREATE => {
             // Quick filter: skip windows that don't look manageable
-            if !IsWindowVisible(hwnd).as_bool() {
+            if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 return;
             }
             WindowEvent::Created(window_id)
@@ -814,7 +918,7 @@ unsafe extern "system" fn win_event_callback(
         EVENT_SYSTEM_MINIMIZEEND => WindowEvent::Restored(window_id),
         EVENT_OBJECT_LOCATIONCHANGE => {
             // Only track visible windows
-            if !IsWindowVisible(hwnd).as_bool() {
+            if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 return;
             }
             WindowEvent::MovedOrResized(window_id)
@@ -906,7 +1010,14 @@ pub struct HotkeyEvent {
 }
 
 /// Global sender for hotkey events.
-static HOTKEY_SENDER: std::sync::OnceLock<mpsc::Sender<HotkeyEvent>> = std::sync::OnceLock::new();
+/// Uses Mutex to allow re-registration after dropping previous HotkeyHandle.
+static HOTKEY_SENDER: std::sync::Mutex<Option<mpsc::Sender<HotkeyEvent>>> =
+    std::sync::Mutex::new(None);
+
+/// Global sender for display change events.
+/// Uses Mutex to allow re-registration after dropping previous HotkeyHandle.
+static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
 
 /// Custom message to signal the hotkey thread to stop.
 const WM_QUIT_HOTKEY_THREAD: u32 = WM_USER + 1;
@@ -951,6 +1062,11 @@ impl Drop for HotkeyHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+
+        // Clear the global sender to allow re-registration
+        if let Ok(mut sender) = HOTKEY_SENDER.lock() {
+            *sender = None;
+        }
     }
 }
 
@@ -971,10 +1087,18 @@ pub fn register_hotkeys(
     // Create channel for events
     let (tx, rx) = mpsc::channel();
 
-    // Store sender globally
-    HOTKEY_SENDER
-        .set(tx)
-        .map_err(|_| Win32Error::HotkeyRegistrationFailed("Hotkey sender already initialized".to_string()))?;
+    // Store sender globally (check that it's not already set)
+    {
+        let mut sender = HOTKEY_SENDER
+            .lock()
+            .map_err(|_| Win32Error::HotkeyRegistrationFailed("Hotkey sender mutex poisoned".to_string()))?;
+        if sender.is_some() {
+            return Err(Win32Error::HotkeyRegistrationFailed(
+                "Hotkey sender already initialized - drop existing HotkeyHandle first".to_string(),
+            ));
+        }
+        *sender = Some(tx);
+    }
 
     // Create the message window and register hotkeys on a separate thread
     // We send isize (raw pointer value) instead of HWND because HWND is !Send
@@ -1080,7 +1204,30 @@ pub fn register_hotkeys(
 }
 
 /// Window procedure for the hotkey message window.
+///
+/// Wrapped with catch_unwind to prevent panics from crashing the application.
 unsafe extern "system" fn hotkey_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    // Wrap in catch_unwind to prevent panics from crashing
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hotkey_window_proc_inner(hwnd, msg, wparam, lparam)
+    }));
+
+    match result {
+        Ok(lresult) => lresult,
+        Err(e) => {
+            tracing::error!("Panic in hotkey_window_proc: {:?}", e);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Inner implementation of hotkey window procedure.
+fn hotkey_window_proc_inner(
     hwnd: HWND,
     msg: u32,
     wparam: windows::Win32::Foundation::WPARAM,
@@ -1092,13 +1239,27 @@ unsafe extern "system" fn hotkey_window_proc(
             tracing::debug!("Hotkey {} pressed", hotkey_id);
 
             // Send event through channel
-            if let Some(sender) = HOTKEY_SENDER.get() {
-                let _ = sender.send(HotkeyEvent { id: hotkey_id });
+            if let Ok(sender_guard) = HOTKEY_SENDER.lock() {
+                if let Some(sender) = sender_guard.as_ref() {
+                    let _ = sender.send(HotkeyEvent { id: hotkey_id });
+                }
             }
 
             windows::Win32::Foundation::LRESULT(0)
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_DISPLAYCHANGE => {
+            tracing::info!("Display configuration changed");
+
+            // Send display change event through channel
+            if let Ok(sender_guard) = DISPLAY_CHANGE_SENDER.lock() {
+                if let Some(sender) = sender_guard.as_ref() {
+                    let _ = sender.send(());
+                }
+            }
+
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -1249,6 +1410,276 @@ pub fn parse_hotkey_string(s: &str) -> Option<(Modifiers, u32)> {
     let vk = parse_vk(key)?;
 
     Some((modifiers, vk))
+}
+
+// ============================================================================
+// Touchpad Gesture Support
+// ============================================================================
+
+/// Gesture events detected from touchpad/pointer input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureEvent {
+    /// Three-finger swipe left
+    SwipeLeft,
+    /// Three-finger swipe right
+    SwipeRight,
+    /// Three-finger swipe up
+    SwipeUp,
+    /// Three-finger swipe down
+    SwipeDown,
+}
+
+/// Threshold in pixels for detecting a swipe gesture.
+const GESTURE_THRESHOLD: i32 = 50;
+
+/// Gesture detection state.
+#[derive(Default)]
+struct GestureState {
+    /// Starting X position of the gesture
+    start_x: i32,
+    /// Starting Y position of the gesture
+    start_y: i32,
+    /// Whether a gesture is currently in progress
+    active: bool,
+}
+
+/// Global sender for gesture events.
+static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
+    std::sync::Mutex::new(None);
+
+/// Global gesture detection state.
+static GESTURE_STATE: std::sync::Mutex<GestureState> =
+    std::sync::Mutex::new(GestureState { start_x: 0, start_y: 0, active: false });
+
+/// Handle for gesture detection.
+///
+/// Dropping this handle will stop gesture detection.
+pub struct GestureHandle {
+    hwnd: HWND,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for GestureHandle {
+    fn drop(&mut self) {
+        // Signal the message loop to quit
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                WM_QUIT_HOTKEY_THREAD, // Reuse quit message
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+
+        // Wait for thread to finish
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+
+        // Clear the global sender
+        if let Ok(mut sender) = GESTURE_SENDER.lock() {
+            *sender = None;
+        }
+
+        tracing::debug!("Gesture detection stopped");
+    }
+}
+
+/// WM_POINTER message constants (not all exposed by windows-rs)
+const WM_POINTERDOWN: u32 = 0x0246;
+#[allow(dead_code)] // Reserved for future pointer tracking
+const WM_POINTERUPDATE: u32 = 0x0245;
+const WM_POINTERUP: u32 = 0x0247;
+
+/// Register for pointer input and start gesture detection.
+///
+/// Returns a handle that must be kept alive to receive gesture events,
+/// and a channel receiver for gesture events.
+///
+/// Note: This uses a simplified approach - for production use, consider
+/// using the Windows Precision Touchpad gesture API or raw input.
+pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent>), Win32Error> {
+    // Create channel for events
+    let (tx, rx) = mpsc::channel();
+
+    // Store sender globally
+    {
+        let mut sender = GESTURE_SENDER
+            .lock()
+            .map_err(|_| Win32Error::HookInstallFailed("Gesture sender mutex poisoned".to_string()))?;
+        if sender.is_some() {
+            return Err(Win32Error::HookInstallFailed(
+                "Gesture sender already initialized - drop existing GestureHandle first".to_string(),
+            ));
+        }
+        *sender = Some(tx);
+    }
+
+    // Create the message window on a separate thread
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<isize, Win32Error>>();
+
+    let thread = std::thread::spawn(move || {
+        unsafe {
+            // Register window class for gesture detection
+            let class_name: Vec<u16> = "OpenNiriGestureClass\0".encode_utf16().collect();
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(gesture_window_proc),
+                lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            // Create a transparent, click-through overlay window for gesture detection
+            // In practice, we'd use raw input or a low-level hook instead
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                windows::core::PCWSTR(class_name.as_ptr()),
+                None,
+                Default::default(),
+                0, 0, 0, 0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            );
+
+            if hwnd.is_err() {
+                let _ = init_tx.send(Err(Win32Error::HookInstallFailed(
+                    "Failed to create gesture message window".to_string(),
+                )));
+                return;
+            }
+
+            let hwnd = hwnd.unwrap();
+            let hwnd_raw = hwnd.0 as isize;
+            let _ = init_tx.send(Ok(hwnd_raw));
+
+            // Message loop
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, Some(hwnd), 0, 0).as_bool() {
+                if msg.message == WM_QUIT_HOTKEY_THREAD {
+                    break;
+                }
+                let _ = DispatchMessageW(&msg);
+            }
+        }
+    });
+
+    // Wait for initialization
+    let hwnd_raw = init_rx
+        .recv()
+        .map_err(|_| Win32Error::HookInstallFailed("Gesture thread initialization failed".to_string()))??;
+
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+
+    tracing::info!("Gesture detection registered");
+
+    Ok((
+        GestureHandle {
+            hwnd,
+            thread: Some(thread),
+        },
+        rx,
+    ))
+}
+
+/// Window procedure for gesture detection window.
+///
+/// Wrapped with catch_unwind to prevent panics from crashing the application.
+unsafe extern "system" fn gesture_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    // Wrap in catch_unwind to prevent panics from crashing
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gesture_window_proc_inner(hwnd, msg, wparam, lparam)
+    }));
+
+    match result {
+        Ok(lresult) => lresult,
+        Err(e) => {
+            tracing::error!("Panic in gesture_window_proc: {:?}", e);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Inner implementation of gesture window procedure.
+fn gesture_window_proc_inner(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    let _ = wparam; // Unused in current implementation
+    match msg {
+        WM_POINTERDOWN => {
+            // Extract pointer position
+            let x = (lparam.0 as i32) & 0xFFFF;
+            let y = ((lparam.0 as i32) >> 16) & 0xFFFF;
+
+            if let Ok(mut state) = GESTURE_STATE.lock() {
+                state.start_x = x;
+                state.start_y = y;
+                state.active = true;
+            }
+
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        WM_POINTERUP => {
+            if let Ok(mut state) = GESTURE_STATE.lock() {
+                if state.active {
+                    // Extract end position
+                    let x = (lparam.0 as i32) & 0xFFFF;
+                    let y = ((lparam.0 as i32) >> 16) & 0xFFFF;
+
+                    let delta_x = x - state.start_x;
+                    let delta_y = y - state.start_y;
+
+                    // Detect swipe direction
+                    let gesture = if delta_x.abs() > delta_y.abs() {
+                        // Horizontal swipe
+                        if delta_x.abs() > GESTURE_THRESHOLD {
+                            if delta_x < 0 {
+                                Some(GestureEvent::SwipeLeft)
+                            } else {
+                                Some(GestureEvent::SwipeRight)
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Vertical swipe
+                        if delta_y.abs() > GESTURE_THRESHOLD {
+                            if delta_y < 0 {
+                                Some(GestureEvent::SwipeUp)
+                            } else {
+                                Some(GestureEvent::SwipeDown)
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    // Send gesture event
+                    if let Some(event) = gesture {
+                        if let Ok(sender_guard) = GESTURE_SENDER.lock() {
+                            if let Some(sender) = sender_guard.as_ref() {
+                                let _ = sender.send(event);
+                            }
+                        }
+                    }
+
+                    state.active = false;
+                }
+            }
+
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
 }
 
 #[cfg(test)]

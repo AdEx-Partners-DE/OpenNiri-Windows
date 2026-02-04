@@ -7,6 +7,48 @@ use serde::{Deserialize, Serialize};
 /// Named pipe path for IPC communication.
 pub const PIPE_NAME: &str = r"\\.\pipe\openniri";
 
+/// Rectangle for IPC serialization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl IpcRect {
+    pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+/// Detailed information about a window for IPC queries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    /// The window handle as a unique identifier.
+    pub window_id: u64,
+    /// The window's current title.
+    pub title: String,
+    /// The window's class name.
+    pub class_name: String,
+    /// The process ID that owns this window.
+    pub process_id: u32,
+    /// The executable name (e.g., "notepad.exe").
+    pub executable: String,
+    /// The window's current rectangle (position and size).
+    pub rect: IpcRect,
+    /// The column index if tiled, None if floating.
+    pub column_index: Option<usize>,
+    /// The window index within its column, None if floating.
+    pub window_index: Option<usize>,
+    /// The monitor ID this window is on.
+    pub monitor_id: i64,
+    /// Whether this window is floating (not tiled).
+    pub is_floating: bool,
+    /// Whether this window currently has focus.
+    pub is_focused: bool,
+}
+
 /// Commands that can be sent from the CLI to the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -59,6 +101,9 @@ pub enum IpcCommand {
     Reload,
     /// Stop the daemon.
     Stop,
+
+    /// Query detailed information about all managed windows.
+    QueryAllWindows,
 }
 
 /// Responses from the daemon to the CLI.
@@ -95,6 +140,18 @@ pub enum IpcResponse {
         column_index: usize,
         /// Window index within the column.
         window_index: usize,
+    },
+
+    /// Response containing information about all windows.
+    WindowList {
+        /// List of all managed windows.
+        windows: Vec<WindowInfo>,
+    },
+
+    /// Response containing detailed info about the focused window.
+    FocusedWindowInfo {
+        /// The focused window's info, if any.
+        window: Option<WindowInfo>,
     },
 }
 
@@ -190,6 +247,7 @@ mod tests {
             IpcCommand::Scroll { delta: -75.0 },
             IpcCommand::QueryWorkspace,
             IpcCommand::QueryFocused,
+            IpcCommand::QueryAllWindows,
             IpcCommand::Refresh,
             IpcCommand::Apply,
             IpcCommand::Reload,
@@ -230,6 +288,42 @@ mod tests {
                 column_index: 0,
                 window_index: 0,
             },
+            IpcResponse::WindowList {
+                windows: vec![WindowInfo {
+                    window_id: 1,
+                    title: "Test Window".to_string(),
+                    class_name: "TestClass".to_string(),
+                    process_id: 100,
+                    executable: "test.exe".to_string(),
+                    rect: IpcRect::new(0, 0, 800, 600),
+                    column_index: Some(0),
+                    window_index: Some(0),
+                    monitor_id: 1,
+                    is_floating: false,
+                    is_focused: true,
+                }],
+            },
+            IpcResponse::WindowList {
+                windows: vec![],
+            },
+            IpcResponse::FocusedWindowInfo {
+                window: Some(WindowInfo {
+                    window_id: 42,
+                    title: "Focused".to_string(),
+                    class_name: "FocusedClass".to_string(),
+                    process_id: 200,
+                    executable: "focused.exe".to_string(),
+                    rect: IpcRect::new(100, 100, 1024, 768),
+                    column_index: Some(1),
+                    window_index: Some(0),
+                    monitor_id: 2,
+                    is_floating: false,
+                    is_focused: true,
+                }),
+            },
+            IpcResponse::FocusedWindowInfo {
+                window: None,
+            },
         ];
 
         for resp in responses {
@@ -238,6 +332,62 @@ mod tests {
                 serde_json::from_str(&json).expect("Failed to deserialize response");
             assert_eq!(resp, roundtrip, "Roundtrip failed for {:?}", resp);
         }
+    }
+
+    #[test]
+    fn test_window_info_serialization() {
+        let info = WindowInfo {
+            window_id: 12345,
+            title: "Test Window".to_string(),
+            class_name: "TestClass".to_string(),
+            process_id: 1234,
+            executable: "test.exe".to_string(),
+            rect: IpcRect::new(100, 100, 800, 600),
+            column_index: Some(0),
+            window_index: Some(0),
+            monitor_id: 1,
+            is_floating: false,
+            is_focused: true,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let roundtrip: WindowInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, roundtrip);
+    }
+
+    #[test]
+    fn test_query_all_windows_command() {
+        let cmd = IpcCommand::QueryAllWindows;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("query_all_windows"));
+
+        let roundtrip: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, roundtrip);
+    }
+
+    #[test]
+    fn test_window_list_response() {
+        let resp = IpcResponse::WindowList {
+            windows: vec![WindowInfo {
+                window_id: 1,
+                title: "Window 1".to_string(),
+                class_name: "Class1".to_string(),
+                process_id: 100,
+                executable: "app.exe".to_string(),
+                rect: IpcRect::new(0, 0, 800, 600),
+                column_index: Some(0),
+                window_index: Some(0),
+                monitor_id: 1,
+                is_floating: false,
+                is_focused: true,
+            }],
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("window_list"));
+
+        let roundtrip: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, roundtrip);
     }
 
     #[test]

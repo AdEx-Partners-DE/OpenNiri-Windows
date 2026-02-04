@@ -178,14 +178,20 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 ---
 
 ## Current Status (Reality Check)
-- `openniri-core-layout` is implemented and unit-tested (52 tests).
-- `openniri-platform-win32` has real Win32 implementations:
+- `openniri-core-layout` is implemented and unit-tested (79 tests).
+- `openniri-platform-win32` has real Win32 implementations (11 tests + 2 hardware-dependent):
   - `enumerate_windows()` - Uses EnumWindows with filtering
   - `enumerate_monitors()` / `get_primary_monitor()` - Uses EnumDisplayMonitors
   - `apply_placements()` - Uses DeferWindowPos for batched moves
   - `cloak_window()` / `uncloak_window()` - Uses DwmSetWindowAttribute
-- `openniri-ipc` provides shared IPC types (`IpcCommand`, `IpcResponse`, `PIPE_NAME`).
-- `openniri-daemon` runs an async event loop with a named pipe IPC server.
+  - `install_event_hooks()` - WinEvent hooks for window lifecycle
+  - `register_hotkeys()` - Global hotkey registration with reload support
+- `openniri-ipc` provides shared IPC types (10 tests).
+- `openniri-daemon` runs an async event loop with named pipe IPC server (11 tests):
+  - Configuration loading from TOML files
+  - Global hotkey handling with live reload
+  - Smooth scroll animations (~60 FPS)
+  - Multi-monitor workspace support
 - `openniri-cli` sends IPC commands to the daemon and prints responses.
 
 ---
@@ -206,7 +212,7 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 
 ## Planned vs Implemented (Gap Summary)
 - **Implemented**:
-  - Core layout engine with 52 unit tests
+  - Core layout engine with 79 unit tests
   - IPC protocol crate with 10 unit tests
   - Win32 enumeration with filtering (visible, non-tool, non-cloaked, non-system windows)
   - Monitor enumeration via EnumDisplayMonitors (dynamic viewport detection)
@@ -215,10 +221,14 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - Async daemon with named pipe IPC server
   - CLI sends real IPC commands and receives responses (with timeout)
   - WinEvent hooks for real-time window tracking (create/destroy/focus/minimize/restore)
+  - Configuration file support (TOML format) with live reload
+  - Multi-monitor workspace support (one workspace per monitor)
+  - Global hotkeys with configurable bindings and live reload
+  - Smooth scroll animations (~60 FPS) with easing functions
 - **Pending**:
-  - Configuration file support
-  - Multi-monitor workspace support
-- **Next Steps**: Add configuration file support, implement multi-monitor workspaces.
+  - Touchpad gesture support
+  - Per-window floating/rules
+- **Next Steps**: Add touchpad gesture support, implement per-window rules.
 
 ## Data Flow
 
@@ -294,13 +304,29 @@ Workspace {
 
 ```rust
 AppState {
-    workspace: Workspace,
-    platform_config: PlatformConfig,
-    viewport: Rect,              // Monitor dimensions
-    // Future: multi-monitor support
-    // monitors: HashMap<MonitorId, Workspace>,
+    workspaces: HashMap<MonitorId, Workspace>,  // One workspace per monitor
+    monitors: HashMap<MonitorId, MonitorInfo>,  // Monitor info by ID
+    focused_monitor: MonitorId,                 // Currently focused monitor
+    platform_config: PlatformConfig,            // Window positioning config
+    config: Config,                             // User configuration
 }
 ```
+
+### Global Hotkeys
+
+Hotkeys are registered via Win32 `RegisterHotKey` API:
+- Hotkey presses are received in a dedicated message window thread
+- Events are forwarded to the main event loop via channel
+- Hotkey bindings are configurable in TOML config
+- Live reload: dropping `HotkeyHandle` unregisters all hotkeys, allowing re-registration
+
+### Smooth Scroll Animations
+
+Viewport scrolling uses animated transitions:
+- Animation tick at ~60 FPS (16ms intervals)
+- Configurable easing functions (linear, ease-in, ease-out, ease-in-out)
+- Animation state tracked per-workspace
+- Timer spawned on-demand, stopped when animations complete
 
 ## Threading Model
 

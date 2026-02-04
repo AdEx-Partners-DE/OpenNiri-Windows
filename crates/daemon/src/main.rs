@@ -8,19 +8,22 @@
 //! - Handle IPC commands from the CLI
 //! - Trigger layout recalculations
 //! - Apply window placements
+//! - System tray icon and menu
 
 mod config;
+mod tray;
 
 use anyhow::Result;
 use config::Config;
 use openniri_core_layout::{Rect, Workspace};
 use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
 use openniri_platform_win32::{
-    enumerate_monitors, enumerate_windows, find_monitor_for_rect, install_event_hooks,
-    monitor_to_left, monitor_to_right, parse_hotkey_string, register_hotkeys, Hotkey, HotkeyEvent,
+    enumerate_monitors, enumerate_windows, find_monitor_for_rect, get_process_executable,
+    install_event_hooks, monitor_to_left, monitor_to_right, overlay::OverlayWindow,
+    parse_hotkey_string, register_gestures, register_hotkeys, GestureEvent, Hotkey, HotkeyEvent,
     HotkeyId, MonitorId, MonitorInfo, PlatformConfig, WindowEvent,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
@@ -39,8 +42,14 @@ enum DaemonEvent {
     WindowEvent(WindowEvent),
     /// A global hotkey was pressed.
     Hotkey(HotkeyEvent),
+    /// A touchpad gesture was detected.
+    Gesture(GestureEvent),
+    /// A tray menu event.
+    Tray(tray::TrayEvent),
     /// Animation tick (16ms intervals during animation).
     AnimationTick,
+    /// Hide snap hint overlay after timeout.
+    HideSnapHint,
     /// Shutdown signal.
     Shutdown,
 }
@@ -141,6 +150,69 @@ impl AppState {
         info!("Configuration applied to all {} workspaces", self.workspaces.len());
     }
 
+    /// Reconcile workspaces after monitor configuration change.
+    ///
+    /// This handles:
+    /// - Removing workspaces for disconnected monitors (migrating windows to primary)
+    /// - Adding workspaces for newly connected monitors
+    #[allow(dead_code)] // Infrastructure for display change handling (future use)
+    fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
+        let new_ids: HashSet<MonitorId> =
+            new_monitors.iter().map(|m| m.id).collect();
+        let old_ids: HashSet<MonitorId> =
+            self.monitors.keys().copied().collect();
+
+        // Find primary monitor in new config (or first available)
+        let primary_id = new_monitors
+            .iter()
+            .find(|m| m.is_primary)
+            .or_else(|| new_monitors.first())
+            .map(|m| m.id);
+
+        // Handle removed monitors - migrate windows to primary
+        for removed_id in old_ids.difference(&new_ids) {
+            if let Some(old_workspace) = self.workspaces.remove(removed_id) {
+                let window_ids = old_workspace.all_window_ids();
+                if let Some(primary) = primary_id {
+                    if let Some(primary_ws) = self.workspaces.get_mut(&primary) {
+                        for window_id in &window_ids {
+                            // Try to add as tiled, ignore errors (window might be gone)
+                            let _ = primary_ws.insert_window(*window_id, None);
+                        }
+                        info!(
+                            "Migrated {} windows from removed monitor {} to primary",
+                            window_ids.len(),
+                            removed_id
+                        );
+                    }
+                }
+            }
+            self.monitors.remove(removed_id);
+        }
+
+        // Handle added monitors - create new workspaces
+        for monitor in &new_monitors {
+            if !old_ids.contains(&monitor.id) {
+                let mut workspace = Workspace::with_gaps(
+                    self.config.layout.gap,
+                    self.config.layout.outer_gap,
+                );
+                workspace.set_default_column_width(self.config.layout.default_column_width);
+                workspace.set_centering_mode(self.config.layout.centering_mode.into());
+                self.workspaces.insert(monitor.id, workspace);
+                info!("Created workspace for new monitor {}", monitor.id);
+            }
+        }
+
+        // Update monitor info
+        self.monitors = new_monitors.into_iter().map(|m| (m.id, m)).collect();
+
+        // Update focused monitor if it was removed
+        if !self.monitors.contains_key(&self.focused_monitor) {
+            self.focused_monitor = primary_id.unwrap_or(0);
+        }
+    }
+
     /// Check if any workspace has an active animation.
     fn is_animating(&self) -> bool {
         self.workspaces.values().any(|w| w.is_animating())
@@ -190,35 +262,134 @@ impl AppState {
         let mut added = 0;
 
         for win_info in windows {
+            // Get executable name for rule matching
+            let executable = get_process_executable(win_info.process_id)
+                .unwrap_or_default();
+
+            // Check window rules
+            let action = self.evaluate_window_rules(&win_info.class_name, &win_info.title, &executable);
+
+            // Skip ignored windows
+            if action == config::WindowAction::Ignore {
+                debug!(
+                    "Ignoring window by rule: {} ({})",
+                    win_info.title, win_info.class_name
+                );
+                continue;
+            }
+
             // Find which monitor this window is on
             let monitor_id = find_monitor_for_rect(&monitors, &win_info.rect)
                 .map(|m| m.id)
                 .unwrap_or(self.focused_monitor);
 
-            // Use a reasonable default width or the window's current width, respecting config bounds
-            let width = win_info.rect.width.clamp(
-                self.config.layout.min_column_width,
-                self.config.layout.max_column_width,
-            );
+            // Get floating rect before borrowing workspace mutably (to avoid borrow conflict)
+            let floating_rect = if action == config::WindowAction::Float {
+                Some(self.get_floating_rect_from_rules(
+                    &win_info.class_name,
+                    &win_info.title,
+                    &executable,
+                    &win_info.rect,
+                ))
+            } else {
+                None
+            };
 
             if let Some(workspace) = self.workspaces.get_mut(&monitor_id) {
-                match workspace.insert_window(win_info.hwnd, Some(width)) {
-                    Ok(()) => {
-                        info!(
-                            "Added window: {} ({}) to monitor {} - {}x{}",
-                            win_info.title, win_info.class_name, monitor_id,
-                            win_info.rect.width, win_info.rect.height
+                match action {
+                    config::WindowAction::Float => {
+                        // Use rule dimensions or default to centered 800x600 window
+                        let rule_rect = floating_rect.unwrap_or_else(|| {
+                            let viewport = self.monitors.get(&monitor_id)
+                                .map(|m| m.work_area)
+                                .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT));
+                            Rect::new(
+                                viewport.x + (viewport.width - 800) / 2,
+                                viewport.y + (viewport.height - 600) / 2,
+                                800,
+                                600,
+                            )
+                        });
+
+                        match workspace.add_floating(win_info.hwnd, rule_rect) {
+                            Ok(()) => {
+                                info!(
+                                    "Added floating window: {} ({}) to monitor {} - {}x{}",
+                                    win_info.title, win_info.class_name, monitor_id,
+                                    rule_rect.width, rule_rect.height
+                                );
+                                added += 1;
+                            }
+                            Err(e) => {
+                                warn!("Failed to add floating window {}: {}", win_info.hwnd, e);
+                            }
+                        }
+                    }
+                    config::WindowAction::Tile => {
+                        // Use a reasonable default width or the window's current width, respecting config bounds
+                        let width = win_info.rect.width.clamp(
+                            self.config.layout.min_column_width,
+                            self.config.layout.max_column_width,
                         );
-                        added += 1;
+
+                        match workspace.insert_window(win_info.hwnd, Some(width)) {
+                            Ok(()) => {
+                                info!(
+                                    "Added tiled window: {} ({}) to monitor {} - {}x{}",
+                                    win_info.title, win_info.class_name, monitor_id,
+                                    win_info.rect.width, win_info.rect.height
+                                );
+                                added += 1;
+                            }
+                            Err(e) => {
+                                warn!("Failed to add window {}: {}", win_info.hwnd, e);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!("Failed to add window {}: {}", win_info.hwnd, e);
-                    }
+                    config::WindowAction::Ignore => unreachable!(), // Handled above
                 }
             }
         }
 
         Ok(added)
+    }
+
+    /// Evaluate window rules and return the action for a window.
+    fn evaluate_window_rules(
+        &self,
+        class_name: &str,
+        title: &str,
+        executable: &str,
+    ) -> config::WindowAction {
+        for rule in &self.config.window_rules {
+            if rule.matches(class_name, title, executable) {
+                return rule.action;
+            }
+        }
+        config::WindowAction::Tile // Default
+    }
+
+    /// Get the floating rect for a window based on rules.
+    fn get_floating_rect_from_rules(
+        &self,
+        class_name: &str,
+        title: &str,
+        executable: &str,
+        original_rect: &openniri_core_layout::Rect,
+    ) -> openniri_core_layout::Rect {
+        for rule in &self.config.window_rules {
+            if rule.matches(class_name, title, executable) {
+                let width = rule.width.unwrap_or(original_rect.width);
+                let height = rule.height.unwrap_or(original_rect.height);
+                return openniri_core_layout::Rect::new(
+                    original_rect.x,
+                    original_rect.y,
+                    width,
+                    height,
+                );
+            }
+        }
+        *original_rect
     }
 
     /// Find which workspace contains a window.
@@ -229,6 +400,22 @@ impl AppState {
             }
         }
         None
+    }
+
+    /// Get the rectangle of the focused column for snap hint display.
+    ///
+    /// Returns the absolute screen position of the focused column.
+    fn get_focused_column_rect(&self) -> Option<Rect> {
+        let workspace = self.focused_workspace()?;
+        let monitor = self.monitors.get(&self.focused_monitor)?;
+        let placements = workspace.compute_placements(monitor.work_area);
+
+        // Find the placement for the focused window
+        let focused_hwnd = workspace.focused_window()?;
+        placements
+            .iter()
+            .find(|p| p.window_id == focused_hwnd)
+            .map(|p| p.rect)
     }
 
     /// Process an IPC command and return a response.
@@ -486,11 +673,113 @@ impl AppState {
                 // This is handled specially in the event loop
                 IpcResponse::Ok
             }
+            IpcCommand::QueryAllWindows => {
+                let mut windows = Vec::new();
+
+                // Get focused window for comparison
+                let focused_hwnd = self.focused_workspace()
+                    .and_then(|ws| ws.focused_window());
+
+                // Enumerate all windows to get titles and other info
+                let win_info_map: HashMap<u64, (String, String, u32)> =
+                    match enumerate_windows() {
+                        Ok(wins) => wins.into_iter()
+                            .map(|w| (w.hwnd, (w.title, w.class_name, w.process_id)))
+                            .collect(),
+                        Err(_) => HashMap::new(),
+                    };
+
+                for (monitor_id, workspace) in &self.workspaces {
+                    // Tiled windows
+                    for (col_idx, column) in workspace.columns().iter().enumerate() {
+                        for (win_idx, &window_id) in column.windows().iter().enumerate() {
+                            let (title, class_name, process_id) = win_info_map
+                                .get(&window_id)
+                                .cloned()
+                                .unwrap_or_else(|| ("Unknown".to_string(), "Unknown".to_string(), 0));
+
+                            let executable = get_process_executable(process_id)
+                                .unwrap_or_default();
+
+                            // Get rect from computed placements
+                            let rect = self.monitors.get(monitor_id)
+                                .map(|m| workspace.compute_placements(m.work_area))
+                                .and_then(|placements| placements.into_iter()
+                                    .find(|p| p.window_id == window_id)
+                                    .map(|p| p.rect))
+                                .unwrap_or_else(|| Rect::new(0, 0, 0, 0));
+
+                            windows.push(openniri_ipc::WindowInfo {
+                                window_id,
+                                title,
+                                class_name,
+                                process_id,
+                                executable,
+                                rect: openniri_ipc::IpcRect::new(rect.x, rect.y, rect.width, rect.height),
+                                column_index: Some(col_idx),
+                                window_index: Some(win_idx),
+                                monitor_id: *monitor_id as i64,
+                                is_floating: false,
+                                is_focused: Some(window_id) == focused_hwnd,
+                            });
+                        }
+                    }
+
+                    // Floating windows
+                    for floating in workspace.floating_windows() {
+                        let (title, class_name, process_id) = win_info_map
+                            .get(&floating.id)
+                            .cloned()
+                            .unwrap_or_else(|| ("Unknown".to_string(), "Unknown".to_string(), 0));
+
+                        let executable = get_process_executable(process_id)
+                            .unwrap_or_default();
+
+                        windows.push(openniri_ipc::WindowInfo {
+                            window_id: floating.id,
+                            title,
+                            class_name,
+                            process_id,
+                            executable,
+                            rect: openniri_ipc::IpcRect::new(
+                                floating.rect.x,
+                                floating.rect.y,
+                                floating.rect.width,
+                                floating.rect.height
+                            ),
+                            column_index: None,
+                            window_index: None,
+                            monitor_id: *monitor_id as i64,
+                            is_floating: true,
+                            is_focused: Some(floating.id) == focused_hwnd,
+                        });
+                    }
+                }
+
+                IpcResponse::WindowList { windows }
+            }
         }
     }
 
     /// Handle a window lifecycle event.
     fn handle_window_event(&mut self, event: WindowEvent) {
+        // Get window_id from event for validation (DisplayChange has no window ID)
+        let window_id = match &event {
+            WindowEvent::Created(id) | WindowEvent::Destroyed(id) |
+            WindowEvent::Focused(id) | WindowEvent::Minimized(id) |
+            WindowEvent::Restored(id) | WindowEvent::MovedOrResized(id) => Some(*id),
+            WindowEvent::DisplayChange => None,
+        };
+
+        // Skip Destroyed events validation (window is already gone)
+        // Skip DisplayChange (no window to validate)
+        if let Some(wid) = window_id {
+            if !matches!(event, WindowEvent::Destroyed(_)) && !openniri_platform_win32::is_valid_window(wid) {
+                debug!("Ignoring event for invalid window {}", wid);
+                return;
+            }
+        }
+
         match event {
             WindowEvent::Created(hwnd) => {
                 // Check if any workspace already manages this window
@@ -502,35 +791,86 @@ impl AppState {
                 // Try to get window info for filtering and monitor assignment
                 if let Ok(windows) = enumerate_windows() {
                     if let Some(win_info) = windows.into_iter().find(|w| w.hwnd == hwnd) {
+                        // Get executable name for rule matching
+                        let executable = get_process_executable(win_info.process_id)
+                            .unwrap_or_default();
+
+                        // Check window rules
+                        let action = self.evaluate_window_rules(
+                            &win_info.class_name,
+                            &win_info.title,
+                            &executable,
+                        );
+
+                        // Skip ignored windows
+                        if action == config::WindowAction::Ignore {
+                            debug!(
+                                "Ignoring window by rule: {} ({})",
+                                win_info.title, win_info.class_name
+                            );
+                            return;
+                        }
+
                         // Determine which monitor this window should be on
                         let monitors: Vec<_> = self.monitors.values().cloned().collect();
                         let monitor_id = find_monitor_for_rect(&monitors, &win_info.rect)
                             .map(|m| m.id)
                             .unwrap_or(self.focused_monitor);
 
-                        let width = win_info.rect.width.clamp(
-                            self.config.layout.min_column_width,
-                            self.config.layout.max_column_width,
-                        );
+                        // Get floating rect before borrowing workspace mutably
+                        let floating_rect = if action == config::WindowAction::Float {
+                            Some(self.get_floating_rect_from_rules(
+                                &win_info.class_name,
+                                &win_info.title,
+                                &executable,
+                                &win_info.rect,
+                            ))
+                        } else {
+                            None
+                        };
+
+                        let viewport_width = self.monitors.get(&monitor_id)
+                            .map(|m| m.work_area.width)
+                            .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
 
                         if let Some(workspace) = self.workspaces.get_mut(&monitor_id) {
-                            match workspace.insert_window(hwnd, Some(width)) {
-                                Ok(()) => {
-                                    info!(
-                                        "Window created: {} ({}) - added to monitor {}",
-                                        win_info.title, win_info.class_name, monitor_id
+                            let added = match action {
+                                config::WindowAction::Float => {
+                                    // Use rule dimensions or default to centered 800x600 window
+                                    let rect = floating_rect.unwrap_or_else(|| {
+                                        let viewport = self.monitors.get(&monitor_id)
+                                            .map(|m| m.work_area)
+                                            .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT));
+                                        Rect::new(
+                                            viewport.x + (viewport.width - 800) / 2,
+                                            viewport.y + (viewport.height - 600) / 2,
+                                            800,
+                                            600,
+                                        )
+                                    });
+                                    workspace.add_floating(hwnd, rect).is_ok()
+                                }
+                                config::WindowAction::Tile => {
+                                    let width = win_info.rect.width.clamp(
+                                        self.config.layout.min_column_width,
+                                        self.config.layout.max_column_width,
                                     );
-                                    let viewport_width = self.monitors.get(&monitor_id)
-                                        .map(|m| m.work_area.width)
-                                        .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
-                                    workspace.ensure_focused_visible_animated(viewport_width);
-                                    if let Err(e) = self.apply_layout() {
-                                        warn!("Failed to apply layout after window create: {}", e);
-                                    }
+                                    workspace.insert_window(hwnd, Some(width)).is_ok()
                                 }
-                                Err(e) => {
-                                    debug!("Failed to add window {}: {}", hwnd, e);
+                                config::WindowAction::Ignore => unreachable!(),
+                            };
+
+                            if added {
+                                info!(
+                                    "Window created: {} ({}) - added to monitor {} as {:?}",
+                                    win_info.title, win_info.class_name, monitor_id, action
+                                );
+                                workspace.ensure_focused_visible_animated(viewport_width);
+                                if let Err(e) = self.apply_layout() {
+                                    warn!("Failed to apply layout after window create: {}", e);
                                 }
+                            } else {
+                                debug!("Failed to add window {} to workspace", hwnd);
                             }
                         }
                     }
@@ -544,14 +884,20 @@ impl AppState {
                         .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
 
                     if let Some(workspace) = self.workspaces.get_mut(&monitor_id) {
-                        if let Err(e) = workspace.remove_window(hwnd) {
+                        // Try to remove as floating window first
+                        let was_floating = workspace.remove_floating(hwnd);
+
+                        if was_floating {
+                            info!("Floating window {} destroyed - removed from monitor {}", hwnd, monitor_id);
+                        } else if let Err(e) = workspace.remove_window(hwnd) {
                             warn!("Failed to remove window {}: {}", hwnd, e);
                         } else {
                             info!("Window {} destroyed - removed from monitor {}", hwnd, monitor_id);
                             workspace.ensure_focused_visible_animated(viewport_width);
-                            if let Err(e) = self.apply_layout() {
-                                warn!("Failed to apply layout after window destroy: {}", e);
-                            }
+                        }
+
+                        if let Err(e) = self.apply_layout() {
+                            warn!("Failed to apply layout after window destroy: {}", e);
                         }
                     }
                 }
@@ -598,6 +944,76 @@ impl AppState {
                 // For now, we don't track user-initiated moves
                 debug!("Window {} moved/resized by user", hwnd);
             }
+            WindowEvent::DisplayChange => {
+                // Display configuration changed (monitors added/removed/rearranged)
+                // This is handled by Phase 2 robustness code
+                info!("Display configuration changed");
+                // TODO: Re-enumerate monitors and redistribute workspaces
+            }
+        }
+    }
+}
+
+/// Hotkey registration result containing handle and mapping.
+struct HotkeyState {
+    /// Handle to unregister hotkeys on drop.
+    handle: Option<openniri_platform_win32::HotkeyHandle>,
+    /// Mapping of hotkey IDs to commands.
+    mapping: HashMap<HotkeyId, IpcCommand>,
+}
+
+/// Register hotkeys from config and return state.
+///
+/// This function is called both at startup and on config reload.
+fn setup_hotkeys(
+    config: &Config,
+    event_tx: mpsc::Sender<DaemonEvent>,
+) -> HotkeyState {
+    let config_hotkeys = &config.hotkeys.bindings;
+
+    // Build hotkey definitions and command mapping
+    let mut hotkeys = Vec::new();
+    let mut mapping = HashMap::new();
+    let mut next_id: HotkeyId = 1;
+
+    for (key_str, cmd_str) in config_hotkeys {
+        if let Some((modifiers, vk)) = parse_hotkey_string(key_str) {
+            if let Some(cmd) = config::parse_command(cmd_str) {
+                hotkeys.push(Hotkey::new(next_id, modifiers, vk));
+                mapping.insert(next_id, cmd);
+                debug!("Configured hotkey {}: {} -> {:?}", next_id, key_str, cmd_str);
+                next_id += 1;
+            } else {
+                warn!("Unknown command in hotkey config: {} -> {}", key_str, cmd_str);
+            }
+        } else {
+            warn!("Invalid hotkey string in config: {}", key_str);
+        }
+    }
+
+    if hotkeys.is_empty() {
+        info!("No hotkeys configured");
+        return HotkeyState { handle: None, mapping };
+    }
+
+    match register_hotkeys(hotkeys) {
+        Ok((handle, hotkey_receiver)) => {
+            info!("Registered {} global hotkeys", handle.registered_count());
+
+            // Spawn task to forward hotkey events
+            std::thread::spawn(move || {
+                while let Ok(event) = hotkey_receiver.recv() {
+                    if event_tx.blocking_send(DaemonEvent::Hotkey(event)).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            HotkeyState { handle: Some(handle), mapping }
+        }
+        Err(e) => {
+            warn!("Failed to register hotkeys: {}. Global shortcuts disabled.", e);
+            HotkeyState { handle: None, mapping }
         }
     }
 }
@@ -718,29 +1134,33 @@ async fn handle_client(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Load configuration first (needed for log level)
+    let config = Config::load().unwrap_or_else(|e| {
+        // Can't use tracing yet, fall back to eprintln
+        eprintln!("Failed to load configuration: {}. Using defaults.", e);
+        Config::default()
+    });
+
+    // Initialize logging with configured log level
+    let log_level = match config.behavior.log_level.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => Level::INFO, // default fallback for invalid values
+    };
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(log_level)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("OpenNiri daemon starting...");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
-
-    // Load configuration
-    let config = match Config::load() {
-        Ok(cfg) => {
-            info!(
-                "Configuration loaded: gap={}, outer_gap={}, default_column_width={}",
-                cfg.layout.gap, cfg.layout.outer_gap, cfg.layout.default_column_width
-            );
-            cfg
-        }
-        Err(e) => {
-            warn!("Failed to load configuration: {}. Using defaults.", e);
-            Config::default()
-        }
-    };
+    info!(
+        "Configuration loaded: gap={}, outer_gap={}, default_column_width={}, log_level={}",
+        config.layout.gap, config.layout.outer_gap, config.layout.default_column_width, config.behavior.log_level
+    );
 
     // Detect all monitors
     let monitors = match enumerate_monitors() {
@@ -778,7 +1198,7 @@ async fn main() -> Result<()> {
     };
 
     // Initialize state with config and monitors
-    let state = Arc::new(Mutex::new(AppState::new_with_config(config, monitors)));
+    let state = Arc::new(Mutex::new(AppState::new_with_config(config.clone(), monitors)));
 
     // Enumerate existing windows
     info!("Enumerating windows...");
@@ -821,82 +1241,106 @@ async fn main() -> Result<()> {
     // Create event channel
     let (event_tx, mut event_rx) = mpsc::channel::<DaemonEvent>(100);
 
-    // Install WinEvent hooks for window lifecycle tracking
-    let _hook_handle = match install_event_hooks() {
-        Ok((handle, event_receiver)) => {
-            info!("WinEvent hooks installed");
+    // Install WinEvent hooks for window lifecycle tracking (if enabled in config)
+    let _hook_handle = if config.behavior.track_focus_changes {
+        match install_event_hooks() {
+            Ok((handle, event_receiver)) => {
+                info!("WinEvent hooks installed");
 
-            // Spawn task to forward window events from std::sync::mpsc to tokio channel
-            let window_event_tx = event_tx.clone();
-            std::thread::spawn(move || {
-                while let Ok(event) = event_receiver.recv() {
-                    // Use blocking_send since we're in a sync thread
-                    if window_event_tx.blocking_send(DaemonEvent::WindowEvent(event)).is_err() {
-                        break; // Channel closed, daemon shutting down
+                // Spawn task to forward window events from std::sync::mpsc to tokio channel
+                let window_event_tx = event_tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(event) = event_receiver.recv() {
+                        // Use blocking_send since we're in a sync thread
+                        if window_event_tx.blocking_send(DaemonEvent::WindowEvent(event)).is_err() {
+                            break; // Channel closed, daemon shutting down
+                        }
                     }
-                }
-            });
+                });
 
-            Some(handle)
-        }
-        Err(e) => {
-            warn!("Failed to install WinEvent hooks: {}. Window tracking disabled.", e);
-            None
-        }
-    };
-
-    // Register global hotkeys
-    let hotkey_mapping: HashMap<HotkeyId, IpcCommand>;
-    let _hotkey_handle = {
-        let state = state.lock().await;
-        let config_hotkeys = &state.config.hotkeys.bindings;
-
-        // Build hotkey definitions and command mapping
-        let mut hotkeys = Vec::new();
-        let mut mapping = HashMap::new();
-        let mut next_id: HotkeyId = 1;
-
-        for (key_str, cmd_str) in config_hotkeys {
-            if let Some((modifiers, vk)) = parse_hotkey_string(key_str) {
-                if let Some(cmd) = config::parse_command(cmd_str) {
-                    hotkeys.push(Hotkey::new(next_id, modifiers, vk));
-                    mapping.insert(next_id, cmd);
-                    debug!("Configured hotkey {}: {} -> {:?}", next_id, key_str, cmd_str);
-                    next_id += 1;
-                } else {
-                    warn!("Unknown command in hotkey config: {} -> {}", key_str, cmd_str);
-                }
-            } else {
-                warn!("Invalid hotkey string in config: {}", key_str);
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("Failed to install WinEvent hooks: {}. Window tracking disabled.", e);
+                None
             }
         }
+    } else {
+        info!("WinEvent hooks disabled by config (track_focus_changes = false)");
+        None
+    };
 
-        hotkey_mapping = mapping;
+    // Register global hotkeys (mutable to support reload)
+    let mut hotkey_state = setup_hotkeys(&config, event_tx.clone());
 
-        if hotkeys.is_empty() {
-            info!("No hotkeys configured");
-            None
-        } else {
-            match register_hotkeys(hotkeys) {
-                Ok((handle, hotkey_receiver)) => {
-                    info!("Registered {} global hotkeys", handle.registered_count());
+    // Register gesture detection (if enabled)
+    let _gesture_handle = if config.gestures.enabled {
+        match register_gestures() {
+            Ok((handle, gesture_receiver)) => {
+                info!("Gesture detection enabled");
 
-                    // Spawn task to forward hotkey events
-                    let hotkey_tx = event_tx.clone();
-                    std::thread::spawn(move || {
-                        while let Ok(event) = hotkey_receiver.recv() {
-                            if hotkey_tx.blocking_send(DaemonEvent::Hotkey(event)).is_err() {
-                                break;
-                            }
+                // Spawn thread to forward gesture events
+                let gesture_event_tx = event_tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(event) = gesture_receiver.recv() {
+                        if gesture_event_tx.blocking_send(DaemonEvent::Gesture(event)).is_err() {
+                            break;
                         }
-                    });
+                    }
+                });
 
-                    Some(handle)
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("Failed to register gestures: {}. Gesture support disabled.", e);
+                None
+            }
+        }
+    } else {
+        info!("Gesture detection disabled by config (gestures.enabled = false)");
+        None
+    };
+
+    // Initialize snap hint overlay (if enabled)
+    let snap_hint_overlay: Option<OverlayWindow> = if config.snap_hints.enabled {
+        match OverlayWindow::new() {
+            Ok(overlay) => {
+                info!("Snap hint overlay initialized");
+                Some(overlay)
+            }
+            Err(e) => {
+                warn!("Failed to create snap hint overlay: {}. Snap hints disabled.", e);
+                None
+            }
+        }
+    } else {
+        info!("Snap hints disabled by config (snap_hints.enabled = false)");
+        None
+    };
+
+    // Initialize system tray icon
+    // Create an intermediate sync channel that bridges tray events to the async event loop
+    let _tray_manager = {
+        let (tray_sync_tx, tray_sync_rx) = std::sync::mpsc::channel();
+        let tray_event_tx = event_tx.clone();
+
+        // Spawn task to forward tray events from sync channel to async channel
+        std::thread::spawn(move || {
+            while let Ok(event) = tray_sync_rx.recv() {
+                if tray_event_tx.blocking_send(DaemonEvent::Tray(event)).is_err() {
+                    break; // Channel closed
                 }
-                Err(e) => {
-                    warn!("Failed to register hotkeys: {}. Global shortcuts disabled.", e);
-                    None
-                }
+            }
+        });
+
+        match tray::TrayManager::new(tray_sync_tx) {
+            Ok(manager) => {
+                info!("System tray icon initialized");
+                Some(manager)
+            }
+            Err(e) => {
+                warn!("Failed to create system tray icon: {}. Tray disabled.", e);
+                None
             }
         }
     };
@@ -913,6 +1357,9 @@ async fn main() -> Result<()> {
     // Animation timer handle - we'll spawn/cancel this as needed
     let mut animation_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
     let animation_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Snap hint timer handle - cancels pending hide operation when new hint is shown
+    let mut snap_hint_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Helper function to start animation timer if not already running
     fn start_animation_timer(
@@ -943,15 +1390,63 @@ async fn main() -> Result<()> {
 
         match event {
             DaemonEvent::IpcCommand { cmd, responder } => {
-                let (response, should_animate) = {
+                let is_reload = matches!(cmd, IpcCommand::Reload);
+                let is_resize = matches!(cmd, IpcCommand::Resize { .. });
+
+                let (response, should_animate, column_rect, hint_duration) = {
                     let mut state = state.lock().await;
                     let response = state.handle_command(cmd);
                     let animating = state.is_animating();
-                    (response, animating)
+
+                    // Get column rect for snap hint if this is a resize
+                    let rect = if is_resize && state.config.snap_hints.enabled {
+                        state.get_focused_column_rect()
+                    } else {
+                        None
+                    };
+                    let duration = state.config.snap_hints.duration_ms;
+
+                    (response, animating, rect, duration)
                 };
+
+                // If config was reloaded successfully, also reload hotkeys
+                if is_reload && matches!(response, IpcResponse::Ok) {
+                    // Drop old hotkey handle to unregister existing hotkeys
+                    hotkey_state.handle = None;
+
+                    // Re-register with new config
+                    let new_config = {
+                        let state = state.lock().await;
+                        state.config.clone()
+                    };
+                    hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
+                    info!("Hotkeys reloaded after config reload");
+                }
+
                 // Log if client disconnected before receiving response
                 if responder.send(response).is_err() {
                     debug!("Client disconnected before receiving IPC response");
+                }
+
+                // Show snap hint for resize operations
+                if is_resize {
+                    if let (Some(ref overlay), Some(rect)) = (&snap_hint_overlay, column_rect) {
+                        // Cancel any pending hide timer
+                        if let Some(handle) = snap_hint_timer_handle.take() {
+                            handle.abort();
+                        }
+
+                        // Show the snap hint
+                        overlay.show_snap_target(rect);
+
+                        // Schedule hide after duration
+                        let hide_tx = event_tx.clone();
+                        let duration = hint_duration;
+                        snap_hint_timer_handle = Some(tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(duration as u64)).await;
+                            let _ = hide_tx.send(DaemonEvent::HideSnapHint).await;
+                        }));
+                    }
                 }
 
                 // Start animation timer if needed
@@ -967,18 +1462,50 @@ async fn main() -> Result<()> {
                 state.handle_window_event(win_event);
             }
             DaemonEvent::Hotkey(hotkey_event) => {
-                let should_animate = if let Some(cmd) = hotkey_mapping.get(&hotkey_event.id) {
+                let (should_animate, is_resize, column_rect, hint_duration) = if let Some(cmd) = hotkey_state.mapping.get(&hotkey_event.id) {
                     debug!("Hotkey {} triggered, executing {:?}", hotkey_event.id, cmd);
+                    let is_resize = matches!(cmd, IpcCommand::Resize { .. });
                     let mut state = state.lock().await;
                     let response = state.handle_command(cmd.clone());
                     if let IpcResponse::Error { message } = response {
                         warn!("Hotkey command failed: {}", message);
                     }
-                    state.is_animating()
+                    let animating = state.is_animating();
+
+                    // Get column rect for snap hint if this is a resize
+                    let rect = if is_resize && state.config.snap_hints.enabled {
+                        state.get_focused_column_rect()
+                    } else {
+                        None
+                    };
+                    let duration = state.config.snap_hints.duration_ms;
+
+                    (animating, is_resize, rect, duration)
                 } else {
                     warn!("Unknown hotkey ID: {}", hotkey_event.id);
-                    false
+                    (false, false, None, 200)
                 };
+
+                // Show snap hint for resize operations
+                if is_resize {
+                    if let (Some(ref overlay), Some(rect)) = (&snap_hint_overlay, column_rect) {
+                        // Cancel any pending hide timer
+                        if let Some(handle) = snap_hint_timer_handle.take() {
+                            handle.abort();
+                        }
+
+                        // Show the snap hint
+                        overlay.show_snap_target(rect);
+
+                        // Schedule hide after duration
+                        let hide_tx = event_tx.clone();
+                        let duration = hint_duration;
+                        snap_hint_timer_handle = Some(tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(duration as u64)).await;
+                            let _ = hide_tx.send(DaemonEvent::HideSnapHint).await;
+                        }));
+                    }
+                }
 
                 // Start animation timer if needed
                 if should_animate && !animation_running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -986,6 +1513,78 @@ async fn main() -> Result<()> {
                         event_tx.clone(),
                         animation_running.clone(),
                     ));
+                }
+            }
+            DaemonEvent::Gesture(gesture_event) => {
+                // Map gesture to command from config
+                let gesture_config = {
+                    let state = state.lock().await;
+                    state.config.gestures.clone()
+                };
+
+                let cmd_str = match gesture_event {
+                    GestureEvent::SwipeLeft => &gesture_config.swipe_left,
+                    GestureEvent::SwipeRight => &gesture_config.swipe_right,
+                    GestureEvent::SwipeUp => &gesture_config.swipe_up,
+                    GestureEvent::SwipeDown => &gesture_config.swipe_down,
+                };
+
+                if let Some(cmd) = config::parse_command(cmd_str) {
+                    debug!("Gesture {:?} triggered, executing {:?}", gesture_event, cmd);
+                    let should_animate = {
+                        let mut state = state.lock().await;
+                        let response = state.handle_command(cmd);
+                        if let IpcResponse::Error { message } = response {
+                            warn!("Gesture command failed: {}", message);
+                        }
+                        state.is_animating()
+                    };
+
+                    // Start animation timer if needed
+                    if should_animate && !animation_running.load(std::sync::atomic::Ordering::SeqCst) {
+                        animation_timer_handle = Some(start_animation_timer(
+                            event_tx.clone(),
+                            animation_running.clone(),
+                        ));
+                    }
+                } else {
+                    warn!("Unknown command for gesture: {}", cmd_str);
+                }
+            }
+            DaemonEvent::Tray(tray_event) => {
+                match tray_event {
+                    tray::TrayEvent::Refresh => {
+                        info!("Tray: Refresh requested");
+                        let mut state = state.lock().await;
+                        let response = state.handle_command(IpcCommand::Refresh);
+                        if let IpcResponse::Error { message } = response {
+                            warn!("Refresh failed: {}", message);
+                        }
+                    }
+                    tray::TrayEvent::Reload => {
+                        info!("Tray: Reload config requested");
+                        let response = {
+                            let mut state = state.lock().await;
+                            state.handle_command(IpcCommand::Reload)
+                        };
+
+                        // If config was reloaded successfully, also reload hotkeys
+                        if matches!(response, IpcResponse::Ok) {
+                            hotkey_state.handle = None;
+                            let new_config = {
+                                let state = state.lock().await;
+                                state.config.clone()
+                            };
+                            hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
+                            info!("Hotkeys reloaded after tray config reload");
+                        } else if let IpcResponse::Error { message } = response {
+                            warn!("Reload failed: {}", message);
+                        }
+                    }
+                    tray::TrayEvent::Exit => {
+                        info!("Tray: Exit requested");
+                        break;
+                    }
                 }
             }
             DaemonEvent::AnimationTick => {
@@ -1010,6 +1609,12 @@ async fn main() -> Result<()> {
                     debug!("All animations complete");
                 }
             }
+            DaemonEvent::HideSnapHint => {
+                if let Some(ref overlay) = snap_hint_overlay {
+                    overlay.hide();
+                    debug!("Snap hint hidden");
+                }
+            }
             DaemonEvent::Shutdown => {
                 info!("Shutdown signal received");
                 break;
@@ -1017,11 +1622,175 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Clean up animation timer if running
+    // Clean up timers if running
     if let Some(handle) = animation_timer_handle {
+        handle.abort();
+    }
+    if let Some(handle) = snap_hint_timer_handle {
         handle.abort();
     }
 
     info!("OpenNiri daemon shutting down.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openniri_core_layout::Rect;
+
+    fn test_config() -> Config {
+        Config::default()
+    }
+
+    fn test_monitors() -> Vec<MonitorInfo> {
+        vec![MonitorInfo {
+            id: 1,
+            rect: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1040),
+            is_primary: true,
+            device_name: "DISPLAY1".to_string(),
+        }]
+    }
+
+    #[test]
+    fn test_app_state_new() {
+        let state = AppState::new_with_config(test_config(), test_monitors());
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.focused_monitor, 1);
+    }
+
+    #[test]
+    fn test_app_state_focused_viewport() {
+        let state = AppState::new_with_config(test_config(), test_monitors());
+        let viewport = state.focused_viewport();
+        assert_eq!(viewport.width, 1920);
+        assert_eq!(viewport.height, 1040);
+    }
+
+    #[test]
+    fn test_app_state_no_monitors_fallback() {
+        let state = AppState::new_with_config(test_config(), vec![]);
+        let viewport = state.focused_viewport();
+        assert_eq!(viewport.width, FALLBACK_VIEWPORT_WIDTH);
+        assert_eq!(viewport.height, FALLBACK_VIEWPORT_HEIGHT);
+    }
+
+    #[test]
+    fn test_window_rule_matching_class() {
+        let config = Config {
+            window_rules: vec![config::WindowRule {
+                match_class: Some("TestClass".to_string()),
+                match_title: None,
+                match_executable: None,
+                action: config::WindowAction::Float,
+                width: Some(800),
+                height: Some(600),
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_with_config(config, test_monitors());
+        let action = state.evaluate_window_rules("TestClass", "Any Title", "any.exe");
+        assert_eq!(action, config::WindowAction::Float);
+    }
+
+    #[test]
+    fn test_window_rule_matching_title() {
+        let config = Config {
+            window_rules: vec![config::WindowRule {
+                match_class: None,
+                match_title: Some(".*DevTools.*".to_string()),
+                match_executable: None,
+                action: config::WindowAction::Float,
+                width: None,
+                height: None,
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_with_config(config, test_monitors());
+        let action = state.evaluate_window_rules("AnyClass", "DevTools - localhost", "chrome.exe");
+        assert_eq!(action, config::WindowAction::Float);
+    }
+
+    #[test]
+    fn test_window_rule_matching_executable() {
+        let config = Config {
+            window_rules: vec![config::WindowRule {
+                match_class: None,
+                match_title: None,
+                match_executable: Some("spotify.exe".to_string()),
+                action: config::WindowAction::Ignore,
+                width: None,
+                height: None,
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_with_config(config, test_monitors());
+        let action = state.evaluate_window_rules("SpotifyClass", "Spotify", "spotify.exe");
+        assert_eq!(action, config::WindowAction::Ignore);
+    }
+
+    #[test]
+    fn test_window_rule_no_match_defaults_to_tile() {
+        let state = AppState::new_with_config(test_config(), test_monitors());
+        let action = state.evaluate_window_rules("SomeClass", "Some Title", "some.exe");
+        assert_eq!(action, config::WindowAction::Tile);
+    }
+
+    #[test]
+    fn test_floating_rect_uses_rule_dimensions() {
+        let config = Config {
+            window_rules: vec![config::WindowRule {
+                match_class: Some("TestClass".to_string()),
+                match_title: None,
+                match_executable: None,
+                action: config::WindowAction::Float,
+                width: Some(1024),
+                height: Some(768),
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_with_config(config, test_monitors());
+        let original = Rect::new(100, 100, 640, 480);
+        let result = state.get_floating_rect_from_rules("TestClass", "Title", "test.exe", &original);
+        assert_eq!(result.width, 1024);
+        assert_eq!(result.height, 768);
+    }
+
+    #[test]
+    fn test_floating_rect_preserves_original_if_no_dimensions() {
+        let config = Config {
+            window_rules: vec![config::WindowRule {
+                match_class: Some("TestClass".to_string()),
+                match_title: None,
+                match_executable: None,
+                action: config::WindowAction::Float,
+                width: None,
+                height: None,
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_with_config(config, test_monitors());
+        let original = Rect::new(100, 100, 640, 480);
+        let result = state.get_floating_rect_from_rules("TestClass", "Title", "test.exe", &original);
+        assert_eq!(result.width, 640);
+        assert_eq!(result.height, 480);
+    }
+
+    #[test]
+    fn test_find_window_workspace_not_found() {
+        let state = AppState::new_with_config(test_config(), test_monitors());
+        assert!(state.find_window_workspace(99999).is_none());
+    }
+
+    #[test]
+    fn test_app_state_apply_config() {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        let mut new_config = test_config();
+        new_config.layout.gap = 20;
+        new_config.layout.outer_gap = 15;
+        state.apply_config(new_config.clone());
+        assert_eq!(state.config.layout.gap, 20);
+        assert_eq!(state.config.layout.outer_gap, 15);
+    }
 }

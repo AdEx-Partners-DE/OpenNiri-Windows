@@ -308,6 +308,18 @@ pub enum CenteringMode {
     JustInView,
 }
 
+/// A floating window that is not part of the tiling layout.
+///
+/// Floating windows are positioned at absolute coordinates and always
+/// remain visible (not scrolled with the workspace).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloatingWindow {
+    /// The window identifier.
+    pub id: WindowId,
+    /// The position and size of the floating window.
+    pub rect: Rect,
+}
+
 /// The scrollable workspace.
 /// This is the core data structure representing the infinite horizontal strip.
 ///
@@ -343,6 +355,9 @@ pub struct Workspace {
     /// Active scroll animation, if any.
     #[serde(skip)]
     active_animation: Option<ScrollAnimation>,
+    /// Floating windows outside the tiling layout.
+    #[serde(default)]
+    floating_windows: Vec<FloatingWindow>,
 }
 
 impl Default for Workspace {
@@ -357,6 +372,7 @@ impl Default for Workspace {
             default_column_width: DEFAULT_COLUMN_WIDTH,
             centering_mode: CenteringMode::default(),
             active_animation: None,
+            floating_windows: Vec::new(),
         }
     }
 }
@@ -387,9 +403,61 @@ impl Workspace {
         self.columns.len()
     }
 
-    /// Check if a window ID already exists in the workspace.
+    /// Check if a window ID already exists in the workspace (tiled or floating).
     pub fn contains_window(&self, window_id: WindowId) -> bool {
         self.columns.iter().any(|c| c.windows.contains(&window_id))
+            || self.floating_windows.iter().any(|f| f.id == window_id)
+    }
+
+    /// Check if a window is floating.
+    pub fn is_floating(&self, window_id: WindowId) -> bool {
+        self.floating_windows.iter().any(|f| f.id == window_id)
+    }
+
+    /// Get the number of floating windows.
+    pub fn floating_count(&self) -> usize {
+        self.floating_windows.len()
+    }
+
+    /// Add a floating window to the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
+    pub fn add_floating(&mut self, window_id: WindowId, rect: Rect) -> Result<(), LayoutError> {
+        if self.contains_window(window_id) {
+            return Err(LayoutError::DuplicateWindow(window_id));
+        }
+
+        self.floating_windows.push(FloatingWindow { id: window_id, rect });
+        Ok(())
+    }
+
+    /// Remove a floating window from the workspace.
+    ///
+    /// Returns true if the window was found and removed, false otherwise.
+    pub fn remove_floating(&mut self, window_id: WindowId) -> bool {
+        if let Some(pos) = self.floating_windows.iter().position(|f| f.id == window_id) {
+            self.floating_windows.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update the position/size of a floating window.
+    pub fn update_floating(&mut self, window_id: WindowId, rect: Rect) -> bool {
+        if let Some(floating) = self.floating_windows.iter_mut().find(|f| f.id == window_id) {
+            floating.rect = rect;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get all floating windows.
+    pub fn floating_windows(&self) -> &[FloatingWindow] {
+        &self.floating_windows
     }
 
     /// Get the total width of the strip (sum of all column widths + gaps).
@@ -636,6 +704,18 @@ impl Workspace {
         self.columns.iter().map(|c| c.len()).sum()
     }
 
+    /// Get all window IDs in this workspace (both tiled and floating).
+    ///
+    /// Useful for migrating windows when monitors are disconnected.
+    pub fn all_window_ids(&self) -> Vec<WindowId> {
+        let mut ids: Vec<WindowId> = self.columns
+            .iter()
+            .flat_map(|c| c.windows().iter().copied())
+            .collect();
+        ids.extend(self.floating_windows.iter().map(|f| f.id));
+        ids
+    }
+
     /// Get the gap between columns in pixels.
     pub fn gap(&self) -> i32 {
         self.gap
@@ -803,10 +883,6 @@ impl Workspace {
     pub fn compute_placements(&self, viewport: Rect) -> Vec<WindowPlacement> {
         let mut placements = Vec::new();
 
-        if self.columns.is_empty() {
-            return placements;
-        }
-
         // Defensively clamp gaps to >= 0 in case fields were set directly
         let gap = self.gap.max(0);
         let outer_gap = self.outer_gap.max(0);
@@ -873,6 +949,16 @@ impl Workspace {
             }
 
             current_x = current_x.saturating_add(column.width).saturating_add(gap);
+        }
+
+        // Add floating windows (always visible, at their absolute positions)
+        for floating in &self.floating_windows {
+            placements.push(WindowPlacement {
+                window_id: floating.id,
+                rect: floating.rect,
+                visibility: Visibility::Visible,
+                column_index: usize::MAX, // Sentinel for floating windows
+            });
         }
 
         placements
@@ -1043,10 +1129,6 @@ impl Workspace {
     pub fn compute_placements_animated(&self, viewport: Rect) -> Vec<WindowPlacement> {
         let mut placements = Vec::new();
 
-        if self.columns.is_empty() {
-            return placements;
-        }
-
         // Defensively clamp gaps to >= 0 in case fields were set directly
         let gap = self.gap.max(0);
         let outer_gap = self.outer_gap.max(0);
@@ -1105,6 +1187,16 @@ impl Workspace {
             }
 
             current_x = current_x.saturating_add(column.width).saturating_add(gap);
+        }
+
+        // Add floating windows (always visible, at their absolute positions)
+        for floating in &self.floating_windows {
+            placements.push(WindowPlacement {
+                window_id: floating.id,
+                rect: floating.rect,
+                visibility: Visibility::Visible,
+                column_index: usize::MAX, // Sentinel for floating windows
+            });
         }
 
         placements
@@ -2489,5 +2581,127 @@ mod tests {
 
         // Should start an animation to scroll back to column 0
         assert!(ws.is_animating());
+    }
+
+    // ========================================================================
+    // Floating Window Tests
+    // ========================================================================
+
+    #[test]
+    fn test_add_floating_window() {
+        let mut ws = Workspace::new();
+        let rect = Rect::new(100, 100, 400, 300);
+
+        ws.add_floating(1, rect).unwrap();
+
+        assert!(ws.contains_window(1));
+        assert!(ws.is_floating(1));
+        assert_eq!(ws.floating_count(), 1);
+        assert_eq!(ws.column_count(), 0); // Not in columns
+    }
+
+    #[test]
+    fn test_floating_window_in_placements() {
+        let mut ws = Workspace::new();
+        let rect = Rect::new(100, 100, 400, 300);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        ws.add_floating(1, rect).unwrap();
+
+        let placements = ws.compute_placements(viewport);
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].window_id, 1);
+        assert_eq!(placements[0].rect, rect);
+        assert_eq!(placements[0].visibility, Visibility::Visible);
+        assert_eq!(placements[0].column_index, usize::MAX); // Floating sentinel
+    }
+
+    #[test]
+    fn test_remove_floating_window() {
+        let mut ws = Workspace::new();
+        let rect = Rect::new(100, 100, 400, 300);
+
+        ws.add_floating(1, rect).unwrap();
+        assert!(ws.contains_window(1));
+
+        let removed = ws.remove_floating(1);
+        assert!(removed);
+        assert!(!ws.contains_window(1));
+        assert_eq!(ws.floating_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_floating_window() {
+        let mut ws = Workspace::new();
+        let removed = ws.remove_floating(999);
+        assert!(!removed);
+    }
+
+    #[test]
+    fn test_update_floating_window() {
+        let mut ws = Workspace::new();
+        let rect1 = Rect::new(100, 100, 400, 300);
+        let rect2 = Rect::new(200, 200, 600, 400);
+
+        ws.add_floating(1, rect1).unwrap();
+
+        let updated = ws.update_floating(1, rect2);
+        assert!(updated);
+
+        let placements = ws.compute_placements(Rect::new(0, 0, 1920, 1080));
+        assert_eq!(placements[0].rect, rect2);
+    }
+
+    #[test]
+    fn test_floating_and_tiled_windows_together() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        let floating_rect = Rect::new(500, 500, 300, 200);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        // Add tiled window
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+
+        // Add floating window
+        ws.add_floating(3, floating_rect).unwrap();
+
+        assert_eq!(ws.column_count(), 2);
+        assert_eq!(ws.floating_count(), 1);
+        assert!(ws.contains_window(1));
+        assert!(ws.contains_window(2));
+        assert!(ws.contains_window(3));
+        assert!(!ws.is_floating(1));
+        assert!(!ws.is_floating(2));
+        assert!(ws.is_floating(3));
+
+        let placements = ws.compute_placements(viewport);
+        assert_eq!(placements.len(), 3);
+
+        // Floating window should be last in placements
+        assert_eq!(placements[2].window_id, 3);
+        assert_eq!(placements[2].rect, floating_rect);
+    }
+
+    #[test]
+    fn test_duplicate_floating_window_rejected() {
+        let mut ws = Workspace::new();
+        let rect = Rect::new(100, 100, 400, 300);
+
+        ws.add_floating(1, rect).unwrap();
+
+        let result = ws.add_floating(1, rect);
+        assert!(matches!(result, Err(LayoutError::DuplicateWindow(1))));
+    }
+
+    #[test]
+    fn test_floating_window_duplicate_with_tiled() {
+        let mut ws = Workspace::new();
+
+        // Add tiled window
+        ws.insert_window(1, Some(400)).unwrap();
+
+        // Try to add same ID as floating - should fail
+        let result = ws.add_floating(1, Rect::new(100, 100, 400, 300));
+        assert!(matches!(result, Err(LayoutError::DuplicateWindow(1))));
     }
 }
