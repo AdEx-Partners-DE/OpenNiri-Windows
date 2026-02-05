@@ -2,7 +2,7 @@
 
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
-> **Last Updated**: 2026-02-04 (Iteration 23)
+> **Last Updated**: 2026-02-05 (Iteration 24)
 
 ---
 
@@ -70,10 +70,170 @@ OpenNiri-Windows/
 | 21 | 2026-02-04 | Full Feature Push | 111 | 131 | System tray, window rules, gestures, snap hints |
 | 22 | 2026-02-04 | Quality & Robustness | 131 | 147 | Fix unwraps, HWND validation, unit tests, docs, catch_unwind, IPC queries |
 | 23 | 2026-02-04 | Feature Completion & Tests | 147 | 202 | Wire DisplayChange, focus_follows_mouse, use_cloaking, CLI tests, integration tests |
+| 24 | 2026-02-05 | Real Gestures, Persistence, Docs | 202 | 206 | Real touchpad gestures, workspace persistence, doc refresh |
 
 ---
 
 ## Detailed Iteration Logs
+
+### Iteration 24: Real Gestures, Workspace Persistence & Doc Refresh
+
+**Date**: 2026-02-05
+**Status**: COMPLETED
+**Previous Context**: Iteration 23 (Feature Completion & Test Expansion)
+
+#### 24.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Update SPEC.md to reflect current implementation | High | DONE |
+| 2 | Update ARCHITECTURE.md to reflect current implementation | High | DONE |
+| 3 | Implement real touchpad gesture support | High | DONE |
+| 4 | Implement workspace persistence (save/restore) | High | DONE |
+| 5 | Add tests for new features | Medium | DONE |
+
+#### 24.2 Changes Made
+
+##### 24.2.1 Documentation Refresh
+
+**File**: `docs/SPEC.md`
+
+Updated to reflect all implemented features:
+- Added Per-Window Rules section (was listed as "pending", now documented)
+- Added Floating Windows section
+- Added System Tray section
+- Added Visual Snap Hints section
+- Added Focus Follows Mouse section
+- Added Touchpad Gesture Support section
+- Added Display Change Handling section
+- Added Workspace Persistence section
+- Updated Implementation Status (202 tests, all features implemented)
+- Removed stale "Pending" items
+
+**File**: `docs/ARCHITECTURE.md`
+
+Updated to reflect current state:
+- Updated IPC types (added QueryAllWindows, WindowList, WindowInfo, IpcRect)
+- Updated CLI commands (added focus-monitor, move-to-monitor, query all, init)
+- Updated daemon responsibilities (persistence, tray, gesture/mouse hooks)
+- Updated event loop diagram (added hotkeys, gestures, tray, display change, focus follows mouse)
+- Updated Current Status with correct test counts (202 total)
+- Updated Planned vs Implemented (all features now implemented)
+- Updated threading model (7 threads/tasks documented)
+- Updated error handling (DeferWindowPos fallback, HWND validation, config fallbacks)
+
+##### 24.2.2 Real Touchpad Gesture Support
+
+**File**: `crates/platform_win32/src/lib.rs`
+
+**Problem**: Previous implementation used a message-only window (HWND_MESSAGE) listening for WM_POINTERDOWN/WM_POINTERUP, which never receives real touchpad input.
+
+**Solution**: Replaced with a low-level mouse hook (WH_MOUSE_LL) that captures WM_MOUSEWHEEL and WM_MOUSEHWHEEL events system-wide.
+
+**New types**:
+```rust
+struct GestureAccumState {
+    accum_x: i32,
+    accum_y: i32,
+    last_scroll_time: std::time::Instant,
+}
+```
+
+**New constants**:
+```rust
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
+const GESTURE_SCROLL_THRESHOLD: i32 = 360; // 3 * WHEEL_DELTA
+const GESTURE_TIMEOUT_MS: u128 = 300;
+```
+
+**How it works**:
+1. `register_gestures()` installs `WH_MOUSE_LL` hook
+2. Hook callback captures WM_MOUSEWHEEL/WM_MOUSEHWHEEL
+3. Extracts delta from `mouseData >> 16` (high word)
+4. Accumulates horizontal (WM_MOUSEHWHEEL) and vertical (WM_MOUSEWHEEL) deltas
+5. When accumulated delta exceeds threshold (360 = 3x WHEEL_DELTA), fires GestureEvent
+6. Resets accumulator after timeout (300ms no scroll)
+
+**Removed**: WM_POINTER message constants, gesture_window_proc, gesture_window_proc_inner, GestureState (replaced by GestureAccumState), thread-based GestureHandle.
+
+**Simplified GestureHandle**: Now holds just an HHOOK (like MouseHookHandle), no thread.
+
+##### 24.2.3 Workspace Persistence
+
+**File**: `crates/daemon/src/main.rs`
+
+**New types**:
+```rust
+#[derive(Serialize, Deserialize)]
+struct WorkspaceSnapshot {
+    monitor_device_name: String,
+    workspace: Workspace,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StateSnapshot {
+    saved_at: String,
+    workspaces: Vec<WorkspaceSnapshot>,
+    focused_monitor_name: String,
+}
+```
+
+**New AppState methods**:
+- `save_state()` - Serialize workspace state to `%APPDATA%/openniri/data/workspace-state.json`
+- `load_state()` - Deserialize saved state from disk
+- `state_file_path()` - Get persistence file path
+- `restore_state()` - Apply saved scroll offsets and focus to matching monitors
+
+**Lifecycle integration**:
+- On startup: After monitor setup, before window enumeration, attempts to restore saved state
+- On shutdown (DaemonEvent::Shutdown): Saves current state before exiting
+- On tray Exit: Saves current state before triggering shutdown
+
+**Matching strategy**: Monitors are matched by `device_name` (e.g., "DISPLAY1") which is stable across restarts, unlike MonitorId (HMONITOR handle values).
+
+#### 24.3 Test Results
+
+```
+Test Summary (2026-02-05):
+- core_layout:    87 passed, 0 failed, 0 ignored
+- daemon:         48 passed, 0 failed, 0 ignored
+- cli:            28 passed, 0 failed, 0 ignored
+- integration:    17 passed, 0 failed, 0 ignored
+- ipc:            13 passed, 0 failed, 0 ignored
+- platform_win32: 13 passed, 0 failed, 2 ignored
+
+TOTAL: 206 passed, 0 failed, 2 ignored (1 doc-test ignored)
+Clippy: No warnings
+```
+
+**Test Growth**: 202 → 206 (+4 tests)
+
+**New Tests**:
+- `test_state_file_path` - Validates persistence path
+- `test_state_snapshot_serialization` - StateSnapshot roundtrip
+- `test_workspace_snapshot_serialization` - WorkspaceSnapshot roundtrip
+- `test_save_and_load_roundtrip` - Full snapshot roundtrip with workspace data
+
+#### 24.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| All tests pass | `cargo test --workspace` | 206 passed, 2 ignored |
+| Build succeeds | `cargo build --workspace` | Success |
+| Clippy clean | `cargo clippy --workspace` | No warnings |
+
+#### 24.5 Files Modified Summary
+
+| File | Lines Changed | Type |
+|------|---------------|------|
+| `crates/platform_win32/src/lib.rs` | ~288 lines changed | Real gesture hook, simplified GestureHandle |
+| `crates/daemon/src/main.rs` | +208 lines | Workspace persistence, 4 tests |
+| `docs/SPEC.md` | +126 lines | Doc refresh with all features |
+| `docs/ARCHITECTURE.md` | +154 lines changed | Doc refresh, current state |
+| `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` | Updated | Reflect Iteration 23 fixes |
+
+---
 
 ### Iteration 23: Feature Completion & Test Expansion
 
@@ -1818,12 +1978,13 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | 21 | 87 | 10 | 13 (+2 ignored) | 21 | 131 |
 | 22 | 87 | 13 | 13 (+2 ignored) | 34 | 147 |
 | 23 | 87 | 13 | 13 (+2 ignored) | 44 (+28 cli, +17 integration) | 202 |
+| 24 | 87 | 13 | 13 (+2 ignored) | 48 (+28 cli, +17 integration) | 206 |
 
 ---
 
 ## Architecture Evolution
 
-### Current State (Post-Iteration 23)
+### Current State (Post-Iteration 24)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1875,24 +2036,25 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | Issue | Severity | Iteration Introduced | Status |
 |-------|----------|---------------------|--------|
 | Global EVENT_SENDER for hooks | Low | 9 | Acceptable (thread safety) |
-| No touchpad gestures | Low | - | Planned |
 | Config `default_config_path` unused | Low | 10 | Minor (dead code warning) |
 | `monitors_list` method unused | Low | 11 | Minor (dead code warning) |
+| No end-to-end daemon integration tests | Medium | - | Planned for Iteration 25 |
+| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 24 |
 
 ---
 
 ## Next Iteration Planning
 
-### Iteration 24 (Planned)
+### Iteration 25 (Planned)
 
-**Focus**: Persistence & Performance
+**Focus**: Polish & Advanced Features
 
 **Objectives**:
-1. Workspace persistence (save/restore window positions)
-2. Multi-workspace support (named workspaces per monitor)
-3. Enhanced window rules (assign to workspace, custom sizes)
-4. Performance profiling and optimization
-5. Window layout serialization/deserialization
+1. Multi-workspace support (named workspaces per monitor, switch between them)
+2. Enhanced window rules (assign to specific workspace/monitor)
+3. Performance profiling and optimization
+4. End-to-end integration tests (spawn daemon, CLI interaction)
+5. Window layout import/export
 
 ---
 

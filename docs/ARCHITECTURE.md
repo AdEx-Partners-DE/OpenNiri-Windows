@@ -110,8 +110,10 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 **Purpose**: Shared IPC protocol types for daemon-CLI communication.
 
 **Key Types**:
-- `IpcCommand`: Commands sent from CLI to daemon (FocusLeft/Right/Up/Down, MoveColumnLeft/Right, Resize, Scroll, QueryWorkspace, QueryFocused, Refresh, Apply, Stop)
-- `IpcResponse`: Responses from daemon (Ok, Error, WorkspaceState, FocusedWindow)
+- `IpcCommand`: Commands sent from CLI to daemon (FocusLeft/Right/Up/Down, MoveColumnLeft/Right, FocusMonitorLeft/Right, MoveWindowToMonitorLeft/Right, Resize, Scroll, QueryWorkspace, QueryFocused, QueryAllWindows, Refresh, Apply, Reload, Stop)
+- `IpcResponse`: Responses from daemon (Ok, Error, WorkspaceState, FocusedWindow, WindowList)
+- `WindowInfo`: Detailed window information (ID, title, class, process, rect, floating status)
+- `IpcRect`: Window rectangle (x, y, width, height)
 - `PIPE_NAME`: Named pipe path (`\\.\pipe\openniri`)
 
 **Dependencies**: `serde`, `serde_json`, `thiserror`
@@ -121,39 +123,43 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 **Purpose**: Main process that orchestrates everything.
 
 **Responsibilities**:
-1. Initialize workspace state
+1. Initialize workspace state (with optional persistence restore)
 2. Enumerate existing windows on startup
-3. Install WinEvent hooks
+3. Install WinEvent hooks, hotkeys, and optional mouse/gesture hooks
 4. Run IPC server for CLI commands
-5. Process events and commands
-6. Trigger layout recalculation
+5. Process events and commands (window events, hotkeys, gestures, display changes)
+6. Trigger layout recalculation (with smooth animation)
 7. Apply placements via platform layer
+8. Manage system tray icon and menu
+9. Save workspace state on shutdown
 
 **Event Loop**:
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Event Loop                               │
-│                                                                  │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐     │
-│   │ Window Events│    │ IPC Commands │    │ Timer Events │     │
-│   │ (WinEvent)   │    │ (Named Pipe) │    │ (Animations) │     │
-│   └──────┬───────┘    └──────┬───────┘    └──────┬───────┘     │
-│          │                   │                   │              │
-│          └───────────────────┼───────────────────┘              │
-│                              ▼                                   │
-│                    ┌─────────────────┐                          │
-│                    │  Update State   │                          │
-│                    │  (Workspace)    │                          │
-│                    └────────┬────────┘                          │
-│                             ▼                                    │
-│                    ┌─────────────────┐                          │
-│                    │ Compute Layout  │                          │
-│                    └────────┬────────┘                          │
-│                             ▼                                    │
-│                    ┌─────────────────┐                          │
-│                    │Apply Placements │                          │
-│                    └─────────────────┘                          │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                           Event Loop                                  │
+│                                                                       │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌──────────────────┐  │
+│  │  Window     │ │   IPC      │ │   Timer    │ │  Other Events    │  │
+│  │  Events     │ │  Commands  │ │   Events   │ │  - Hotkeys       │  │
+│  │ (WinEvent)  │ │(Named Pipe)│ │(Animations)│ │  - Gestures      │  │
+│  └──────┬──────┘ └──────┬─────┘ └──────┬─────┘ │  - Tray Menu     │  │
+│         │               │              │        │  - Display Change│  │
+│         │               │              │        │  - Focus Follows │  │
+│         └───────────────┼──────────────┼────────┘    Mouse         │  │
+│                         ▼              │                             │
+│                ┌─────────────────┐     │                             │
+│                │  Update State   │◄────┘                             │
+│                │  (Workspace)    │                                    │
+│                └────────┬────────┘                                    │
+│                         ▼                                             │
+│                ┌─────────────────┐                                    │
+│                │ Compute Layout  │                                    │
+│                └────────┬────────┘                                    │
+│                         ▼                                             │
+│                ┌─────────────────┐                                    │
+│                │Apply Placements │                                    │
+│                └─────────────────┘                                    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Dependencies**: `tokio`, `openniri-core-layout`, `openniri-platform-win32`, `openniri-ipc`
@@ -164,35 +170,51 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 
 **Commands**:
 - `focus left|right|up|down`: Navigation
-- `scroll left|right`: Manual scrolling
+- `scroll <delta>`: Manual scrolling
 - `move left|right`: Move column
 - `resize --delta <N>`: Resize column
-- `query workspace|focused|placements`: State queries
+- `focus-monitor left|right`: Navigate between monitors
+- `move-to-monitor left|right`: Move window to adjacent monitor
+- `query workspace|focused|all`: State queries
+- `init [-o path] [--force]`: Generate default config
+- `refresh`: Re-enumerate windows
 - `reload`: Reload configuration
 - `stop`: Stop daemon
 
-**IPC Protocol**: JSON over named pipe `\\.\pipe\openniri`
+**IPC Protocol**: JSON over named pipe `\\.\pipe\openniri` (5s timeout)
 
 **Dependencies**: `clap`, `tokio`, `openniri-ipc`
 
 ---
 
 ## Current Status (Reality Check)
-- `openniri-core-layout` is implemented and unit-tested (79 tests).
-- `openniri-platform-win32` has real Win32 implementations (11 tests + 2 hardware-dependent):
+- `openniri-core-layout` is implemented and unit-tested (87 tests).
+- `openniri-platform-win32` has real Win32 implementations (13 tests + 2 hardware-dependent):
   - `enumerate_windows()` - Uses EnumWindows with filtering
   - `enumerate_monitors()` / `get_primary_monitor()` - Uses EnumDisplayMonitors
-  - `apply_placements()` - Uses DeferWindowPos for batched moves
+  - `apply_placements()` - Uses DeferWindowPos for batched moves, individual fallback
   - `cloak_window()` / `uncloak_window()` - Uses DwmSetWindowAttribute
-  - `install_event_hooks()` - WinEvent hooks for window lifecycle
+  - `hide_window()` - Supports Cloak and MoveOffScreen strategies via config
+  - `install_event_hooks()` - WinEvent hooks for window lifecycle (with catch_unwind)
   - `register_hotkeys()` - Global hotkey registration with reload support
-- `openniri-ipc` provides shared IPC types (10 tests).
-- `openniri-daemon` runs an async event loop with named pipe IPC server (11 tests):
-  - Configuration loading from TOML files
+  - `install_mouse_hook()` - Low-level mouse hook for focus-follows-mouse
+  - `register_gestures()` - Touchpad gesture detection via pointer input
+  - `set_display_change_sender()` - Monitor hotplug event forwarding
+  - `is_valid_window()` - HWND validation
+  - `get_process_executable()` - Process executable name lookup
+- `openniri-ipc` provides shared IPC types (13 tests).
+- `openniri-daemon` runs an async event loop with named pipe IPC server (44 tests + 17 integration):
+  - Configuration loading from TOML files with live reload
   - Global hotkey handling with live reload
-  - Smooth scroll animations (~60 FPS)
-  - Multi-monitor workspace support
-- `openniri-cli` sends IPC commands to the daemon and prints responses.
+  - Smooth scroll animations (~60 FPS) with easing functions
+  - Multi-monitor workspace support with display change handling
+  - Per-window floating rules (regex matching on class/title/executable)
+  - System tray icon with context menu
+  - Visual snap hints overlay
+  - Focus follows mouse with configurable delay
+  - Touchpad gesture support
+  - Workspace state persistence
+- `openniri-cli` sends IPC commands and prints formatted responses (28 tests).
 
 ---
 
@@ -211,24 +233,33 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 ---
 
 ## Planned vs Implemented (Gap Summary)
-- **Implemented**:
-  - Core layout engine with 79 unit tests
-  - IPC protocol crate with 10 unit tests
+- **Implemented** (202 tests total):
+  - Core layout engine (87 unit tests)
+  - IPC protocol crate (13 unit tests)
+  - CLI tool (28 unit tests)
+  - Daemon (44 unit tests + 17 integration tests)
+  - Platform layer (13 unit tests + 2 hardware-dependent)
   - Win32 enumeration with filtering (visible, non-tool, non-cloaked, non-system windows)
   - Monitor enumeration via EnumDisplayMonitors (dynamic viewport detection)
-  - Window positioning via DeferWindowPos batching
-  - DWM cloaking for off-screen windows
+  - Window positioning via DeferWindowPos batching (with individual fallback)
+  - DWM cloaking for off-screen windows (configurable via use_cloaking)
   - Async daemon with named pipe IPC server
-  - CLI sends real IPC commands and receives responses (with timeout)
-  - WinEvent hooks for real-time window tracking (create/destroy/focus/minimize/restore)
+  - CLI sends real IPC commands and receives responses (with 5s timeout)
+  - WinEvent hooks for real-time window tracking (with catch_unwind safety)
   - Configuration file support (TOML format) with live reload
   - Multi-monitor workspace support (one workspace per monitor)
   - Global hotkeys with configurable bindings and live reload
   - Smooth scroll animations (~60 FPS) with easing functions
-- **Pending**:
-  - Touchpad gesture support
-  - Per-window floating/rules
-- **Next Steps**: Add touchpad gesture support, implement per-window rules.
+  - Per-window floating/rules (regex matching, float/tile/ignore actions)
+  - System tray icon with context menu
+  - Visual snap hints (overlay window)
+  - Focus follows mouse (low-level mouse hook with debouncing)
+  - Display change detection and monitor reconciliation
+  - Touchpad gesture support (pointer input detection)
+  - Workspace state persistence (save/restore across restarts)
+  - HWND validation on window events
+  - catch_unwind in all Win32 callbacks
+- **All core features implemented.** Future work is polish and optimization.
 
 ## Data Flow
 
@@ -330,12 +361,21 @@ Viewport scrolling uses animated transitions:
 
 ## Threading Model
 
-- **Main Thread**: Event loop, IPC server
-- **WinEvent Callback**: Runs on Windows thread pool, posts to main thread
-- **Animation Loop**: Timer-based, runs on main thread
+- **Main Thread**: Tokio async event loop, IPC server, command processing
+- **WinEvent Callback**: Runs on Windows thread pool, posts to main thread via channel
+- **Hotkey Thread**: Dedicated message window for RegisterHotKey events
+- **Gesture Thread**: Dedicated message window for pointer input
+- **Mouse Hook Thread**: Low-level mouse hook for focus-follows-mouse
+- **Tray Event Thread**: Forwards tray menu clicks to main loop
+- **Animation Timer**: Tokio interval, ~60 FPS, on-demand start/stop
+
+All Win32 callbacks use `catch_unwind` to prevent panics from crossing FFI boundaries.
 
 ## Error Handling
 
 - Platform errors (Win32) are logged and may be recoverable
+- DeferWindowPos failures fall back to individual SetWindowPos calls
 - Layout errors should not occur with valid state
-- IPC errors result in disconnection, client can retry
+- IPC errors result in disconnection, client can retry (5s timeout)
+- Invalid window handles (HWND) are detected and events are skipped
+- Configuration parse errors fall back to defaults with warnings

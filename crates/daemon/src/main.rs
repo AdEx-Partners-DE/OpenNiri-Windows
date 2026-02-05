@@ -16,6 +16,7 @@ mod tray;
 use anyhow::Result;
 use config::Config;
 use openniri_core_layout::{Rect, Workspace};
+use serde::{Deserialize, Serialize};
 use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
 use openniri_platform_win32::{
     enumerate_monitors, enumerate_windows, find_monitor_for_rect, get_process_executable,
@@ -77,6 +78,26 @@ struct AppState {
     platform_config: PlatformConfig,
     /// User configuration.
     config: Config,
+}
+
+/// Snapshot of workspace state for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceSnapshot {
+    /// Monitor device name (stable across restarts, unlike MonitorId/HMONITOR).
+    monitor_device_name: String,
+    /// Saved workspace state.
+    workspace: Workspace,
+}
+
+/// Full daemon state snapshot for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateSnapshot {
+    /// Timestamp when state was saved.
+    saved_at: String,
+    /// Per-monitor workspace snapshots.
+    workspaces: Vec<WorkspaceSnapshot>,
+    /// Which monitor was focused (by device name).
+    focused_monitor_name: String,
 }
 
 impl AppState {
@@ -159,6 +180,121 @@ impl AppState {
         };
         self.config = config;
         info!("Configuration applied to all {} workspaces", self.workspaces.len());
+    }
+
+    /// Save current workspace state to disk.
+    fn save_state(&self) -> Result<()> {
+        let snapshots: Vec<WorkspaceSnapshot> = self
+            .workspaces
+            .iter()
+            .filter_map(|(monitor_id, workspace)| {
+                self.monitors.get(monitor_id).map(|monitor| WorkspaceSnapshot {
+                    monitor_device_name: monitor.device_name.clone(),
+                    workspace: workspace.clone(),
+                })
+            })
+            .collect();
+
+        let focused_name = self
+            .monitors
+            .get(&self.focused_monitor)
+            .map(|m| m.device_name.clone())
+            .unwrap_or_default();
+
+        let saved_at = {
+            let now = std::time::SystemTime::now();
+            match now.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => format!("{}", d.as_secs()),
+                Err(_) => "0".to_string(),
+            }
+        };
+
+        let snapshot = StateSnapshot {
+            saved_at,
+            workspaces: snapshots,
+            focused_monitor_name: focused_name,
+        };
+
+        let state_path = Self::state_file_path();
+        if let Some(parent) = state_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let json = serde_json::to_string_pretty(&snapshot)?;
+        std::fs::write(&state_path, json)?;
+        info!("Workspace state saved to {:?}", state_path);
+        Ok(())
+    }
+
+    /// Load saved workspace state from disk.
+    fn load_state() -> Option<StateSnapshot> {
+        let state_path = Self::state_file_path();
+        match std::fs::read_to_string(&state_path) {
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    warn!("Failed to parse saved state: {}", e);
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Get the path for the state file.
+    fn state_file_path() -> std::path::PathBuf {
+        directories::ProjectDirs::from("", "", "openniri")
+            .map(|dirs| dirs.data_dir().join("workspace-state.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("workspace-state.json"))
+    }
+
+    /// Restore workspace state from a saved snapshot.
+    ///
+    /// This should be called AFTER monitors are set up but BEFORE windows are enumerated.
+    /// It restores scroll offsets and focus positions. Actual windows will be
+    /// re-added during enumeration since window IDs from a previous session are invalid.
+    fn restore_state(&mut self, snapshot: &StateSnapshot) {
+        for ws_snapshot in &snapshot.workspaces {
+            // Find matching monitor by device name
+            let monitor_id = self
+                .monitors
+                .iter()
+                .find(|(_, m)| m.device_name == ws_snapshot.monitor_device_name)
+                .map(|(&id, _)| id);
+
+            if let Some(id) = monitor_id {
+                // Restore scroll offset from saved workspace
+                if let Some(workspace) = self.workspaces.get_mut(&id) {
+                    let saved_offset = ws_snapshot.workspace.scroll_offset();
+                    if saved_offset != 0.0 {
+                        let viewport_width = self
+                            .monitors
+                            .get(&id)
+                            .map(|m| m.work_area.width)
+                            .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+                        workspace.scroll_by(saved_offset, viewport_width);
+                    }
+                    info!(
+                        "Restored workspace state for monitor '{}'",
+                        ws_snapshot.monitor_device_name
+                    );
+                }
+            } else {
+                debug!(
+                    "Skipping saved workspace for unknown monitor '{}'",
+                    ws_snapshot.monitor_device_name
+                );
+            }
+        }
+
+        // Restore focused monitor
+        if let Some((&id, _)) = self
+            .monitors
+            .iter()
+            .find(|(_, m)| m.device_name == snapshot.focused_monitor_name)
+        {
+            self.focused_monitor = id;
+        }
     }
 
     /// Reconcile workspaces after monitor configuration change.
@@ -1272,6 +1408,15 @@ async fn main() -> Result<()> {
     // Initialize state with config and monitors
     let state = Arc::new(Mutex::new(AppState::new_with_config(config.clone(), monitors)));
 
+    // Try to restore saved workspace state (before enumerating windows)
+    {
+        let mut state = state.lock().await;
+        if let Some(snapshot) = AppState::load_state() {
+            state.restore_state(&snapshot);
+            info!("Restored workspace state from previous session");
+        }
+    }
+
     // Enumerate existing windows
     info!("Enumerating windows...");
     {
@@ -1733,6 +1878,13 @@ async fn main() -> Result<()> {
                     }
                     tray::TrayEvent::Exit => {
                         info!("Tray: Exit requested");
+                        // Save workspace state before exiting
+                        {
+                            let state = state.lock().await;
+                            if let Err(e) = state.save_state() {
+                                warn!("Failed to save workspace state on tray exit: {}", e);
+                            }
+                        }
                         break;
                     }
                 }
@@ -1786,6 +1938,13 @@ async fn main() -> Result<()> {
             }
             DaemonEvent::Shutdown => {
                 info!("Shutdown signal received");
+                // Save workspace state before shutting down
+                {
+                    let state = state.lock().await;
+                    if let Err(e) = state.save_state() {
+                        warn!("Failed to save workspace state: {}", e);
+                    }
+                }
                 break;
             }
         }
@@ -1964,5 +2123,54 @@ mod tests {
         state.apply_config(new_config.clone());
         assert_eq!(state.config.layout.gap, 20);
         assert_eq!(state.config.layout.outer_gap, 15);
+    }
+
+    #[test]
+    fn test_state_file_path() {
+        let path = AppState::state_file_path();
+        assert!(path.to_str().unwrap().contains("openniri"));
+        assert!(path.to_str().unwrap().ends_with("workspace-state.json"));
+    }
+
+    #[test]
+    fn test_state_snapshot_serialization() {
+        let snapshot = StateSnapshot {
+            saved_at: "2026-02-04T12:00:00".to_string(),
+            workspaces: vec![],
+            focused_monitor_name: "DISPLAY1".to_string(),
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.focused_monitor_name, "DISPLAY1");
+        assert!(parsed.workspaces.is_empty());
+    }
+
+    #[test]
+    fn test_workspace_snapshot_serialization() {
+        let workspace = Workspace::new();
+        let snapshot = WorkspaceSnapshot {
+            monitor_device_name: "DISPLAY1".to_string(),
+            workspace,
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let parsed: WorkspaceSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.monitor_device_name, "DISPLAY1");
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        // Create a snapshot and verify it roundtrips through serialization
+        let snapshot = StateSnapshot {
+            saved_at: "2026-02-04T12:00:00".to_string(),
+            workspaces: vec![WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY1".to_string(),
+                workspace: Workspace::with_gaps(10, 10),
+            }],
+            focused_monitor_name: "DISPLAY1".to_string(),
+        };
+        let json = serde_json::to_string_pretty(&snapshot).expect("serialize");
+        let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.workspaces.len(), 1);
+        assert_eq!(parsed.workspaces[0].monitor_device_name, "DISPLAY1");
     }
 }

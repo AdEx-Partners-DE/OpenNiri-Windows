@@ -1466,75 +1466,73 @@ pub enum GestureEvent {
     SwipeDown,
 }
 
-/// Threshold in pixels for detecting a swipe gesture.
-const GESTURE_THRESHOLD: i32 = 50;
+/// Wheel message constants (not all exposed by windows-rs).
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
 
-/// Gesture detection state.
-#[derive(Default)]
-struct GestureState {
-    /// Starting X position of the gesture
-    start_x: i32,
-    /// Starting Y position of the gesture
-    start_y: i32,
-    /// Whether a gesture is currently in progress
-    active: bool,
+/// Threshold for accumulated wheel delta before firing a gesture event.
+/// 3 * WHEEL_DELTA (120) = 360.
+const GESTURE_SCROLL_THRESHOLD: i32 = 360;
+
+/// Timeout in milliseconds: if no scroll event arrives within this window,
+/// accumulators are reset.
+const GESTURE_TIMEOUT_MS: u128 = 300;
+
+/// Gesture accumulator state for the low-level mouse hook.
+struct GestureAccumState {
+    /// Accumulated horizontal wheel delta.
+    accum_x: i32,
+    /// Accumulated vertical wheel delta.
+    accum_y: i32,
+    /// Timestamp of the last scroll event.
+    last_scroll_time: std::time::Instant,
 }
 
 /// Global sender for gesture events.
 static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
     std::sync::Mutex::new(None);
 
-/// Global gesture detection state.
-static GESTURE_STATE: std::sync::Mutex<GestureState> =
-    std::sync::Mutex::new(GestureState { start_x: 0, start_y: 0, active: false });
+/// Global gesture accumulator state.
+/// Initialized to `None`; `register_gestures()` sets it to `Some(...)`.
+static GESTURE_STATE: std::sync::Mutex<Option<GestureAccumState>> =
+    std::sync::Mutex::new(None);
 
 /// Handle for gesture detection.
 ///
-/// Dropping this handle will stop gesture detection.
+/// Dropping this handle will unhook the low-level mouse hook and stop
+/// gesture detection.
 pub struct GestureHandle {
-    hwnd: HWND,
-    thread: Option<std::thread::JoinHandle<()>>,
+    hook: HHOOK,
 }
 
 impl Drop for GestureHandle {
     fn drop(&mut self) {
-        // Signal the message loop to quit
         unsafe {
-            let _ = PostMessageW(
-                Some(self.hwnd),
-                WM_QUIT_HOTKEY_THREAD, // Reuse quit message
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
+            if !self.hook.is_invalid() {
+                let _ = UnhookWindowsHookEx(self.hook);
+            }
         }
 
-        // Wait for thread to finish
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-
-        // Clear the global sender
+        // Clear the global sender and state
         if let Ok(mut sender) = GESTURE_SENDER.lock() {
             *sender = None;
+        }
+        if let Ok(mut state) = GESTURE_STATE.lock() {
+            *state = None;
         }
 
         tracing::debug!("Gesture detection stopped");
     }
 }
 
-/// WM_POINTER message constants (not all exposed by windows-rs)
-const WM_POINTERDOWN: u32 = 0x0246;
-#[allow(dead_code)] // Reserved for future pointer tracking
-const WM_POINTERUPDATE: u32 = 0x0245;
-const WM_POINTERUP: u32 = 0x0247;
-
-/// Register for pointer input and start gesture detection.
+/// Register a low-level mouse hook for gesture detection via wheel events.
 ///
 /// Returns a handle that must be kept alive to receive gesture events,
 /// and a channel receiver for gesture events.
 ///
-/// Note: This uses a simplified approach - for production use, consider
-/// using the Windows Precision Touchpad gesture API or raw input.
+/// Touchpad scroll gestures are delivered as WM_MOUSEWHEEL (vertical) and
+/// WM_MOUSEHWHEEL (horizontal) messages. The hook accumulates wheel deltas
+/// and fires swipe events when the threshold is exceeded.
 pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent>), Win32Error> {
     // Create channel for events
     let (tx, rx) = mpsc::channel();
@@ -1552,155 +1550,90 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
         *sender = Some(tx);
     }
 
-    // Create the message window on a separate thread
-    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<isize, Win32Error>>();
-
-    let thread = std::thread::spawn(move || {
-        unsafe {
-            // Register window class for gesture detection
-            let class_name: Vec<u16> = "OpenNiriGestureClass\0".encode_utf16().collect();
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(gesture_window_proc),
-                lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
-                ..Default::default()
-            };
-            RegisterClassW(&wc);
-
-            // Create a transparent, click-through overlay window for gesture detection
-            // In practice, we'd use raw input or a low-level hook instead
-            let hwnd = CreateWindowExW(
-                Default::default(),
-                windows::core::PCWSTR(class_name.as_ptr()),
-                None,
-                Default::default(),
-                0, 0, 0, 0,
-                Some(HWND_MESSAGE),
-                None,
-                None,
-                None,
-            );
-
-            if hwnd.is_err() {
-                let _ = init_tx.send(Err(Win32Error::HookInstallFailed(
-                    "Failed to create gesture message window".to_string(),
-                )));
-                return;
-            }
-
-            let hwnd = hwnd.unwrap();
-            let hwnd_raw = hwnd.0 as isize;
-            let _ = init_tx.send(Ok(hwnd_raw));
-
-            // Message loop
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, Some(hwnd), 0, 0).as_bool() {
-                if msg.message == WM_QUIT_HOTKEY_THREAD {
-                    break;
-                }
-                let _ = DispatchMessageW(&msg);
-            }
-        }
-    });
-
-    // Wait for initialization
-    let hwnd_raw = init_rx
-        .recv()
-        .map_err(|_| Win32Error::HookInstallFailed("Gesture thread initialization failed".to_string()))??;
-
-    let hwnd = HWND(hwnd_raw as *mut c_void);
-
-    tracing::info!("Gesture detection registered");
-
-    Ok((
-        GestureHandle {
-            hwnd,
-            thread: Some(thread),
-        },
-        rx,
-    ))
-}
-
-/// Window procedure for gesture detection window.
-///
-/// Wrapped with catch_unwind to prevent panics from crashing the application.
-unsafe extern "system" fn gesture_window_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    // Wrap in catch_unwind to prevent panics from crashing
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        gesture_window_proc_inner(hwnd, msg, wparam, lparam)
-    }));
-
-    match result {
-        Ok(lresult) => lresult,
-        Err(e) => {
-            tracing::error!("Panic in gesture_window_proc: {:?}", e);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
+    // Initialize accumulator state
+    {
+        let mut state = GESTURE_STATE
+            .lock()
+            .map_err(|_| Win32Error::HookInstallFailed("Gesture state mutex poisoned".to_string()))?;
+        *state = Some(GestureAccumState {
+            accum_x: 0,
+            accum_y: 0,
+            last_scroll_time: std::time::Instant::now(),
+        });
     }
+
+    // Install low-level mouse hook
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(gesture_mouse_hook_proc),
+            None,
+            0,
+        )
+        .map_err(|e| Win32Error::HookInstallFailed(format!(
+            "SetWindowsHookExW for gesture hook failed: {}", e
+        )))?
+    };
+
+    tracing::info!("Gesture detection registered (low-level mouse hook)");
+
+    Ok((GestureHandle { hook }, rx))
 }
 
-/// Inner implementation of gesture window procedure.
-fn gesture_window_proc_inner(
-    hwnd: HWND,
-    msg: u32,
+/// Low-level mouse hook callback for gesture detection.
+///
+/// Handles WM_MOUSEWHEEL and WM_MOUSEHWHEEL to accumulate scroll deltas
+/// and fire swipe gesture events when the threshold is exceeded.
+unsafe extern "system" fn gesture_mouse_hook_proc(
+    ncode: i32,
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    let _ = wparam; // Unused in current implementation
-    match msg {
-        WM_POINTERDOWN => {
-            // Extract pointer position
-            let x = (lparam.0 as i32) & 0xFFFF;
-            let y = ((lparam.0 as i32) >> 16) & 0xFFFF;
+    if ncode >= 0 {
+        let msg = wparam.0 as u32;
+        if msg == WM_MOUSEHWHEEL || msg == WM_MOUSEWHEEL {
+            let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            // The high word of mouseData contains the wheel delta (signed).
+            let delta = (mouse_struct.mouseData >> 16) as i16 as i32;
 
-            if let Ok(mut state) = GESTURE_STATE.lock() {
-                state.start_x = x;
-                state.start_y = y;
-                state.active = true;
-            }
+            if let Ok(mut state_guard) = GESTURE_STATE.lock() {
+                if let Some(state) = state_guard.as_mut() {
+                    let now = std::time::Instant::now();
 
-            windows::Win32::Foundation::LRESULT(0)
-        }
-        WM_POINTERUP => {
-            if let Ok(mut state) = GESTURE_STATE.lock() {
-                if state.active {
-                    // Extract end position
-                    let x = (lparam.0 as i32) & 0xFFFF;
-                    let y = ((lparam.0 as i32) >> 16) & 0xFFFF;
+                    // Reset accumulators if timeout exceeded
+                    if now.duration_since(state.last_scroll_time).as_millis() > GESTURE_TIMEOUT_MS {
+                        state.accum_x = 0;
+                        state.accum_y = 0;
+                    }
+                    state.last_scroll_time = now;
 
-                    let delta_x = x - state.start_x;
-                    let delta_y = y - state.start_y;
-
-                    // Detect swipe direction
-                    let gesture = if delta_x.abs() > delta_y.abs() {
-                        // Horizontal swipe
-                        if delta_x.abs() > GESTURE_THRESHOLD {
-                            if delta_x < 0 {
-                                Some(GestureEvent::SwipeLeft)
-                            } else {
-                                Some(GestureEvent::SwipeRight)
-                            }
-                        } else {
-                            None
-                        }
+                    if msg == WM_MOUSEHWHEEL {
+                        state.accum_x += delta;
                     } else {
-                        // Vertical swipe
-                        if delta_y.abs() > GESTURE_THRESHOLD {
-                            if delta_y < 0 {
-                                Some(GestureEvent::SwipeUp)
-                            } else {
-                                Some(GestureEvent::SwipeDown)
-                            }
+                        state.accum_y += delta;
+                    }
+
+                    // Check thresholds and determine gesture
+                    let gesture = if state.accum_x.abs() >= GESTURE_SCROLL_THRESHOLD {
+                        let g = if state.accum_x > 0 {
+                            GestureEvent::SwipeRight
                         } else {
-                            None
-                        }
+                            GestureEvent::SwipeLeft
+                        };
+                        state.accum_x = 0;
+                        Some(g)
+                    } else if state.accum_y.abs() >= GESTURE_SCROLL_THRESHOLD {
+                        let g = if state.accum_y > 0 {
+                            GestureEvent::SwipeDown
+                        } else {
+                            GestureEvent::SwipeUp
+                        };
+                        state.accum_y = 0;
+                        Some(g)
+                    } else {
+                        None
                     };
 
-                    // Send gesture event
                     if let Some(event) = gesture {
                         if let Ok(sender_guard) = GESTURE_SENDER.lock() {
                             if let Some(sender) = sender_guard.as_ref() {
@@ -1708,15 +1641,12 @@ fn gesture_window_proc_inner(
                             }
                         }
                     }
-
-                    state.active = false;
                 }
             }
-
-            windows::Win32::Foundation::LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+
+    CallNextHookEx(None, ncode, wparam, lparam)
 }
 
 // ============================================================================

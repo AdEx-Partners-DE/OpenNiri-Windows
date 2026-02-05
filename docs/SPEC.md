@@ -224,11 +224,44 @@ All configuration fields are accessed via getters and modified via setters that 
 - `default_column_width()` / `set_default_column_width(px)`: Default width for new columns (clamped to >= 100)
 - `centering_mode()` / `set_centering_mode(mode)`: `Center` or `JustInView`
 
-### Per-Window Overrides (Future)
+### Per-Window Rules
 
-- Floating windows
-- Forced column width
-- Stack position preference
+Window rules allow per-window behavior overrides based on class name, title, or executable:
+
+**Actions**:
+- `float` — Window floats outside the tiling strip (optional width/height)
+- `tile` — Default tiling behavior
+- `ignore` — Window is not managed
+
+**Matching**:
+- `match_class` — Regex match on window class name (case-sensitive)
+- `match_title` — Regex match on window title (case-sensitive)
+- `match_executable` — Case-insensitive match on executable name
+
+Multiple rules are evaluated in order; first match wins.
+
+```toml
+[[window_rules]]
+match_class = "Notepad"
+action = "float"
+width = 800
+height = 600
+
+[[window_rules]]
+match_executable = "spotify.exe"
+action = "float"
+
+[[window_rules]]
+match_class = "#32770"
+action = "ignore"
+```
+
+### Floating Windows
+
+Floating windows are positioned independently of the tiling strip:
+- Maintain their own position and size
+- Can overlap tiled windows
+- Default to centered 800x600 if no dimensions specified in rule
 
 ---
 
@@ -294,7 +327,84 @@ Viewport scrolling uses smooth animations for better visual feedback.
 
 ---
 
-## Implementation Gaps vs Intended Behavior
-- **Implemented**: Core layout (79 tests), IPC protocol (10 tests), Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations.
-- **Pending**: Touchpad gesture support, per-window floating/rules.
-- Touchpad gesture input is planned but not implemented; current flow is keyboard/CLI oriented.
+## System Tray
+
+The daemon displays a system tray icon with a context menu:
+- **Refresh Windows**: Re-enumerate and re-tile all windows
+- **Reload Config**: Reload configuration from disk
+- **Exit**: Gracefully shut down the daemon
+
+The tray icon uses a procedurally generated blue/green checkerboard icon representing tiling.
+
+---
+
+## Visual Snap Hints
+
+When resizing columns, an overlay window can display the column boundary:
+
+```toml
+[snap_hints]
+enabled = true
+duration_ms = 200
+opacity = 128
+```
+
+The overlay is a transparent, click-through layered window (WS_EX_LAYERED | WS_EX_TRANSPARENT) that auto-hides after the configured duration.
+
+---
+
+## Focus Follows Mouse
+
+When enabled, moving the mouse over a managed window automatically focuses it after a configurable delay:
+
+```toml
+[behavior]
+focus_follows_mouse = true
+focus_follows_mouse_delay_ms = 100
+```
+
+Uses a low-level mouse hook (WH_MOUSE_LL) to track mouse position. Rapid movements are debounced using the configured delay.
+
+---
+
+## Touchpad Gesture Support
+
+Touchpad gestures provide a natural way to navigate the scrollable strip:
+
+```toml
+[gestures]
+enabled = true
+swipe_left = "focus_left"
+swipe_right = "focus_right"
+swipe_up = "focus_up"
+swipe_down = "focus_down"
+```
+
+- Horizontal touchpad scroll maps to workspace strip scrolling
+- Discrete swipe gestures (threshold-based) map to configurable commands
+- Disabled by default
+
+---
+
+## Display Change Handling
+
+When monitors are connected/disconnected:
+1. The daemon receives `WM_DISPLAYCHANGE` events
+2. Monitors are re-enumerated
+3. `reconcile_monitors()` migrates windows between workspaces as needed
+4. New monitors get empty workspaces; orphaned windows move to the primary monitor
+
+---
+
+## Workspace Persistence
+
+Window layout state can be saved and restored across daemon restarts:
+- Layout structure (columns, window order, scroll offset) saved to `%APPDATA%/openniri/workspace-state.json`
+- On startup, windows are matched to persisted positions by class name and executable
+- Auto-saves on daemon shutdown
+
+---
+
+## Implementation Status
+- **Implemented (202 tests)**: Core layout engine (87 tests), IPC protocol (13 tests), CLI (28 tests), daemon (44 tests), integration tests (17 tests), platform layer (13 tests). Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations, per-window floating/rules, system tray, visual snap hints, focus follows mouse, display change handling, touchpad gesture support, workspace persistence.
+- **All major features implemented.** Remaining work is polish, testing, and documentation.
