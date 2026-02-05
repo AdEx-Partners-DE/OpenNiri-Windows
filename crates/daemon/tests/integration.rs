@@ -430,3 +430,42 @@ fn test_unknown_response_type() {
     let result: Result<IpcResponse, _> = serde_json::from_str(json);
     assert!(result.is_err());
 }
+
+// ============================================================================
+// IPC Robustness Tests
+// ============================================================================
+
+#[test]
+fn test_empty_message_is_not_valid_command() {
+    let result: Result<IpcCommand, _> = serde_json::from_str("");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_binary_garbage_is_not_valid_command() {
+    let garbage = "\x00\x01\x02\x7f";
+    let result: Result<IpcCommand, _> = serde_json::from_str(garbage);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_partial_json_is_not_valid_command() {
+    let partial = r#"{"FocusLeft":"#;
+    let result: Result<IpcCommand, _> = serde_json::from_str(partial);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_oversized_payload_would_fail_parse() {
+    // A string larger than MAX_IPC_MESSAGE_SIZE won't be a valid command
+    let huge = "x".repeat(openniri_ipc::MAX_IPC_MESSAGE_SIZE + 1);
+    let result: Result<IpcCommand, _> = serde_json::from_str(&huge);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_max_ipc_message_size_accessible() {
+    // Verify the constant is accessible and reasonable
+    const { assert!(openniri_ipc::MAX_IPC_MESSAGE_SIZE >= 1024) };
+    const { assert!(openniri_ipc::MAX_IPC_MESSAGE_SIZE <= 1024 * 1024) };
+}

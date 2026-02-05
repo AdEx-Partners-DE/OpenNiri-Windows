@@ -109,6 +109,14 @@ pub struct AppearanceConfig {
     /// Whether to use batched window positioning (DeferWindowPos).
     #[serde(default = "default_true")]
     pub use_deferred_positioning: bool,
+
+    /// Whether to highlight the active window border (Windows 11+).
+    #[serde(default = "default_true")]
+    pub active_border: bool,
+
+    /// Active window border color as hex RGB (e.g., "4285F4").
+    #[serde(default = "default_active_border_color")]
+    pub active_border_color: String,
 }
 
 impl Default for AppearanceConfig {
@@ -116,6 +124,8 @@ impl Default for AppearanceConfig {
         Self {
             use_cloaking: true,
             use_deferred_positioning: true,
+            active_border: true,
+            active_border_color: default_active_border_color(),
         }
     }
 }
@@ -192,6 +202,10 @@ fn default_focus_delay() -> u32 {
     100
 }
 
+fn default_active_border_color() -> String {
+    "4285F4".to_string()
+}
+
 // ============================================================================
 // Window Rules
 // ============================================================================
@@ -261,6 +275,10 @@ impl WindowRule {
     ///
     /// All specified match criteria must match for the rule to apply.
     /// If no match criteria are specified, the rule matches nothing.
+    ///
+    /// Note: Runtime code uses `CompiledWindowRule::matches()` for efficiency.
+    /// This method is retained for tests and direct use.
+    #[allow(dead_code)]
     pub fn matches(&self, class_name: &str, title: &str, executable: &str) -> bool {
         let has_any_criteria = self.match_class.is_some()
             || self.match_title.is_some()
@@ -353,6 +371,18 @@ impl Default for HotkeyConfig {
         // Utility
         bindings.insert("Win+R".to_string(), "refresh".to_string());
 
+        // Close focused window
+        bindings.insert("Win+Shift+Q".to_string(), "close_window".to_string());
+        // Toggle floating
+        bindings.insert("Win+F".to_string(), "toggle_floating".to_string());
+        // Toggle fullscreen
+        bindings.insert("Win+Shift+F".to_string(), "toggle_fullscreen".to_string());
+        // Column width presets
+        bindings.insert("Win+1".to_string(), "width_third".to_string());
+        bindings.insert("Win+2".to_string(), "width_half".to_string());
+        bindings.insert("Win+3".to_string(), "width_two_thirds".to_string());
+        bindings.insert("Win+0".to_string(), "equalize_widths".to_string());
+
         Self { bindings }
     }
 }
@@ -364,7 +394,7 @@ impl Default for HotkeyConfig {
 #[serde(default)]
 pub struct GestureConfig {
     /// Whether gesture support is enabled.
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Command for three-finger swipe left.
@@ -407,7 +437,7 @@ fn default_swipe_down() -> String {
 impl Default for GestureConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             swipe_left: default_swipe_left(),
             swipe_right: default_swipe_right(),
             swipe_up: default_swipe_up(),
@@ -424,7 +454,7 @@ impl Default for GestureConfig {
 #[serde(default)]
 pub struct SnapHintConfig {
     /// Whether snap hints are enabled.
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Duration to show hints in milliseconds.
@@ -447,10 +477,67 @@ fn default_hint_opacity() -> u8 {
 impl Default for SnapHintConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             duration_ms: default_hint_duration(),
             opacity: default_hint_opacity(),
         }
+    }
+}
+
+/// A warning generated during config validation.
+#[derive(Debug, Clone)]
+pub struct ConfigWarning {
+    pub field: String,
+    pub message: String,
+}
+
+/// A window rule with pre-compiled regex patterns for efficient matching.
+#[derive(Debug, Clone)]
+pub struct CompiledWindowRule {
+    /// Pre-compiled regex for class name matching.
+    pub class_regex: Option<regex::Regex>,
+    /// Pre-compiled regex for title matching.
+    pub title_regex: Option<regex::Regex>,
+    /// Executable name to match (case-insensitive string comparison).
+    pub match_executable: Option<String>,
+    /// Action to take when the rule matches.
+    pub action: WindowAction,
+    /// Fixed width for floating windows (optional).
+    pub width: Option<i32>,
+    /// Fixed height for floating windows (optional).
+    pub height: Option<i32>,
+}
+
+impl CompiledWindowRule {
+    /// Check if this compiled rule matches a window.
+    pub fn matches(&self, class_name: &str, title: &str, executable: &str) -> bool {
+        let has_any_criteria = self.class_regex.is_some()
+            || self.title_regex.is_some()
+            || self.match_executable.is_some();
+
+        if !has_any_criteria {
+            return false;
+        }
+
+        if let Some(ref re) = self.class_regex {
+            if !re.is_match(class_name) {
+                return false;
+            }
+        }
+
+        if let Some(ref re) = self.title_regex {
+            if !re.is_match(title) {
+                return false;
+            }
+        }
+
+        if let Some(ref exe) = self.match_executable {
+            if !executable.eq_ignore_ascii_case(exe) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -477,6 +564,13 @@ pub fn parse_command(cmd: &str) -> Option<openniri_ipc::IpcCommand> {
         "scroll_right" => Some(IpcCommand::Scroll { delta: 100.0 }),
         "refresh" => Some(IpcCommand::Refresh),
         "reload" => Some(IpcCommand::Reload),
+        "close_window" => Some(IpcCommand::CloseWindow),
+        "toggle_floating" => Some(IpcCommand::ToggleFloating),
+        "toggle_fullscreen" => Some(IpcCommand::ToggleFullscreen),
+        "width_third" => Some(IpcCommand::SetColumnWidth { fraction: 0.333 }),
+        "width_half" => Some(IpcCommand::SetColumnWidth { fraction: 0.5 }),
+        "width_two_thirds" => Some(IpcCommand::SetColumnWidth { fraction: 0.667 }),
+        "equalize_widths" => Some(IpcCommand::EqualizeColumnWidths),
         _ => None,
     }
 }
@@ -502,6 +596,139 @@ impl Config {
 
         tracing::info!("No config file found, using defaults");
         Ok(Self::default())
+    }
+
+    /// Validate configuration values, clamping out-of-range fields and returning warnings.
+    pub fn validate(&mut self) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+
+        // gap must be >= 0
+        if self.layout.gap < 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.gap".to_string(),
+                message: format!("Negative gap ({}) clamped to 0", self.layout.gap),
+            });
+            self.layout.gap = 0;
+        }
+
+        // outer_gap must be >= 0
+        if self.layout.outer_gap < 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.outer_gap".to_string(),
+                message: format!("Negative outer_gap ({}) clamped to 0", self.layout.outer_gap),
+            });
+            self.layout.outer_gap = 0;
+        }
+
+        // min_column_width must be <= max_column_width
+        if self.layout.min_column_width > self.layout.max_column_width {
+            warnings.push(ConfigWarning {
+                field: "layout.min_column_width / layout.max_column_width".to_string(),
+                message: format!(
+                    "min_column_width ({}) > max_column_width ({}), swapping",
+                    self.layout.min_column_width, self.layout.max_column_width
+                ),
+            });
+            std::mem::swap(
+                &mut self.layout.min_column_width,
+                &mut self.layout.max_column_width,
+            );
+        }
+
+        // default_column_width must be in [min, max]
+        if self.layout.default_column_width < self.layout.min_column_width
+            || self.layout.default_column_width > self.layout.max_column_width
+        {
+            let clamped = self.layout.default_column_width.clamp(
+                self.layout.min_column_width,
+                self.layout.max_column_width,
+            );
+            warnings.push(ConfigWarning {
+                field: "layout.default_column_width".to_string(),
+                message: format!(
+                    "default_column_width ({}) outside [{}, {}], clamped to {}",
+                    self.layout.default_column_width,
+                    self.layout.min_column_width,
+                    self.layout.max_column_width,
+                    clamped,
+                ),
+            });
+            self.layout.default_column_width = clamped;
+        }
+
+        // focus_follows_mouse_delay_ms must be >= 50 when enabled
+        if self.behavior.focus_follows_mouse && self.behavior.focus_follows_mouse_delay_ms < 50 {
+            warnings.push(ConfigWarning {
+                field: "behavior.focus_follows_mouse_delay_ms".to_string(),
+                message: format!(
+                    "focus_follows_mouse_delay_ms ({}) below minimum 50, clamped to 50",
+                    self.behavior.focus_follows_mouse_delay_ms
+                ),
+            });
+            self.behavior.focus_follows_mouse_delay_ms = 50;
+        }
+
+        // snap_hints.duration_ms must be >= 50 when enabled
+        if self.snap_hints.enabled && self.snap_hints.duration_ms < 50 {
+            warnings.push(ConfigWarning {
+                field: "snap_hints.duration_ms".to_string(),
+                message: format!(
+                    "snap_hints.duration_ms ({}) below minimum 50, clamped to 50",
+                    self.snap_hints.duration_ms
+                ),
+            });
+            self.snap_hints.duration_ms = 50;
+        }
+
+        warnings
+    }
+
+    /// Compile window rules into pre-compiled regex patterns for efficient matching.
+    ///
+    /// Invalid regex patterns are logged as warnings and their rules are skipped.
+    pub fn compile_window_rules(&self) -> Vec<CompiledWindowRule> {
+        let mut compiled = Vec::new();
+
+        for rule in &self.window_rules {
+            let class_regex = match &rule.match_class {
+                Some(pattern) => match regex::Regex::new(pattern) {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Invalid regex in window rule match_class '{}': {}. Skipping rule.",
+                            pattern, e
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            let title_regex = match &rule.match_title {
+                Some(pattern) => match regex::Regex::new(pattern) {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Invalid regex in window rule match_title '{}': {}. Skipping rule.",
+                            pattern, e
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            compiled.push(CompiledWindowRule {
+                class_regex,
+                title_regex,
+                match_executable: rule.match_executable.clone(),
+                action: rule.action,
+                width: rule.width,
+                height: rule.height,
+            });
+        }
+
+        compiled
     }
 
     /// Load configuration from a specific path.
@@ -801,7 +1028,7 @@ mod tests {
     #[test]
     fn test_snap_hint_config_default() {
         let config = SnapHintConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.duration_ms, 200);
         assert_eq!(config.opacity, 128);
     }
@@ -1031,5 +1258,148 @@ mod tests {
 
         assert_eq!(config.window_rules[1].width, None);
         assert_eq!(config.window_rules[1].height, Some(800));
+    }
+
+    // =========================================================================
+    // Config Validation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_negative_gap_clamped() {
+        let mut config = Config::default();
+        config.layout.gap = -5;
+        let warnings = config.validate();
+        assert_eq!(config.layout.gap, 0);
+        assert!(warnings.iter().any(|w| w.field == "layout.gap"));
+    }
+
+    #[test]
+    fn test_validate_negative_outer_gap_clamped() {
+        let mut config = Config::default();
+        config.layout.outer_gap = -10;
+        let warnings = config.validate();
+        assert_eq!(config.layout.outer_gap, 0);
+        assert!(warnings.iter().any(|w| w.field == "layout.outer_gap"));
+    }
+
+    #[test]
+    fn test_validate_min_gt_max_swapped() {
+        let mut config = Config::default();
+        config.layout.min_column_width = 2000;
+        config.layout.max_column_width = 500;
+        let warnings = config.validate();
+        assert_eq!(config.layout.min_column_width, 500);
+        assert_eq!(config.layout.max_column_width, 2000);
+        assert!(warnings.iter().any(|w| w.field.contains("min_column_width")));
+    }
+
+    #[test]
+    fn test_validate_default_width_outside_range_clamped() {
+        let mut config = Config::default();
+        config.layout.min_column_width = 600;
+        config.layout.max_column_width = 1000;
+        config.layout.default_column_width = 1500; // above max
+        let warnings = config.validate();
+        assert_eq!(config.layout.default_column_width, 1000);
+        assert!(warnings.iter().any(|w| w.field == "layout.default_column_width"));
+    }
+
+    #[test]
+    fn test_validate_focus_delay_below_min_clamped() {
+        let mut config = Config::default();
+        config.behavior.focus_follows_mouse = true;
+        config.behavior.focus_follows_mouse_delay_ms = 10;
+        let warnings = config.validate();
+        assert_eq!(config.behavior.focus_follows_mouse_delay_ms, 50);
+        assert!(warnings.iter().any(|w| w.field == "behavior.focus_follows_mouse_delay_ms"));
+    }
+
+    #[test]
+    fn test_validate_snap_duration_below_min_clamped() {
+        let mut config = Config::default();
+        config.snap_hints.enabled = true;
+        config.snap_hints.duration_ms = 20;
+        let warnings = config.validate();
+        assert_eq!(config.snap_hints.duration_ms, 50);
+        assert!(warnings.iter().any(|w| w.field == "snap_hints.duration_ms"));
+    }
+
+    #[test]
+    fn test_validate_valid_config_no_warnings() {
+        let mut config = Config::default();
+        let warnings = config.validate();
+        assert!(warnings.is_empty(), "Default config should produce no warnings, got: {:?}", warnings);
+    }
+
+    // =========================================================================
+    // Compiled Window Rule Tests
+    // =========================================================================
+
+    #[test]
+    fn test_compiled_window_rule_matches() {
+        let config = Config {
+            window_rules: vec![
+                WindowRule {
+                    match_class: Some("Chrome.*".to_string()),
+                    match_title: Some(".*YouTube.*".to_string()),
+                    match_executable: None,
+                    action: WindowAction::Float,
+                    width: Some(1024),
+                    height: Some(768),
+                },
+                WindowRule {
+                    match_class: None,
+                    match_title: None,
+                    match_executable: Some("notepad.exe".to_string()),
+                    action: WindowAction::Tile,
+                    width: None,
+                    height: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let compiled = config.compile_window_rules();
+        assert_eq!(compiled.len(), 2);
+
+        // First rule: class + title regex
+        assert!(compiled[0].matches("Chrome_WidgetWin_1", "YouTube - Google Chrome", "chrome.exe"));
+        assert!(!compiled[0].matches("Firefox", "YouTube", "firefox.exe")); // class doesn't match
+        assert!(!compiled[0].matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe")); // title doesn't match
+
+        // Second rule: executable only
+        assert!(compiled[1].matches("AnyClass", "Any Title", "notepad.exe"));
+        assert!(compiled[1].matches("AnyClass", "Any Title", "NOTEPAD.EXE")); // case insensitive
+        assert!(!compiled[1].matches("AnyClass", "Any Title", "wordpad.exe"));
+    }
+
+    #[test]
+    fn test_compiled_window_rule_invalid_regex_skipped() {
+        let config = Config {
+            window_rules: vec![
+                WindowRule {
+                    match_class: Some("[invalid(regex".to_string()), // Invalid regex
+                    match_title: None,
+                    match_executable: None,
+                    action: WindowAction::Float,
+                    width: None,
+                    height: None,
+                },
+                WindowRule {
+                    match_class: Some("ValidClass".to_string()),
+                    match_title: None,
+                    match_executable: None,
+                    action: WindowAction::Tile,
+                    width: None,
+                    height: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let compiled = config.compile_window_rules();
+        // First rule should be skipped due to invalid regex
+        assert_eq!(compiled.len(), 1);
+        assert!(compiled[0].matches("ValidClass", "Any Title", "any.exe"));
     }
 }

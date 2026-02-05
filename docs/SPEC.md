@@ -286,6 +286,11 @@ Hotkeys are specified as strings: `Modifier+Modifier+Key`
 | Win+Ctrl+H/L | Resize shrink/grow |
 | Win+Alt+H/L | Focus monitor left/right |
 | Win+Alt+Shift+H/L | Move window to monitor left/right |
+| Win+Shift+Q | Close focused window |
+| Win+F | Toggle floating |
+| Win+Shift+F | Toggle fullscreen |
+| Win+1/2/3 | Set column width preset |
+| Win+0 | Equalize column widths |
 | Win+R | Refresh (re-enumerate windows) |
 
 ### Live Reload
@@ -330,8 +335,11 @@ Viewport scrolling uses smooth animations for better visual feedback.
 ## System Tray
 
 The daemon displays a system tray icon with a context menu:
+- **Pause/Resume**: Pause or resume tiling management
 - **Refresh Windows**: Re-enumerate and re-tile all windows
 - **Reload Config**: Reload configuration from disk
+- **Open Config**: Open the configuration file in the default editor
+- **View Logs**: Open the log directory
 - **Exit**: Gracefully shut down the daemon
 
 The tray icon uses a procedurally generated blue/green checkerboard icon representing tiling.
@@ -410,5 +418,5 @@ Workspace scroll offsets and focus state can be saved and restored across daemon
 ---
 
 ## Implementation Status
-- **Implemented (206 tests)**: Core layout engine (87 tests), IPC protocol (13 tests), CLI (28 tests), daemon (48 tests), integration tests (17 tests), platform layer (13 tests). Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations, per-window floating/rules, system tray, visual snap hints, focus follows mouse, display change handling, touchpad gesture support, workspace persistence.
+- **Implemented (302 tests — 297 passing, 5 ignored)**: Core layout engine (99 tests), IPC protocol (15 tests), CLI (38 tests), daemon (99 tests, 1 ignored), integration tests (22 tests), platform layer (24 tests, 3 ignored), doc-tests (1 ignored). Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations, per-window floating/rules, system tray (Pause, Open Config, View Logs), visual snap hints (enabled by default), focus follows mouse, display change handling, touchpad gesture support (enabled by default), workspace persistence, SetForegroundWindow for actual focus changes, CloseWindow command (Win+Shift+Q), ToggleFloating command (Win+F), ToggleFullscreen command (Win+Shift+F), SetColumnWidth presets (Win+1/2/3) and EqualizeColumnWidths (Win+0), active window border (DWM), QueryStatus command, owner-window filtering (dialog windows not tiled), auto-start via Registry, Ctrl+C shutdown handling, managed-window uncloak on shutdown, panic-hook emergency uncloak, and DPI awareness initialization.
 - **All major features implemented.** Remaining work is polish, testing, and documentation.

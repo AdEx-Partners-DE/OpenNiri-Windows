@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Named pipe path for IPC communication.
 pub const PIPE_NAME: &str = r"\\.\pipe\openniri";
 
+/// Maximum IPC message size (64 KiB). Messages larger than this are rejected.
+pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024;
+
 /// Rectangle for IPC serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcRect {
@@ -104,6 +107,22 @@ pub enum IpcCommand {
 
     /// Query detailed information about all managed windows.
     QueryAllWindows,
+
+    /// Close the focused window.
+    CloseWindow,
+    /// Toggle floating state for the focused window.
+    ToggleFloating,
+    /// Toggle fullscreen for the focused window.
+    ToggleFullscreen,
+    /// Set the focused column width as a fraction of the viewport.
+    SetColumnWidth {
+        /// Fraction of viewport width (e.g., 0.333, 0.5, 0.667).
+        fraction: f64,
+    },
+    /// Equalize all column widths.
+    EqualizeColumnWidths,
+    /// Query daemon status information.
+    QueryStatus,
 }
 
 /// Responses from the daemon to the CLI.
@@ -152,6 +171,18 @@ pub enum IpcResponse {
     FocusedWindowInfo {
         /// The focused window's info, if any.
         window: Option<WindowInfo>,
+    },
+
+    /// Daemon status information.
+    StatusInfo {
+        /// Daemon version.
+        version: String,
+        /// Number of monitors.
+        monitors: usize,
+        /// Total managed windows across all workspaces.
+        total_windows: usize,
+        /// Daemon uptime in seconds.
+        uptime_seconds: u64,
     },
 }
 
@@ -252,6 +283,13 @@ mod tests {
             IpcCommand::Apply,
             IpcCommand::Reload,
             IpcCommand::Stop,
+            IpcCommand::CloseWindow,
+            IpcCommand::ToggleFloating,
+            IpcCommand::ToggleFullscreen,
+            IpcCommand::SetColumnWidth { fraction: 0.5 },
+            IpcCommand::SetColumnWidth { fraction: 0.333 },
+            IpcCommand::EqualizeColumnWidths,
+            IpcCommand::QueryStatus,
         ];
 
         for cmd in commands {
@@ -323,6 +361,12 @@ mod tests {
             },
             IpcResponse::FocusedWindowInfo {
                 window: None,
+            },
+            IpcResponse::StatusInfo {
+                version: "0.1.0".to_string(),
+                monitors: 2,
+                total_windows: 5,
+                uptime_seconds: 3600,
             },
         ];
 
@@ -432,5 +476,17 @@ mod tests {
         // Verify pipe name follows Windows named pipe convention
         assert!(PIPE_NAME.starts_with(r"\\.\pipe\"));
         assert_eq!(PIPE_NAME, r"\\.\pipe\openniri");
+    }
+
+    #[test]
+    fn test_max_message_size_defined() {
+        const { assert!(MAX_IPC_MESSAGE_SIZE > 0) };
+    }
+
+    #[test]
+    fn test_max_message_size_reasonable() {
+        // Between 1 KiB and 1 MiB
+        const { assert!(MAX_IPC_MESSAGE_SIZE >= 1024) };
+        const { assert!(MAX_IPC_MESSAGE_SIZE <= 1024 * 1024) };
     }
 }

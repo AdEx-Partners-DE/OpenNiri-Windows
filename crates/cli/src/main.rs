@@ -9,14 +9,17 @@ use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use openniri_ipc::{IpcCommand, IpcResponse, PIPE_NAME};
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ClientOptions;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 /// Connection timeout for IPC commands.
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const RUN_WAIT_DEFAULT_MS: u64 = 5000;
 
 #[derive(Parser)]
 #[command(name = "openniri-cli")]
@@ -70,6 +73,15 @@ enum Commands {
     Apply,
     /// Reload configuration from file
     Reload,
+    /// Start daemon (if needed) and apply layout once
+    Run {
+        /// Skip applying layout after the daemon is ready
+        #[arg(long)]
+        no_apply: bool,
+        /// How long to wait for the daemon to become ready (milliseconds)
+        #[arg(long, default_value_t = RUN_WAIT_DEFAULT_MS)]
+        wait_ms: u64,
+    },
     /// Generate default configuration file
     Init {
         /// Output path (default: %APPDATA%/openniri/config/config.toml)
@@ -81,6 +93,27 @@ enum Commands {
     },
     /// Stop the daemon
     Stop,
+    /// Close the focused window
+    CloseWindow,
+    /// Toggle floating for the focused window
+    ToggleFloating,
+    /// Toggle fullscreen for the focused window
+    ToggleFullscreen,
+    /// Set the focused column width
+    SetWidth {
+        /// Width as fraction of viewport (e.g., 0.333, 0.5, 0.667)
+        #[arg(short, long)]
+        fraction: f64,
+    },
+    /// Equalize all column widths
+    EqualizeWidths,
+    /// Query daemon status
+    Status,
+    /// Manage auto-start on login
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +170,14 @@ enum QueryType {
     All,
 }
 
+#[derive(Subcommand)]
+enum AutostartAction {
+    /// Enable auto-start on login
+    Enable,
+    /// Disable auto-start on login
+    Disable,
+}
+
 /// Convert CLI command to IPC command.
 fn to_ipc_command(cmd: &Commands) -> IpcCommand {
     match cmd {
@@ -175,24 +216,181 @@ fn to_ipc_command(cmd: &Commands) -> IpcCommand {
         Commands::Refresh => IpcCommand::Refresh,
         Commands::Apply => IpcCommand::Apply,
         Commands::Reload => IpcCommand::Reload,
+        Commands::CloseWindow => IpcCommand::CloseWindow,
+        Commands::ToggleFloating => IpcCommand::ToggleFloating,
+        Commands::ToggleFullscreen => IpcCommand::ToggleFullscreen,
+        Commands::SetWidth { fraction } => IpcCommand::SetColumnWidth { fraction: *fraction },
+        Commands::EqualizeWidths => IpcCommand::EqualizeColumnWidths,
+        Commands::Status => IpcCommand::QueryStatus,
+        Commands::Run { .. } => unreachable!("Run is handled separately"),
         Commands::Init { .. } => unreachable!("Init is handled separately"),
+        Commands::Autostart { .. } => unreachable!("Autostart is handled separately"),
         Commands::Stop => IpcCommand::Stop,
     }
 }
 
+fn daemon_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "openniri.exe"
+    } else {
+        "openniri"
+    }
+}
+
+fn find_daemon_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let candidate = exe_dir.join(daemon_binary_name());
+    if candidate.exists() {
+        return Some(candidate);
+    }
+
+    let cwd = std::env::current_dir().ok()?;
+    let debug = cwd.join("target").join("debug").join(daemon_binary_name());
+    if debug.exists() {
+        return Some(debug);
+    }
+    let release = cwd.join("target").join("release").join(daemon_binary_name());
+    if release.exists() {
+        return Some(release);
+    }
+
+    None
+}
+
+fn ensure_daemon_binary() -> Result<PathBuf> {
+    if let Some(path) = find_daemon_binary() {
+        return Ok(path);
+    }
+
+    println!("Daemon binary not found. Building openniri-daemon...");
+    let status = Command::new("cargo")
+        .args(["build", "-p", "openniri-daemon"])
+        .status()
+        .context("Failed to run cargo build for openniri-daemon")?;
+    if !status.success() {
+        anyhow::bail!("cargo build failed for openniri-daemon");
+    }
+
+    find_daemon_binary().context("Daemon binary still not found after build")
+}
+
+#[cfg(windows)]
+fn apply_detach_flags(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(windows))]
+fn apply_detach_flags(_cmd: &mut Command) {}
+
+fn spawn_daemon() -> Result<u32> {
+    let daemon_path = ensure_daemon_binary()?;
+    let log_dir = std::env::temp_dir();
+    let stdout_path = log_dir.join("openniri-daemon.log");
+    let stderr_path = log_dir.join("openniri-daemon.err.log");
+
+    let stdout = File::create(&stdout_path).context("Failed to create daemon stdout log")?;
+    let stderr = File::create(&stderr_path).context("Failed to create daemon stderr log")?;
+
+    let mut cmd = Command::new(daemon_path);
+    cmd.stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    apply_detach_flags(&mut cmd);
+
+    let child = cmd.spawn().context("Failed to start openniri daemon")?;
+    println!(
+        "Started openniri daemon (PID {}). Logs: {} / {}",
+        child.id(),
+        stdout_path.display(),
+        stderr_path.display()
+    );
+    Ok(child.id())
+}
+
+async fn wait_for_daemon(timeout: Duration) -> Result<()> {
+    let _ = open_pipe_with_retry(timeout).await?;
+    Ok(())
+}
+
+fn is_pipe_busy(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(231)
+}
+
+fn is_pipe_not_found(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(2)
+}
+
+async fn open_pipe_with_retry(
+    timeout: Duration,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    let start = Instant::now();
+    loop {
+        match ClientOptions::new().open(PIPE_NAME) {
+            Ok(client) => return Ok(client),
+            Err(e) if is_pipe_busy(&e) || is_pipe_not_found(&e) => {
+                if start.elapsed() >= timeout {
+                    return Err(e).context("Failed to connect to daemon. Is openniri running?");
+                }
+            }
+            Err(e) => {
+                return Err(e).context("Failed to connect to daemon. Is openniri running?");
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn handle_run(no_apply: bool, wait_ms: u64) -> Result<()> {
+    let already_running = match ClientOptions::new().open(PIPE_NAME) {
+        Ok(_) => true,
+        Err(e) if is_pipe_busy(&e) => true,
+        Err(_) => false,
+    };
+
+    if !already_running {
+        spawn_daemon()?;
+    } else {
+        println!("Daemon already running.");
+    }
+
+    if no_apply {
+        wait_for_daemon(Duration::from_millis(wait_ms)).await?;
+        println!("Daemon is ready.");
+        return Ok(());
+    }
+
+    let response =
+        send_command_with_timeout(IpcCommand::Apply, Duration::from_millis(wait_ms)).await?;
+    print_response(&response);
+    if matches!(response, IpcResponse::Error { .. }) {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 /// Send a command to the daemon and return the response (with timeout).
 async fn send_command(cmd: IpcCommand) -> Result<IpcResponse> {
-    timeout(IPC_TIMEOUT, send_command_inner(cmd))
+    timeout(IPC_TIMEOUT, send_command_inner(cmd, IPC_TIMEOUT))
         .await
         .context("Timed out waiting for daemon response")?
 }
 
 /// Inner implementation without timeout.
-async fn send_command_inner(cmd: IpcCommand) -> Result<IpcResponse> {
-    // Connect to the named pipe
-    let client = ClientOptions::new()
-        .open(PIPE_NAME)
-        .context("Failed to connect to daemon. Is openniri running?")?;
+async fn send_command_with_timeout(cmd: IpcCommand, timeout_duration: Duration) -> Result<IpcResponse> {
+    timeout(timeout_duration, send_command_inner(cmd, timeout_duration))
+        .await
+        .context("Timed out waiting for daemon response")?
+}
+
+/// Inner implementation without timeout.
+async fn send_command_inner(cmd: IpcCommand, connect_timeout: Duration) -> Result<IpcResponse> {
+    // Connect to the named pipe (retry if busy/starting)
+    let client = open_pipe_with_retry(connect_timeout).await?;
 
     let (reader, mut writer) = tokio::io::split(client);
 
@@ -206,10 +404,14 @@ async fn send_command_inner(cmd: IpcCommand) -> Result<IpcResponse> {
     // Read response
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    reader
+    let bytes_read = reader
         .read_line(&mut line)
         .await
         .context("Failed to read response")?;
+
+    if bytes_read == 0 {
+        anyhow::bail!("Daemon disconnected before sending a response");
+    }
 
     let response: IpcResponse =
         serde_json::from_str(line.trim()).context("Failed to parse response")?;
@@ -291,6 +493,16 @@ fn print_response(response: &IpcResponse) {
                 }
             }
         }
+        IpcResponse::StatusInfo { version, monitors, total_windows, uptime_seconds } => {
+            println!("OpenNiri Daemon Status:");
+            println!("  Version: {}", version);
+            println!("  Monitors: {}", monitors);
+            println!("  Total windows: {}", total_windows);
+            let hours = uptime_seconds / 3600;
+            let mins = (uptime_seconds % 3600) / 60;
+            let secs = uptime_seconds % 60;
+            println!("  Uptime: {}h {}m {}s", hours, mins, secs);
+        }
     }
 }
 
@@ -336,6 +548,56 @@ track_focus_changes = true
 
 # Log level: trace, debug, info, warn, error
 log_level = "info"
+
+# Focus follows mouse (hover to focus)
+focus_follows_mouse = false
+
+[hotkeys]
+# Vim-style navigation with Win key
+"Win+H" = "focus_left"
+"Win+L" = "focus_right"
+"Win+J" = "focus_down"
+"Win+K" = "focus_up"
+
+# Move columns with Win+Shift
+"Win+Shift+H" = "move_column_left"
+"Win+Shift+L" = "move_column_right"
+
+# Resize with Win+Ctrl
+"Win+Ctrl+H" = "resize_shrink"
+"Win+Ctrl+L" = "resize_grow"
+
+# Close focused window
+"Win+Shift+Q" = "close_window"
+
+# Toggle floating / fullscreen
+"Win+F" = "toggle_floating"
+"Win+Shift+F" = "toggle_fullscreen"
+
+# Column width presets
+"Win+1" = "width_third"
+"Win+2" = "width_half"
+"Win+3" = "width_two_thirds"
+"Win+0" = "equalize_widths"
+
+[gestures]
+# Touchpad gesture support
+enabled = true
+swipe_left = "focus_left"
+swipe_right = "focus_right"
+swipe_up = "focus_up"
+swipe_down = "focus_down"
+
+[snap_hints]
+# Visual snap hint overlays during resize
+enabled = true
+duration_ms = 200
+opacity = 128
+
+# [[window_rules]]
+# match_class = "Chrome_WidgetWin_1"
+# match_title = ".*DevTools.*"
+# action = "float"
 "#
     .to_string()
 }
@@ -378,13 +640,58 @@ fn handle_init(output: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Handle the autostart command (enable/disable Registry run key).
+fn handle_autostart(action: AutostartAction) -> Result<()> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = hkcu
+        .open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            KEY_READ | KEY_WRITE,
+        )
+        .context("Failed to open Registry Run key")?;
+
+    const REG_VALUE: &str = "OpenNiri";
+
+    match action {
+        AutostartAction::Enable => {
+            let daemon_path = ensure_daemon_binary()?;
+            let path_str = daemon_path.to_string_lossy().to_string();
+            let quoted = format!("\"{}\"", path_str);
+            run_key
+                .set_value(REG_VALUE, &quoted)
+                .context("Failed to set Registry value")?;
+            println!("Auto-start enabled: {}", quoted);
+        }
+        AutostartAction::Disable => {
+            match run_key.delete_value(REG_VALUE) {
+                Ok(()) => println!("Auto-start disabled."),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        println!("Auto-start was not enabled.");
+                    } else {
+                        return Err(e).context("Failed to remove Registry value");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle init command separately (doesn't need IPC)
-    if let Commands::Init { output, force } = cli.command {
-        return handle_init(output, force);
+    // Handle init, run, and autostart commands separately (do not use IPC command mapping)
+    match cli.command {
+        Commands::Init { output, force } => return handle_init(output, force),
+        Commands::Run { no_apply, wait_ms } => return handle_run(no_apply, wait_ms).await,
+        Commands::Autostart { action } => return handle_autostart(action),
+        _ => {}
     }
 
     let ipc_cmd = to_ipc_command(&cli.command);
@@ -436,7 +743,7 @@ mod tests {
         let cmd = Commands::Scroll { direction: ScrollDirection::Left { pixels: 100 } };
         match to_ipc_command(&cmd) {
             IpcCommand::Scroll { delta } => assert_eq!(delta, -100.0),
-            _ => panic!("Expected Scroll command"),
+            other => panic!("Expected Scroll command, got {:?}", other),
         }
     }
 
@@ -445,7 +752,7 @@ mod tests {
         let cmd = Commands::Scroll { direction: ScrollDirection::Right { pixels: 150 } };
         match to_ipc_command(&cmd) {
             IpcCommand::Scroll { delta } => assert_eq!(delta, 150.0),
-            _ => panic!("Expected Scroll command"),
+            other => panic!("Expected Scroll command, got {:?}", other),
         }
     }
 
@@ -466,7 +773,7 @@ mod tests {
         let cmd = Commands::Resize { delta: 50 };
         match to_ipc_command(&cmd) {
             IpcCommand::Resize { delta } => assert_eq!(delta, 50),
-            _ => panic!("Expected Resize command"),
+            other => panic!("Expected Resize command, got {:?}", other),
         }
     }
 
@@ -475,7 +782,7 @@ mod tests {
         let cmd = Commands::Resize { delta: -30 };
         match to_ipc_command(&cmd) {
             IpcCommand::Resize { delta } => assert_eq!(delta, -30),
-            _ => panic!("Expected Resize command"),
+            other => panic!("Expected Resize command, got {:?}", other),
         }
     }
 
@@ -618,5 +925,72 @@ mod tests {
         // Timeout should be between 1 and 30 seconds
         assert!(IPC_TIMEOUT >= Duration::from_secs(1));
         assert!(IPC_TIMEOUT <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_empty_response_parse_fails() {
+        // Verify that an empty string cannot be parsed as a valid IPC response
+        let result: Result<IpcResponse, _> = serde_json::from_str("");
+        assert!(result.is_err(), "Empty string should not parse as IpcResponse");
+    }
+
+    #[test]
+    fn test_to_ipc_command_close_window() {
+        let cmd = Commands::CloseWindow;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::CloseWindow));
+    }
+
+    #[test]
+    fn test_to_ipc_command_toggle_floating() {
+        let cmd = Commands::ToggleFloating;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::ToggleFloating));
+    }
+
+    #[test]
+    fn test_to_ipc_command_toggle_fullscreen() {
+        let cmd = Commands::ToggleFullscreen;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::ToggleFullscreen));
+    }
+
+    #[test]
+    fn test_to_ipc_command_set_width() {
+        let cmd = Commands::SetWidth { fraction: 0.5 };
+        match to_ipc_command(&cmd) {
+            IpcCommand::SetColumnWidth { fraction } => assert!((fraction - 0.5).abs() < f64::EPSILON),
+            other => panic!("Expected SetColumnWidth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_to_ipc_command_equalize_widths() {
+        let cmd = Commands::EqualizeWidths;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::EqualizeColumnWidths));
+    }
+
+    #[test]
+    fn test_to_ipc_command_status() {
+        let cmd = Commands::Status;
+        assert!(matches!(to_ipc_command(&cmd), IpcCommand::QueryStatus));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_hotkeys() {
+        let config = generate_default_config();
+        assert!(config.contains("[hotkeys]"));
+        assert!(config.contains("close_window"));
+        assert!(config.contains("toggle_floating"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_gestures() {
+        let config = generate_default_config();
+        assert!(config.contains("[gestures]"));
+        assert!(config.contains("enabled = true"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_snap_hints() {
+        let config = generate_default_config();
+        assert!(config.contains("[snap_hints]"));
     }
 }

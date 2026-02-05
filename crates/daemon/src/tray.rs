@@ -18,6 +18,9 @@ mod menu_ids {
     pub const REFRESH: &str = "refresh";
     pub const RELOAD: &str = "reload";
     pub const EXIT: &str = "exit";
+    pub const TOGGLE_PAUSE: &str = "toggle_pause";
+    pub const OPEN_CONFIG: &str = "open_config";
+    pub const VIEW_LOGS: &str = "view_logs";
 }
 
 /// Events emitted by the tray icon.
@@ -29,6 +32,12 @@ pub enum TrayEvent {
     Reload,
     /// User clicked "Exit" menu item.
     Exit,
+    /// User clicked "Pause/Resume Tiling" menu item.
+    TogglePause,
+    /// User clicked "Open Config" menu item.
+    OpenConfig,
+    /// User clicked "View Logs" menu item.
+    ViewLogs,
 }
 
 /// Manages the system tray icon and context menu.
@@ -62,6 +71,18 @@ impl TrayManager {
         let reload = MenuItem::with_id(menu_ids::RELOAD, "Reload Config", true, None);
         menu.append(&reload).map_err(|e| TrayError::Menu(e.to_string()))?;
 
+        // Toggle Pause
+        let toggle_pause = MenuItem::with_id(menu_ids::TOGGLE_PAUSE, "Pause Tiling", true, None);
+        menu.append(&toggle_pause).map_err(|e| TrayError::Menu(e.to_string()))?;
+
+        // Open Config
+        let open_config = MenuItem::with_id(menu_ids::OPEN_CONFIG, "Open Config", true, None);
+        menu.append(&open_config).map_err(|e| TrayError::Menu(e.to_string()))?;
+
+        // View Logs
+        let view_logs = MenuItem::with_id(menu_ids::VIEW_LOGS, "View Logs", true, None);
+        menu.append(&view_logs).map_err(|e| TrayError::Menu(e.to_string()))?;
+
         // Separator
         menu.append(&PredefinedMenuItem::separator())
             .map_err(|e| TrayError::Menu(e.to_string()))?;
@@ -90,6 +111,9 @@ impl TrayManager {
                     menu_ids::REFRESH => TrayEvent::Refresh,
                     menu_ids::RELOAD => TrayEvent::Reload,
                     menu_ids::EXIT => TrayEvent::Exit,
+                    menu_ids::TOGGLE_PAUSE => TrayEvent::TogglePause,
+                    menu_ids::OPEN_CONFIG => TrayEvent::OpenConfig,
+                    menu_ids::VIEW_LOGS => TrayEvent::ViewLogs,
                     id => {
                         debug!("Unknown menu item clicked: {}", id);
                         continue;

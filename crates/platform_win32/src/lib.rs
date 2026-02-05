@@ -32,12 +32,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallNextHookEx, CreateWindowExW, DeferWindowPos, DefWindowProcW,
     DispatchMessageW, EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetMessageW,
-    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindow, IsWindowVisible, PostMessageW, RegisterClassW, SetWindowPos, SetWindowsHookExW,
-    UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HHOOK, HWND_MESSAGE,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW,
+    SetForegroundWindow, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint,
+    BringWindowToTop, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, HHOOK, HWND_MESSAGE,
     MSLLHOOKSTRUCT, MSG, SWP_NOACTIVATE, SWP_NOZORDER, WH_MOUSE_LL, WM_HOTKEY, WM_MOUSEMOVE,
     WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 
 // WinEvent constants (not all are exposed by windows-rs)
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
@@ -53,6 +55,27 @@ const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
 // Window message for display configuration changes
 const WM_DISPLAYCHANGE: u32 = 0x007E;
+
+/// Recover from a poisoned mutex, logging a warning.
+///
+/// When a thread panics while holding a mutex, the mutex becomes "poisoned".
+/// This helper logs the event and recovers the inner data so the application
+/// can continue operating.
+fn recover_poisoned_mutex<T>(err: std::sync::PoisonError<std::sync::MutexGuard<'_, T>>) -> std::sync::MutexGuard<'_, T> {
+    eprintln!("[openniri] WARNING: Mutex poisoned, recovering");
+    err.into_inner()
+}
+
+/// Convert a WindowId to an HWND safely, returning an error for null (zero) IDs.
+///
+/// A WindowId of 0 would produce a null HWND pointer, which is invalid for
+/// most Win32 window operations.
+fn window_id_to_hwnd(id: WindowId) -> Result<HWND, Win32Error> {
+    if id == 0 {
+        return Err(Win32Error::WindowNotFound(id));
+    }
+    Ok(HWND(id as *mut c_void))
+}
 
 /// Errors that can occur during Win32 operations.
 #[derive(Debug, Error)]
@@ -372,6 +395,13 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         return TRUE;
     }
 
+    // Skip owned windows (dialogs, secondary windows)
+    if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+        if !owner.is_invalid() {
+            return TRUE;
+        }
+    }
+
     // Skip cloaked windows (e.g., on other virtual desktops)
     if is_window_cloaked(hwnd) {
         return TRUE;
@@ -482,7 +512,8 @@ fn should_skip_window_by_class(class_name: &str) -> bool {
         "Shell_SecondaryTrayWnd",           // Secondary taskbar
         "WorkerW",                          // Desktop worker
         "Windows.UI.Core.CoreWindow",       // UWP system windows
-        "ApplicationFrameWindow",           // Some UWP containers
+        // ApplicationFrameWindow removed: allows tiling UWP apps (Calculator, Photos, etc.)
+        // Empty/cloaked UWP frames are already filtered by the cloaked window check.
         "XamlExplorerHostIslandWindow",     // XAML islands
         "TopLevelWindowForOverflowXamlIsland", // Overflow islands
         // Add more system classes as needed
@@ -529,6 +560,9 @@ pub fn get_process_executable(pid: u32) -> Option<String> {
 /// This helps prevent race conditions where a window is destroyed
 /// between receiving an event and processing it.
 pub fn is_valid_window(hwnd: WindowId) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
     unsafe {
         let hwnd = HWND(hwnd as *mut c_void);
         IsWindow(Some(hwnd)).as_bool()
@@ -617,14 +651,21 @@ pub fn apply_placements(
 /// those placements are tracked and retried individually after the batch.
 fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
     unsafe {
-        let hdwp = BeginDeferWindowPos(placements.len() as i32)
+        let hdwp = BeginDeferWindowPos(placements.len().min(i32::MAX as usize) as i32)
             .map_err(|e| Win32Error::SetPositionFailed(format!("BeginDeferWindowPos failed: {}", e)))?;
 
         let mut current_hdwp = hdwp;
         let mut failed_placements: Vec<&WindowPlacement> = Vec::new();
 
         for placement in placements {
-            let hwnd = HWND(placement.window_id as *mut c_void);
+            let hwnd = match window_id_to_hwnd(placement.window_id) {
+                Ok(h) => h,
+                Err(_) => {
+                    tracing::warn!("Skipping placement for invalid window ID 0");
+                    failed_placements.push(placement);
+                    continue;
+                }
+            };
             let rect = &placement.rect;
 
             match DeferWindowPos(
@@ -694,13 +735,13 @@ fn apply_placements_immediate(placements: &[&WindowPlacement]) -> Result<(), Win
 
 /// Set window position immediately using SetWindowPos.
 fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(placement.window_id)?;
     unsafe {
-        let hwnd = HWND(placement.window_id as *mut c_void);
         let rect = &placement.rect;
 
         SetWindowPos(
             hwnd,
-            None, // No z-order change with SWP_NOZORDER
+            None,
             rect.x,
             rect.y,
             rect.width,
@@ -723,9 +764,9 @@ fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Erro
 /// Cloaked windows are hidden visually but remain in the taskbar
 /// and can still receive focus via Alt-Tab.
 pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(hwnd)?;
     unsafe {
-        let hwnd = HWND(hwnd as *mut c_void);
-        let cloak_value: u32 = 1; // TRUE = cloak
+        let cloak_value: u32 = 1;
 
         let result = DwmSetWindowAttribute(
             hwnd,
@@ -746,9 +787,9 @@ pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
 
 /// Uncloak a window (make visible again).
 pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(hwnd)?;
     unsafe {
-        let hwnd = HWND(hwnd as *mut c_void);
-        let cloak_value: u32 = 0; // FALSE = uncloak
+        let cloak_value: u32 = 0;
 
         let result = DwmSetWindowAttribute(
             hwnd,
@@ -765,6 +806,145 @@ pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
         }
     }
     Ok(())
+}
+
+/// Set the foreground window using Win32 SetForegroundWindow.
+///
+/// Uses AttachThreadInput trick to reliably set foreground even when
+/// the calling process is not the foreground process.
+pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
+    let hwnd = window_id_to_hwnd(hwnd)?;
+    unsafe {
+        let target_thread = GetWindowThreadProcessId(hwnd, None);
+        let current_thread = GetCurrentThreadId();
+
+        // Attach to the target thread's input queue to allow SetForegroundWindow
+        let mut attached = false;
+        if target_thread != current_thread && target_thread != 0 {
+            attached = windows::Win32::System::Threading::AttachThreadInput(
+                current_thread, target_thread, true,
+            ).as_bool();
+        }
+
+        let result = SetForegroundWindow(hwnd).as_bool();
+
+        // If SetForegroundWindow failed, try BringWindowToTop as fallback
+        if !result {
+            let _ = BringWindowToTop(hwnd);
+        }
+
+        // Detach thread input
+        if attached {
+            let _ = windows::Win32::System::Threading::AttachThreadInput(
+                current_thread, target_thread, false,
+            );
+        }
+
+        Ok(result)
+    }
+}
+
+/// Close a window by posting WM_CLOSE.
+///
+/// This is a graceful close that allows the application to handle cleanup.
+pub fn close_window(hwnd: WindowId) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(hwnd)?;
+    unsafe {
+        const WM_CLOSE: u32 = 0x0010;
+        PostMessageW(
+            Some(hwnd),
+            WM_CLOSE,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        )
+        .map_err(|e| Win32Error::SetPositionFailed(format!("PostMessageW(WM_CLOSE) failed: {}", e)))?;
+    }
+    Ok(())
+}
+
+/// Set the DWM border color for a window (Windows 11+).
+///
+/// Returns Ok(true) if the border was set, Ok(false) if the API is unsupported.
+pub fn set_window_border_color(hwnd: WindowId, color: u32) -> Result<bool, Win32Error> {
+    let hwnd = window_id_to_hwnd(hwnd)?;
+    unsafe {
+        // DWMWA_BORDER_COLOR = 34
+        const DWMWA_BORDER_COLOR: u32 = 34;
+        let colorref = color;
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_BORDER_COLOR as i32),
+            &colorref as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        match result {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false), // Unsupported on this Windows version
+        }
+    }
+}
+
+/// Reset the DWM border color for a window to the default.
+///
+/// Returns Ok(true) if the border was reset, Ok(false) if the API is unsupported.
+pub fn reset_window_border_color(hwnd: WindowId) -> Result<bool, Win32Error> {
+    // DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
+    set_window_border_color(hwnd, 0xFFFFFFFF)
+}
+
+/// Uncloak a list of managed windows, best-effort.
+///
+/// Iterates through the provided window IDs and uncloaks each one.
+/// Logs warnings for failures but never panics. Also resets border colors.
+pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
+    for &wid in window_ids {
+        if wid == 0 {
+            continue;
+        }
+        if let Err(e) = uncloak_window(wid) {
+            tracing::warn!("Failed to uncloak window {} during shutdown: {}", wid, e);
+        }
+        // Best-effort border reset
+        let _ = reset_window_border_color(wid);
+    }
+    tracing::info!("Uncloaked {} managed windows during shutdown", window_ids.len());
+}
+
+/// Uncloak all visible windows on the system, best-effort.
+///
+/// Uses `EnumWindows` to find all top-level windows and uncloaks them.
+/// This does not require AppState and works even if state is poisoned,
+/// making it suitable for use in panic hooks.
+pub fn uncloak_all_visible_windows() {
+    unsafe {
+        let _ = EnumWindows(Some(uncloak_all_callback), LPARAM(0));
+    }
+    // eprintln because tracing may not work in a panic hook
+    eprintln!("[openniri] Emergency uncloak of all windows complete");
+}
+
+/// Callback for `EnumWindows` that uncloaks every window.
+unsafe extern "system" fn uncloak_all_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    let wid = hwnd.0 as WindowId;
+    if wid != 0 {
+        // Best-effort uncloak — ignore errors
+        let _ = uncloak_window(wid);
+        let _ = reset_window_border_color(wid);
+    }
+    TRUE // continue enumeration
+}
+
+/// Set the process DPI awareness to Per-Monitor Aware V2.
+///
+/// This must be called as early as possible in `main()`, before any
+/// window or GDI operations. Returns `true` if the call succeeded.
+pub fn set_dpi_awareness() -> bool {
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_ok()
+    }
 }
 
 /// Window event types that the daemon needs to handle.
@@ -1085,13 +1265,12 @@ impl Drop for HotkeyHandle {
             let _ = thread.join();
         }
 
-        // Clear the global senders to allow re-registration
-        if let Ok(mut sender) = HOTKEY_SENDER.lock() {
-            *sender = None;
-        }
-        if let Ok(mut sender) = DISPLAY_CHANGE_SENDER.lock() {
-            *sender = None;
-        }
+        // Clear the global senders to allow re-registration (recover from mutex poisoning)
+        let mut sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        *sender = None;
+        drop(sender);
+        let mut sender = DISPLAY_CHANGE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        *sender = None;
     }
 }
 
@@ -1275,11 +1454,10 @@ fn hotkey_window_proc_inner(
             let hotkey_id = wparam.0 as HotkeyId;
             tracing::debug!("Hotkey {} pressed", hotkey_id);
 
-            // Send event through channel
-            if let Ok(sender_guard) = HOTKEY_SENDER.lock() {
-                if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.send(HotkeyEvent { id: hotkey_id });
-                }
+            // Send event through channel (recover from mutex poisoning)
+            let sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+            if let Some(sender) = sender_guard.as_ref() {
+                let _ = sender.send(HotkeyEvent { id: hotkey_id });
             }
 
             windows::Win32::Foundation::LRESULT(0)
@@ -1287,11 +1465,10 @@ fn hotkey_window_proc_inner(
         WM_DISPLAYCHANGE => {
             tracing::info!("Display configuration changed (WM_DISPLAYCHANGE)");
 
-            // Send display change event through window event channel
-            if let Ok(sender_guard) = DISPLAY_CHANGE_SENDER.lock() {
-                if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.send(WindowEvent::DisplayChange);
-                }
+            // Send display change event through window event channel (recover from mutex poisoning)
+            let sender_guard = DISPLAY_CHANGE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+            if let Some(sender) = sender_guard.as_ref() {
+                let _ = sender.send(WindowEvent::DisplayChange);
             }
 
             windows::Win32::Foundation::LRESULT(0)
@@ -1513,13 +1690,12 @@ impl Drop for GestureHandle {
             }
         }
 
-        // Clear the global sender and state
-        if let Ok(mut sender) = GESTURE_SENDER.lock() {
-            *sender = None;
-        }
-        if let Ok(mut state) = GESTURE_STATE.lock() {
-            *state = None;
-        }
+        // Clear the global sender and state (recover from mutex poisoning)
+        let mut sender = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        *sender = None;
+        drop(sender);
+        let mut state = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
+        *state = None;
 
         tracing::debug!("Gesture detection stopped");
     }
@@ -1596,50 +1772,49 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
             // The high word of mouseData contains the wheel delta (signed).
             let delta = (mouse_struct.mouseData >> 16) as i16 as i32;
 
-            if let Ok(mut state_guard) = GESTURE_STATE.lock() {
-                if let Some(state) = state_guard.as_mut() {
-                    let now = std::time::Instant::now();
+            // Recover from mutex poisoning for both state and sender
+            let mut state_guard = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
+            if let Some(state) = state_guard.as_mut() {
+                let now = std::time::Instant::now();
 
-                    // Reset accumulators if timeout exceeded
-                    if now.duration_since(state.last_scroll_time).as_millis() > GESTURE_TIMEOUT_MS {
-                        state.accum_x = 0;
-                        state.accum_y = 0;
-                    }
-                    state.last_scroll_time = now;
+                // Reset accumulators if timeout exceeded
+                if now.duration_since(state.last_scroll_time).as_millis() > GESTURE_TIMEOUT_MS {
+                    state.accum_x = 0;
+                    state.accum_y = 0;
+                }
+                state.last_scroll_time = now;
 
-                    if msg == WM_MOUSEHWHEEL {
-                        state.accum_x += delta;
+                if msg == WM_MOUSEHWHEEL {
+                    state.accum_x += delta;
+                } else {
+                    state.accum_y += delta;
+                }
+
+                // Check thresholds and determine gesture
+                let gesture = if state.accum_x.abs() >= GESTURE_SCROLL_THRESHOLD {
+                    let g = if state.accum_x > 0 {
+                        GestureEvent::SwipeRight
                     } else {
-                        state.accum_y += delta;
-                    }
-
-                    // Check thresholds and determine gesture
-                    let gesture = if state.accum_x.abs() >= GESTURE_SCROLL_THRESHOLD {
-                        let g = if state.accum_x > 0 {
-                            GestureEvent::SwipeRight
-                        } else {
-                            GestureEvent::SwipeLeft
-                        };
-                        state.accum_x = 0;
-                        Some(g)
-                    } else if state.accum_y.abs() >= GESTURE_SCROLL_THRESHOLD {
-                        let g = if state.accum_y > 0 {
-                            GestureEvent::SwipeDown
-                        } else {
-                            GestureEvent::SwipeUp
-                        };
-                        state.accum_y = 0;
-                        Some(g)
-                    } else {
-                        None
+                        GestureEvent::SwipeLeft
                     };
+                    state.accum_x = 0;
+                    Some(g)
+                } else if state.accum_y.abs() >= GESTURE_SCROLL_THRESHOLD {
+                    let g = if state.accum_y > 0 {
+                        GestureEvent::SwipeDown
+                    } else {
+                        GestureEvent::SwipeUp
+                    };
+                    state.accum_y = 0;
+                    Some(g)
+                } else {
+                    None
+                };
 
-                    if let Some(event) = gesture {
-                        if let Ok(sender_guard) = GESTURE_SENDER.lock() {
-                            if let Some(sender) = sender_guard.as_ref() {
-                                let _ = sender.send(event);
-                            }
-                        }
+                if let Some(event) = gesture {
+                    let sender_guard = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+                    if let Some(sender) = sender_guard.as_ref() {
+                        let _ = sender.send(event);
                     }
                 }
             }
@@ -1676,10 +1851,9 @@ impl Drop for MouseHookHandle {
         }
         tracing::debug!("Mouse hook uninstalled");
 
-        // Clear the global sender
-        if let Ok(mut sender) = MOUSE_EVENT_SENDER.lock() {
-            *sender = None;
-        }
+        // Clear the global sender (recover from mutex poisoning)
+        let mut sender = MOUSE_EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        *sender = None;
     }
 }
 
@@ -1748,17 +1922,15 @@ unsafe extern "system" fn mouse_ll_hook_proc(
         if !hwnd.is_invalid() {
             let window_id = hwnd.0 as WindowId;
 
-            // Check if this is a different window than before
-            if let Ok(mut current) = CURRENT_MOUSE_WINDOW.lock() {
-                if *current != Some(window_id) {
-                    *current = Some(window_id);
+            // Check if this is a different window than before (recover from mutex poisoning)
+            let mut current = CURRENT_MOUSE_WINDOW.lock().unwrap_or_else(recover_poisoned_mutex);
+            if *current != Some(window_id) {
+                *current = Some(window_id);
 
-                    // Send MouseEnterWindow event
-                    if let Ok(sender_guard) = MOUSE_EVENT_SENDER.lock() {
-                        if let Some(sender) = sender_guard.as_ref() {
-                            let _ = sender.send(WindowEvent::MouseEnterWindow(window_id));
-                        }
-                    }
+                // Send MouseEnterWindow event (recover from mutex poisoning)
+                let sender_guard = MOUSE_EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+                if let Some(sender) = sender_guard.as_ref() {
+                    let _ = sender.send(WindowEvent::MouseEnterWindow(window_id));
                 }
             }
         }
@@ -2051,5 +2223,82 @@ mod tests {
         let config = PlatformConfig::default();
         let result = apply_placements(&[], &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_window_id_to_hwnd_zero_returns_error() {
+        let result = window_id_to_hwnd(0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
+    }
+
+    #[test]
+    fn test_window_id_to_hwnd_nonzero_succeeds() {
+        let result = window_id_to_hwnd(12345);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_valid_window_zero_returns_false() {
+        assert!(!is_valid_window(0));
+    }
+
+    #[test]
+    fn test_set_foreground_window_zero_fails() {
+        let result = set_foreground_window(0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
+    }
+
+    #[test]
+    fn test_close_window_zero_fails() {
+        let result = close_window(0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
+    }
+
+    #[test]
+    fn test_set_window_border_color_zero_fails() {
+        let result = set_window_border_color(0, 0x4285F4);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
+    }
+
+    #[test]
+    fn test_reset_window_border_color_zero_fails() {
+        let result = reset_window_border_color(0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
+    }
+
+    #[test]
+    fn test_skip_classes_does_not_contain_application_frame_window() {
+        let skip = should_skip_window_by_class("ApplicationFrameWindow");
+        assert!(!skip, "ApplicationFrameWindow should NOT be in skip list (UWP apps should be tiled)");
+    }
+
+    #[test]
+    fn test_uncloak_all_managed_empty_list() {
+        // Should not panic with an empty list
+        uncloak_all_managed_windows(&[]);
+    }
+
+    #[test]
+    fn test_uncloak_all_managed_with_invalid_ids() {
+        // Should not panic even with invalid window IDs (best-effort)
+        uncloak_all_managed_windows(&[0, 999_999, 1_234_567]);
+    }
+
+    #[test]
+    fn test_uncloak_all_visible_windows_no_panic() {
+        // EnumWindows should succeed; uncloaking random windows is best-effort
+        uncloak_all_visible_windows();
+    }
+
+    #[test]
+    #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
+    fn test_set_dpi_awareness_no_panic() {
+        // On CI/test environments this may return false (already set), but must not panic
+        let _result = set_dpi_awareness();
     }
 }

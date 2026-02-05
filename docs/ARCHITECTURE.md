@@ -110,8 +110,8 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 **Purpose**: Shared IPC protocol types for daemon-CLI communication.
 
 **Key Types**:
-- `IpcCommand`: Commands sent from CLI to daemon (FocusLeft/Right/Up/Down, MoveColumnLeft/Right, FocusMonitorLeft/Right, MoveWindowToMonitorLeft/Right, Resize, Scroll, QueryWorkspace, QueryFocused, QueryAllWindows, Refresh, Apply, Reload, Stop)
-- `IpcResponse`: Responses from daemon (Ok, Error, WorkspaceState, FocusedWindow, WindowList)
+- `IpcCommand`: Commands sent from CLI to daemon (FocusLeft/Right/Up/Down, MoveColumnLeft/Right, FocusMonitorLeft/Right, MoveWindowToMonitorLeft/Right, Resize, Scroll, QueryWorkspace, QueryFocused, QueryAllWindows, Refresh, Apply, Reload, Stop, CloseWindow, ToggleFloating, ToggleFullscreen, SetColumnWidth, EqualizeColumnWidths, QueryStatus)
+- `IpcResponse`: Responses from daemon (Ok, Error, WorkspaceState, FocusedWindow, WindowList, Status)
 - `WindowInfo`: Detailed window information (ID, title, class, process, rect, floating status)
 - `IpcRect`: Window rectangle (x, y, width, height)
 - `PIPE_NAME`: Named pipe path (`\\.\pipe\openniri`)
@@ -175,7 +175,12 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 - `resize --delta <N>`: Resize column
 - `focus-monitor left|right`: Navigate between monitors
 - `move-to-monitor left|right`: Move window to adjacent monitor
-- `query workspace|focused|all`: State queries
+- `query workspace|focused|all|status`: State queries
+- `close`: Close focused window
+- `toggle-floating`: Toggle floating state of focused window
+- `toggle-fullscreen`: Toggle fullscreen state of focused window
+- `set-column-width <preset>`: Set column width preset (1/2/3)
+- `equalize-widths`: Equalize all column widths
 - `init [-o path] [--force]`: Generate default config
 - `refresh`: Re-enumerate windows
 - `reload`: Reload configuration
@@ -188,9 +193,9 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 ---
 
 ## Current Status (Reality Check)
-- `openniri-core-layout` is implemented and unit-tested (87 tests).
-- `openniri-platform-win32` has real Win32 implementations (13 tests + 2 hardware-dependent):
-  - `enumerate_windows()` - Uses EnumWindows with filtering
+- `openniri-core-layout` is implemented and unit-tested (99 tests).
+- `openniri-platform-win32` has real Win32 implementations (24 tests, 3 hardware-dependent):
+  - `enumerate_windows()` - Uses EnumWindows with filtering (including owner-window filtering for dialog windows)
   - `enumerate_monitors()` / `get_primary_monitor()` - Uses EnumDisplayMonitors
   - `apply_placements()` - Uses DeferWindowPos for batched moves, individual fallback
   - `cloak_window()` / `uncloak_window()` - Uses DwmSetWindowAttribute
@@ -202,19 +207,28 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - `set_display_change_sender()` - Monitor hotplug event forwarding
   - `is_valid_window()` - HWND validation
   - `get_process_executable()` - Process executable name lookup
-- `openniri-ipc` provides shared IPC types (13 tests).
-- `openniri-daemon` runs an async event loop with named pipe IPC server (44 tests + 17 integration):
+  - `set_foreground_window()` - SetForegroundWindow for actual focus changes
+  - `set_active_border()` - Active window border via DWM
+  - `close_window()` - Window close via WM_CLOSE
+  - `set_dpi_awareness()` - Per-Monitor Aware V2 initialization
+  - `uncloak_all_managed_windows()` / `uncloak_all_visible_windows()` - shutdown/crash recovery visibility safety
+- `openniri-ipc` provides shared IPC types (15 tests), including CloseWindow, ToggleFloating, ToggleFullscreen, SetColumnWidth, EqualizeColumnWidths, and QueryStatus commands.
+- `openniri-daemon` runs an async event loop with named pipe IPC server (99 tests, 1 ignored, + 22 integration):
   - Configuration loading from TOML files with live reload
   - Global hotkey handling with live reload
   - Smooth scroll animations (~60 FPS) with easing functions
   - Multi-monitor workspace support with display change handling
   - Per-window floating rules (regex matching on class/title/executable)
-  - System tray icon with context menu
-  - Visual snap hints overlay
+  - System tray icon with context menu (Pause, Open Config, View Logs)
+  - Visual snap hints overlay (enabled by default)
   - Focus follows mouse with configurable delay
-  - Touchpad gesture support
+  - Touchpad gesture support (enabled by default)
   - Workspace state persistence
-- `openniri-cli` sends IPC commands and prints formatted responses (28 tests).
+  - Ctrl+C shutdown handling routed into daemon event loop
+  - Shutdown cleanup: save state + uncloak managed windows
+  - Panic hook with emergency best-effort uncloak
+  - Auto-start via Registry
+- `openniri-cli` sends IPC commands and prints formatted responses (38 tests).
 
 ---
 
@@ -233,13 +247,15 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 ---
 
 ## Planned vs Implemented (Gap Summary)
-- **Implemented** (202 tests total):
-  - Core layout engine (87 unit tests)
-  - IPC protocol crate (13 unit tests)
-  - CLI tool (28 unit tests)
-  - Daemon (44 unit tests + 17 integration tests)
-  - Platform layer (13 unit tests + 2 hardware-dependent)
+- **Implemented** (302 tests total — 297 passing, 5 ignored):
+  - Core layout engine (99 unit tests)
+  - IPC protocol crate (15 unit tests)
+  - CLI tool (38 unit tests)
+  - Daemon (99 unit tests, 1 ignored, + 22 integration tests)
+  - Platform layer (24 unit tests, 3 hardware-dependent)
+  - Doc-tests (1 ignored)
   - Win32 enumeration with filtering (visible, non-tool, non-cloaked, non-system windows)
+  - Owner-window filtering (dialog windows not tiled)
   - Monitor enumeration via EnumDisplayMonitors (dynamic viewport detection)
   - Window positioning via DeferWindowPos batching (with individual fallback)
   - DWM cloaking for off-screen windows (configurable via use_cloaking)
@@ -251,14 +267,26 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - Global hotkeys with configurable bindings and live reload
   - Smooth scroll animations (~60 FPS) with easing functions
   - Per-window floating/rules (regex matching, float/tile/ignore actions)
-  - System tray icon with context menu
-  - Visual snap hints (overlay window)
+  - System tray icon with context menu (Pause, Open Config, View Logs)
+  - Visual snap hints (overlay window, enabled by default)
   - Focus follows mouse (low-level mouse hook with debouncing)
   - Display change detection and monitor reconciliation
-  - Touchpad gesture support (low-level mouse hook with wheel accumulation)
+  - Touchpad gesture support (low-level mouse hook with wheel accumulation, enabled by default)
   - Workspace state persistence (save/restore across restarts)
   - HWND validation on window events
   - catch_unwind in all Win32 callbacks
+  - SetForegroundWindow for actual focus changes
+  - CloseWindow command (Win+Shift+Q)
+  - ToggleFloating command (Win+F)
+  - ToggleFullscreen command (Win+Shift+F)
+  - SetColumnWidth presets (Win+1/2/3) and EqualizeColumnWidths (Win+0)
+  - Active window border (DWM)
+  - QueryStatus command
+  - Auto-start via Registry
+  - Ctrl+C signal handling through daemon shutdown event
+  - Managed-window uncloak/reset on shutdown
+  - Panic-hook emergency uncloak-all-visible safety net
+  - Process DPI awareness initialization (Per-Monitor Aware V2)
 - **All core features implemented.** Future work is polish and optimization.
 
 ## Data Flow

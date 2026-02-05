@@ -358,6 +358,9 @@ pub struct Workspace {
     /// Floating windows outside the tiling layout.
     #[serde(default)]
     floating_windows: Vec<FloatingWindow>,
+    /// Window ID in fullscreen mode, if any.
+    #[serde(default)]
+    fullscreen_window: Option<WindowId>,
 }
 
 impl Default for Workspace {
@@ -373,6 +376,7 @@ impl Default for Workspace {
             centering_mode: CenteringMode::default(),
             active_animation: None,
             floating_windows: Vec::new(),
+            fullscreen_window: None,
         }
     }
 }
@@ -881,6 +885,11 @@ impl Workspace {
     ///
     /// Note: Negative gaps are treated as zero for calculation purposes.
     pub fn compute_placements(&self, viewport: Rect) -> Vec<WindowPlacement> {
+        // Fullscreen mode: one window covers the entire viewport, others are off-screen
+        if let Some(fs_wid) = self.fullscreen_window {
+            return self.compute_fullscreen_placements(fs_wid, viewport);
+        }
+
         let mut placements = Vec::new();
 
         // Defensively clamp gaps to >= 0 in case fields were set directly
@@ -1127,6 +1136,11 @@ impl Workspace {
     /// This is similar to `compute_placements` but uses `effective_scroll_offset()`
     /// to support smooth scrolling animations.
     pub fn compute_placements_animated(&self, viewport: Rect) -> Vec<WindowPlacement> {
+        // Fullscreen mode: one window covers the entire viewport, others are off-screen
+        if let Some(fs_wid) = self.fullscreen_window {
+            return self.compute_fullscreen_placements(fs_wid, viewport);
+        }
+
         let mut placements = Vec::new();
 
         // Defensively clamp gaps to >= 0 in case fields were set directly
@@ -1200,6 +1214,153 @@ impl Workspace {
         }
 
         placements
+    }
+
+    /// Compute placements when a window is fullscreen.
+    /// The fullscreen window gets the full viewport; all others are marked off-screen.
+    fn compute_fullscreen_placements(&self, fs_wid: WindowId, viewport: Rect) -> Vec<WindowPlacement> {
+        let mut placements = Vec::new();
+
+        for (col_idx, column) in self.columns.iter().enumerate() {
+            for &window_id in column.windows() {
+                if window_id == fs_wid {
+                    placements.push(WindowPlacement {
+                        window_id,
+                        rect: viewport,
+                        visibility: Visibility::Visible,
+                        column_index: col_idx,
+                    });
+                } else {
+                    placements.push(WindowPlacement {
+                        window_id,
+                        rect: Rect::new(0, 0, 0, 0),
+                        visibility: Visibility::OffScreenLeft,
+                        column_index: col_idx,
+                    });
+                }
+            }
+        }
+
+        // Floating windows are also hidden during fullscreen
+        for floating in &self.floating_windows {
+            if floating.id == fs_wid {
+                placements.push(WindowPlacement {
+                    window_id: floating.id,
+                    rect: viewport,
+                    visibility: Visibility::Visible,
+                    column_index: usize::MAX,
+                });
+            } else {
+                placements.push(WindowPlacement {
+                    window_id: floating.id,
+                    rect: Rect::new(0, 0, 0, 0),
+                    visibility: Visibility::OffScreenLeft,
+                    column_index: usize::MAX,
+                });
+            }
+        }
+
+        placements
+    }
+
+    // ========================================================================
+    // Fullscreen Methods
+    // ========================================================================
+
+    /// Check if a window is currently fullscreen.
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen_window.is_some()
+    }
+
+    /// Get the fullscreen window ID, if any.
+    pub fn fullscreen_window_id(&self) -> Option<WindowId> {
+        self.fullscreen_window
+    }
+
+    /// Toggle fullscreen mode for the focused window.
+    /// Returns true if entering fullscreen, false if exiting.
+    pub fn toggle_fullscreen(&mut self) -> bool {
+        if self.fullscreen_window.is_some() {
+            self.fullscreen_window = None;
+            false
+        } else if let Some(wid) = self.focused_window() {
+            self.fullscreen_window = Some(wid);
+            true
+        } else {
+            false
+        }
+    }
+
+    // ========================================================================
+    // Toggle Floating
+    // ========================================================================
+
+    /// Toggle floating state for the focused window.
+    /// If the focused window is tiled, move it to floating with a centered rect.
+    /// If the focused window is floating, this is a no-op (floating windows are not focused via column focus).
+    /// Returns the window ID that was toggled, if any.
+    pub fn toggle_floating(&mut self, viewport: Rect) -> Option<WindowId> {
+        let wid = self.focused_window()?;
+
+        // Check if the focused window is tiled (it always is since focus tracks tiled columns)
+        // Remove from columns
+        let _ = self.remove_window(wid);
+
+        // Center a floating window of 800x600 or clamped to viewport
+        let float_w = 800.min(viewport.width - 40);
+        let float_h = 600.min(viewport.height - 40);
+        let float_x = viewport.x + (viewport.width - float_w) / 2;
+        let float_y = viewport.y + (viewport.height - float_h) / 2;
+        let rect = Rect::new(float_x, float_y, float_w, float_h);
+
+        let _ = self.add_floating(wid, rect);
+        Some(wid)
+    }
+
+    /// Move a floating window back to the tiling layout.
+    /// Returns true if the window was unfloated.
+    pub fn unfloat_window(&mut self, window_id: WindowId) -> bool {
+        if self.remove_floating(window_id) {
+            // Insert as a new column
+            let _ = self.insert_window(window_id, None);
+            true
+        } else {
+            false
+        }
+    }
+
+    // ========================================================================
+    // Column Width Presets
+    // ========================================================================
+
+    /// Set the focused column's width as a fraction of the viewport width.
+    /// Fraction should be between 0.1 and 1.0.
+    pub fn set_focused_column_width_fraction(&mut self, fraction: f64, viewport_width: i32) {
+        let fraction = fraction.clamp(0.1, 1.0);
+        let outer_gap = self.outer_gap.max(0);
+        let usable_width = viewport_width.saturating_sub(outer_gap * 2);
+        let new_width = (usable_width as f64 * fraction).round() as i32;
+
+        if let Some(column) = self.columns.get_mut(self.focused_column) {
+            column.set_width(new_width);
+        }
+    }
+
+    /// Equalize all column widths to share the viewport equally.
+    pub fn equalize_column_widths(&mut self, viewport_width: i32) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let outer_gap = self.outer_gap.max(0);
+        let gap = self.gap.max(0);
+        let n = self.columns.len() as i32;
+        let total_gaps = gap * (n - 1) + outer_gap * 2;
+        let per_column = ((viewport_width - total_gaps).max(MIN_COLUMN_WIDTH * n)) / n;
+
+        for col in &mut self.columns {
+            col.set_width(per_column);
+        }
     }
 }
 
@@ -2703,5 +2864,189 @@ mod tests {
         // Try to add same ID as floating - should fail
         let result = ws.add_floating(1, Rect::new(100, 100, 400, 300));
         assert!(matches!(result, Err(LayoutError::DuplicateWindow(1))));
+    }
+
+    // ====================================================================
+    // Fullscreen Tests
+    // ====================================================================
+
+    #[test]
+    fn test_fullscreen_toggle() {
+        let mut ws = Workspace::new();
+        ws.insert_window(1, Some(400)).unwrap();
+
+        assert!(!ws.is_fullscreen());
+
+        // Enter fullscreen
+        let entered = ws.toggle_fullscreen();
+        assert!(entered);
+        assert!(ws.is_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), Some(1));
+
+        // Exit fullscreen
+        let entered = ws.toggle_fullscreen();
+        assert!(!entered);
+        assert!(!ws.is_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), None);
+    }
+
+    #[test]
+    fn test_fullscreen_empty_workspace() {
+        let mut ws = Workspace::new();
+        let entered = ws.toggle_fullscreen();
+        assert!(!entered);
+        assert!(!ws.is_fullscreen());
+    }
+
+    #[test]
+    fn test_fullscreen_placements() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+
+        // Focus window 2 and make it fullscreen
+        ws.focus_left();
+        assert_eq!(ws.focused_window(), Some(2));
+        ws.toggle_fullscreen();
+
+        let placements = ws.compute_placements(viewport);
+        assert_eq!(placements.len(), 3);
+
+        // Window 2 should cover the full viewport
+        let fs = placements.iter().find(|p| p.window_id == 2).unwrap();
+        assert_eq!(fs.rect, viewport);
+        assert_eq!(fs.visibility, Visibility::Visible);
+
+        // Others should be off-screen
+        let w1 = placements.iter().find(|p| p.window_id == 1).unwrap();
+        assert_eq!(w1.visibility, Visibility::OffScreenLeft);
+
+        let w3 = placements.iter().find(|p| p.window_id == 3).unwrap();
+        assert_eq!(w3.visibility, Visibility::OffScreenLeft);
+    }
+
+    #[test]
+    fn test_fullscreen_animated_placements() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.toggle_fullscreen();
+
+        let placements = ws.compute_placements_animated(viewport);
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].rect, viewport);
+        assert_eq!(placements[0].visibility, Visibility::Visible);
+    }
+
+    // ====================================================================
+    // Toggle Floating Tests
+    // ====================================================================
+
+    #[test]
+    fn test_toggle_floating_tiled_to_float() {
+        let mut ws = Workspace::new();
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+
+        // Focus window 2 and toggle to floating
+        let wid = ws.toggle_floating(viewport);
+        assert_eq!(wid, Some(2));
+        assert!(ws.is_floating(2));
+        assert_eq!(ws.column_count(), 1); // Only window 1 tiled
+        assert_eq!(ws.floating_count(), 1);
+    }
+
+    #[test]
+    fn test_toggle_floating_back() {
+        let mut ws = Workspace::new();
+        let viewport = Rect::new(0, 0, 1920, 1080);
+
+        ws.insert_window(1, Some(400)).unwrap();
+
+        // Toggle to floating
+        let wid = ws.toggle_floating(viewport);
+        assert_eq!(wid, Some(1));
+        assert!(ws.is_floating(1));
+        assert_eq!(ws.column_count(), 0);
+
+        // Use unfloat to bring it back
+        let ok = ws.unfloat_window(1);
+        assert!(ok);
+        assert!(!ws.is_floating(1));
+        assert_eq!(ws.column_count(), 1);
+    }
+
+    #[test]
+    fn test_toggle_floating_empty_workspace() {
+        let mut ws = Workspace::new();
+        let viewport = Rect::new(0, 0, 1920, 1080);
+        let wid = ws.toggle_floating(viewport);
+        assert_eq!(wid, None);
+    }
+
+    // ====================================================================
+    // Column Width Preset Tests
+    // ====================================================================
+
+    #[test]
+    fn test_set_column_width_fraction() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(400)).unwrap();
+
+        // Set to half viewport (1920 - 20 outer gaps = 1900 usable)
+        ws.set_focused_column_width_fraction(0.5, 1920);
+        assert_eq!(ws.columns()[0].width(), 950); // 1900 * 0.5
+
+        // Set to one-third
+        ws.set_focused_column_width_fraction(0.333, 1920);
+        assert_eq!(ws.columns()[0].width(), 633); // round(1900 * 0.333)
+    }
+
+    #[test]
+    fn test_set_column_width_fraction_clamp() {
+        let mut ws = Workspace::new();
+        ws.insert_window(1, Some(400)).unwrap();
+
+        // Fraction is clamped to [0.1, 1.0]
+        // Default outer_gap = 10, so usable = 1920 - 20 = 1900
+        ws.set_focused_column_width_fraction(2.0, 1920);
+        let w = ws.columns()[0].width();
+        // fraction clamped to 1.0: (1920 - 20 outer) * 1.0 = 1900
+        assert_eq!(w, 1900);
+    }
+
+    #[test]
+    fn test_equalize_widths() {
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(300)).unwrap();
+        ws.insert_window(2, Some(600)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+
+        // 3 columns, viewport 1920
+        // total_gaps = 10*2 + 10*2 = 40
+        // per_column = (1920 - 40) / 3 = 626
+        ws.equalize_column_widths(1920);
+
+        assert_eq!(ws.columns()[0].width(), 626);
+        assert_eq!(ws.columns()[1].width(), 626);
+        assert_eq!(ws.columns()[2].width(), 626);
+    }
+
+    #[test]
+    fn test_equalize_widths_empty() {
+        let mut ws = Workspace::new();
+        ws.equalize_column_widths(1920); // Should not panic
+    }
+
+    #[test]
+    fn test_unfloat_nonexistent() {
+        let mut ws = Workspace::new();
+        assert!(!ws.unfloat_window(999));
     }
 }
