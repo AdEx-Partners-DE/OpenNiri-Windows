@@ -1,0 +1,12 @@
+<Configuration>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>C:\dev\OpenNiri-Windows</HostFolder>
+      <SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\OpenNiri-Windows</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -ExecutionPolicy Bypass -File C:\Users\WDAGUtilityAccount\Desktop\OpenNiri-Windows\sandbox\start.ps1</Command>
+  </LogonCommand>
+</Configuration>
