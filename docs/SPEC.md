@@ -380,8 +380,10 @@ swipe_up = "focus_up"
 swipe_down = "focus_down"
 ```
 
-- Horizontal touchpad scroll maps to workspace strip scrolling
-- Discrete swipe gestures (threshold-based) map to configurable commands
+- Uses a low-level mouse hook (WH_MOUSE_LL) to capture WM_MOUSEWHEEL and WM_MOUSEHWHEEL events
+- Accumulated scroll delta triggers discrete swipe events when threshold (360 units = 3x WHEEL_DELTA) is exceeded
+- Swipe events map to configurable commands (default: focus navigation)
+- Accumulator resets after 300ms of no scroll input
 - Disabled by default
 
 ---
@@ -398,13 +400,15 @@ When monitors are connected/disconnected:
 
 ## Workspace Persistence
 
-Window layout state can be saved and restored across daemon restarts:
-- Layout structure (columns, window order, scroll offset) saved to `%APPDATA%/openniri/workspace-state.json`
-- On startup, windows are matched to persisted positions by class name and executable
-- Auto-saves on daemon shutdown
+Workspace scroll offsets and focus state can be saved and restored across daemon restarts:
+- Per-monitor scroll offset and focused monitor saved to `%APPDATA%/openniri/data/workspace-state.json`
+- Monitors are matched by stable device name (e.g., `\\.\DISPLAY1`), not by HMONITOR handle
+- On startup, scroll offsets and focused monitor are restored for matching monitors
+- Window assignment happens fresh via enumeration (HWNDs are not persisted)
+- Auto-saves on daemon shutdown and tray Exit
 
 ---
 
 ## Implementation Status
-- **Implemented (202 tests)**: Core layout engine (87 tests), IPC protocol (13 tests), CLI (28 tests), daemon (44 tests), integration tests (17 tests), platform layer (13 tests). Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations, per-window floating/rules, system tray, visual snap hints, focus follows mouse, display change handling, touchpad gesture support, workspace persistence.
+- **Implemented (206 tests)**: Core layout engine (87 tests), IPC protocol (13 tests), CLI (28 tests), daemon (48 tests), integration tests (17 tests), platform layer (13 tests). Win32 enumeration with cloaked window filtering, monitor detection, batched positioning (DeferWindowPos), DWM cloaking, async daemon with IPC server and WinEvent hooks, CLI with IPC client and timeout, configuration file support (TOML), multi-monitor workspaces, global hotkeys with live reload, smooth scroll animations, per-window floating/rules, system tray, visual snap hints, focus follows mouse, display change handling, touchpad gesture support, workspace persistence.
 - **All major features implemented.** Remaining work is polish, testing, and documentation.

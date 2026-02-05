@@ -520,8 +520,8 @@ impl Config {
 pub fn config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // 1. Windows standard: %APPDATA%/openniri/config.toml
-    if let Some(proj_dirs) = ProjectDirs::from("com", "openniri", "openniri") {
+    // 1. Windows standard: %APPDATA%/openniri/config/config.toml
+    if let Some(proj_dirs) = ProjectDirs::from("", "", "openniri") {
         paths.push(proj_dirs.config_dir().join("config.toml"));
     }
 

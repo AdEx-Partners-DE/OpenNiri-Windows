@@ -198,7 +198,7 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - `install_event_hooks()` - WinEvent hooks for window lifecycle (with catch_unwind)
   - `register_hotkeys()` - Global hotkey registration with reload support
   - `install_mouse_hook()` - Low-level mouse hook for focus-follows-mouse
-  - `register_gestures()` - Touchpad gesture detection via pointer input
+  - `register_gestures()` - Touchpad gesture detection via low-level mouse hook (WM_MOUSEWHEEL/WM_MOUSEHWHEEL)
   - `set_display_change_sender()` - Monitor hotplug event forwarding
   - `is_valid_window()` - HWND validation
   - `get_process_executable()` - Process executable name lookup
@@ -255,7 +255,7 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - Visual snap hints (overlay window)
   - Focus follows mouse (low-level mouse hook with debouncing)
   - Display change detection and monitor reconciliation
-  - Touchpad gesture support (pointer input detection)
+  - Touchpad gesture support (low-level mouse hook with wheel accumulation)
   - Workspace state persistence (save/restore across restarts)
   - HWND validation on window events
   - catch_unwind in all Win32 callbacks
@@ -364,7 +364,7 @@ Viewport scrolling uses animated transitions:
 - **Main Thread**: Tokio async event loop, IPC server, command processing
 - **WinEvent Callback**: Runs on Windows thread pool, posts to main thread via channel
 - **Hotkey Thread**: Dedicated message window for RegisterHotKey events
-- **Gesture Thread**: Dedicated message window for pointer input
+- **Gesture Hook**: Low-level mouse hook for wheel event accumulation (WH_MOUSE_LL)
 - **Mouse Hook Thread**: Low-level mouse hook for focus-follows-mouse
 - **Tray Event Thread**: Forwards tray menu clicks to main loop
 - **Animation Timer**: Tokio interval, ~60 FPS, on-demand start/stop

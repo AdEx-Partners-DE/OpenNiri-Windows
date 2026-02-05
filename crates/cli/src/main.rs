@@ -72,7 +72,7 @@ enum Commands {
     Reload,
     /// Generate default configuration file
     Init {
-        /// Output path (default: %APPDATA%/openniri/config.toml)
+        /// Output path (default: %APPDATA%/openniri/config/config.toml)
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Overwrite existing config file
@@ -342,7 +342,7 @@ log_level = "info"
 
 /// Get the default config file path.
 fn default_config_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "openniri", "openniri")
+    ProjectDirs::from("", "", "openniri")
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
