@@ -35,10 +35,14 @@ Rust
 - `docs/ARCHITECTURE.md` - Technical architecture and crate responsibilities
 - `docs/SPEC.md` - Behavioral specification
 - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` - Codex review findings and open items
+- `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json` - Machine-readable blocker/task status
+- `docs/1_Progress and review/OPEN_ITEMS.md` - Human-readable open-work dashboard
 - `docs/1_Progress and review/ITERATION_LOG.md` - Development iteration tracking (update after each iteration)
 
 ## Notes
 - **Codex Review**: Review `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` for feedback and open items before making changes.
+- **Blocker Tracking**: Update both `CODEX_BLOCKER_FIX_PLAN.json` and `OPEN_ITEMS.md` when tasks move from open -> done.
+- **Housekeeping**: Follow `docs/1_Progress and review/REVIEW_HOUSEKEEPING.md` to archive superseded files and keep only open work active.
 - **Iteration Log**: After completing each development iteration, update `docs/1_Progress and review/ITERATION_LOG.md` with:
   - Iteration number and date
   - Objectives and status
@@ -70,4 +74,11 @@ Rust
 - For risky operations, ensure a rollback path (backup, version history, or scripted revert).
 - Avoid unrelated refactors; keep changes scoped.
 <!-- PORTFOLIO_BASELINE_END -->
+## Portfolio Governance Standard
+- `C:\dev\0_repo_overarching\docs\agents\golden_repo_governance_proposal_v1.md`
+- `C:\dev\0_repo_overarching\docs\agents\golden_repo_rollout_playbook_v1.md`
+- `C:\dev\0_repo_overarching\docs\agents\agent_contract_snippet.md`
+- `C:\dev\0_repo_overarching\docs\agents\multi_agent_concurrency_policy_v1.md`
+- `C:\dev\0_repo_overarching\docs\agents\review_role_policy_v1.md`
+- `C:\dev\0_repo_overarching\docs\agents\cross_repo_collaboration_protocol_v1.md`
 
