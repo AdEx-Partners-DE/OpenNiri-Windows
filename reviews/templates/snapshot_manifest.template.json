@@ -1,0 +1,14 @@
+{
+  "reviewId": "RV-YYYYMMDD-rNN",
+  "capturedAt": "YYYY-MM-DDTHH:MM:SSZ",
+  "repo": "repo-name",
+  "branch": "branch-name",
+  "head": "commit-sha",
+  "files": [
+    {
+      "path": "path/to/file.ext",
+      "sha256": "hex-digest"
+    }
+  ],
+  "notes": "Snapshot anchor for the reviewed state."
+}

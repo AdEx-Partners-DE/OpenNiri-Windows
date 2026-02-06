@@ -1,0 +1,28 @@
+{
+  "reviewId": "RV-YYYYMMDD-rNN",
+  "date": "YYYY-MM-DD",
+  "scope": "modules/files/features",
+  "summary": {
+    "total": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 0,
+    "openHigh": 0,
+    "openMedium": 0
+  },
+  "findings": [
+    {
+      "id": "RV-YYYYMMDD-rNN-F001",
+      "severity": "HIGH",
+      "status": "open",
+      "title": "Finding title",
+      "owner": "implementation",
+      "references": [
+        "path/to/file.ext:line"
+      ],
+      "impact": "What breaks or risks created.",
+      "requiredFix": "What must be changed.",
+      "acceptanceTest": "Command/check proving closure."
+    }
+  ]
+}
