@@ -2,7 +2,7 @@
 
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
-> **Last Updated**: 2026-02-06 (Iteration 32 — Public README and GitHub About Revamp)
+> **Last Updated**: 2026-02-06 (Iteration 33 — Public Readiness Checklist and Messaging Polish)
 
 ---
 
@@ -79,10 +79,51 @@ OpenNiri-Windows/
 | 30 | 2026-02-05 | Crash safety and reliability: Ctrl+C shutdown, uncloak-on-exit/crash, DPI awareness | 295 | 302 | 297 passed, 5 ignored, strict clippy clean |
 | 31 | 2026-02-05 | Public repo presentation refresh (README + GitHub metadata) | 302 | 302 | README rewrite, GitHub description/topics updated |
 | 32 | 2026-02-06 | Public messaging revamp (README v2 + GitHub About cleanup) | 302 | 302 | Professionalized README structure, tightened GitHub positioning and discovery topics |
+| 33 | 2026-02-06 | Public readiness planning and enterprise README polish | 302 | 302 | Added public-readiness execution checklist and refined README for adoption clarity |
 
 ---
 
 ## Detailed Iteration Logs
+
+### Iteration 33: Public Readiness Checklist and Messaging Polish
+
+**Date**: 2026-02-06
+**Status**: COMPLETED
+**Previous Context**: Iteration 32 (Public README and GitHub About Revamp)
+
+#### 33.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Improve README tone for external users and evaluators | High | DONE |
+| 2 | Add explicit public-usability checklist for execution planning | High | DONE |
+| 3 | Link readiness workstream directly from README | High | DONE |
+
+#### 33.2 Changes Made
+
+- Refined `README.md` with clearer product positioning for public audiences:
+  - Added "Who this is for" and "Capability Snapshot" framing.
+  - Added explicit daily-start usage path and runtime/config path references.
+  - Added direct link to readiness execution checklist.
+- Added `docs/PUBLIC_READINESS_CHECKLIST.md`:
+  - Defined public-usability "definition of done."
+  - Added 8 execution domains (distribution, onboarding, reliability, compatibility, security, support, release engineering, governance).
+  - Added prioritized top-10 immediate tasks for near-term execution.
+
+#### 33.3 Test Results
+
+No Rust code changes in this iteration.
+
+**Test Growth**: 302 -> 302 (unchanged)
+
+#### 33.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| GitHub metadata check | `gh repo view AdEx-Partners-DE/OpenNiri-Windows --json description,repositoryTopics,url` | Description/topics remain aligned |
+| README and checklist sanity check | Manual markdown review | Sections are coherent and cross-linked |
+
+---
 
 ### Iteration 32: Public README and GitHub About Revamp
 
@@ -2295,12 +2336,13 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | 30 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
 | 31 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
 | 32 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
+| 33 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
 
 ---
 
 ## Architecture Evolution
 
-### Current State (Post-Iteration 32)
+### Current State (Post-Iteration 33)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -2355,7 +2397,7 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | Config `default_config_path` unused | Low | 10 | Minor (dead code warning) |
 | `monitors_list` method unused | Low | 11 | Minor (dead code warning) |
 | No end-to-end daemon integration tests | Medium | - | Partially addressed in Iteration 27 |
-| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 32 |
+| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 33 |
 
 ---
 
@@ -2425,7 +2467,21 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 
 ---
 
-### Iteration 33 (Planned)
+### Iteration 33 (Public Readiness Checklist and Messaging Polish)
+
+**Focus**: Make external adoption path explicit and execution-ready
+
+**Completed**:
+1. Added `docs/PUBLIC_READINESS_CHECKLIST.md` with definition-of-done and 8 readiness domains.
+2. Added prioritized "Immediate Next 10" public rollout tasks.
+3. Polished README structure for clearer public onboarding and expectations.
+4. Linked readiness checklist directly from README.
+
+**Tests**: 302 -> 302 (no code changes in this iteration)
+
+---
+
+### Iteration 34 (Planned)
 
 **Focus**: Polish & Advanced Features
 

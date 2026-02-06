@@ -5,18 +5,26 @@
 
 OpenNiri-Windows is a scrollable tiling window manager for Windows 10/11, built in Rust.
 
-It brings the Niri-style "infinite horizontal workspace" workflow to native Windows (without replacing DWM).
+It brings the Niri-style horizontal workspace model to native Windows without replacing DWM.
 
-## Why This Project Exists
+## Product Positioning
 
-Most Windows tilers are tree/BSP-driven. OpenNiri-Windows uses a different model:
+Most Windows tilers are tree/BSP-driven. OpenNiri-Windows is scroll-first:
 
 - Windows are arranged on a horizontal strip.
 - Your monitor acts as a viewport over that strip.
 - Navigation remains spatially consistent as windows are added.
-- You scroll and focus across workspace history instead of constantly re-splitting trees.
+- You move through workspace context instead of constantly rebuilding split trees.
 
-## What Works Today
+## Who This Is For
+
+- Keyboard-driven users who manage many windows every day.
+- Engineers, analysts, operators, and creators on single or multi-monitor setups.
+- Teams that want an open-source Windows tiler with transparent architecture and Rust codebase.
+
+## Capability Snapshot
+
+Implemented now:
 
 - Multi-monitor workspaces with monitor-aware focus and move commands
 - Global hotkeys with live config reload
@@ -24,7 +32,7 @@ Most Windows tilers are tree/BSP-driven. OpenNiri-Windows uses a different model
 - Width presets (`Win+1/2/3`) and equalize (`Win+0`)
 - Smooth scroll animations, snap hints, and touchpad gestures
 - Optional focus-follows-mouse
-- System tray actions: pause/reload/open config/open logs/exit
+- System tray actions (pause/reload/open config/open logs/exit)
 - Workspace persistence and safer shutdown/recovery behavior
 
 ## Product Status
@@ -34,10 +42,10 @@ OpenNiri-Windows is **alpha** and under active development.
 What this means in practice:
 
 - Core behavior is implemented and tested in CI.
-- UX is still keyboard/config-first (no full GUI configuration flow yet).
+- UX is currently keyboard/config-first (no full GUI setup flow yet).
 - Some Windows-managed/system windows can reject movement or styling operations.
 
-## Quick Start
+## Quick Start (3 Minutes)
 
 ### Prerequisites
 
@@ -54,11 +62,17 @@ cargo run -p openniri-cli -- init
 cargo run -p openniri-cli -- run
 ```
 
-### Check Status / Stop
+### Verify / Stop
 
 ```bash
 cargo run -p openniri-cli -- status
 cargo run -p openniri-cli -- stop
+```
+
+### Daily Start
+
+```bash
+cargo run -p openniri-cli -- run
 ```
 
 ## Default Hotkeys
@@ -78,9 +92,20 @@ cargo run -p openniri-cli -- stop
 | `Win+0` | Equalize all column widths |
 | `Win+R` | Refresh (re-enumerate windows) |
 
-Config file location:
+## Config and Runtime Paths
+
+Config file:
 
 - `%APPDATA%\\openniri\\config\\config.toml`
+
+State data:
+
+- `%APPDATA%\\openniri\\data\\workspace-state.json`
+
+Daemon logs:
+
+- `%TEMP%\\openniri-daemon.log`
+- `%TEMP%\\openniri-daemon.err.log`
 
 ## Architecture
 
@@ -100,6 +125,7 @@ Technical docs:
 - `docs/ARCHITECTURE.md`
 - `docs/WINDOWS_CONSTRAINTS.md`
 - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+- `docs/PUBLIC_READINESS_CHECKLIST.md`
 
 ## Platform Constraints
 
@@ -108,6 +134,12 @@ OpenNiri-Windows is a **window controller**, not a compositor.
 - DWM remains the compositor.
 - Elevated or protected windows may reject placement/styling changes.
 - Behavior can vary across app frameworks (Win32/WPF/Electron/UWP).
+
+## Public Readiness Plan
+
+The execution checklist for shipping this as a polished public product is here:
+
+- `docs/PUBLIC_READINESS_CHECKLIST.md`
 
 ## Contributing
 
