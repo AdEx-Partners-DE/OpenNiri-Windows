@@ -2,7 +2,7 @@
 
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
-> **Last Updated**: 2026-02-05 (Iteration 30 — Crash Safety and Reliability)
+> **Last Updated**: 2026-02-06 (Iteration 32 — Public README and GitHub About Revamp)
 
 ---
 
@@ -77,10 +77,54 @@ OpenNiri-Windows/
 | 28 | 2026-02-05 | Codex Review 19 Fixes | 257 | 261 | reconcile_monitors bug fix, 7 strengthened tests, 3 new cmd tests, clippy --all-targets clean |
 | 29 | 2026-02-05 | UX overhaul: SetForegroundWindow, CloseWindow, ToggleFloating, ToggleFullscreen, column presets, active border, status, tray menu, auto-start | 261 | 295 | 0 warnings |
 | 30 | 2026-02-05 | Crash safety and reliability: Ctrl+C shutdown, uncloak-on-exit/crash, DPI awareness | 295 | 302 | 297 passed, 5 ignored, strict clippy clean |
+| 31 | 2026-02-05 | Public repo presentation refresh (README + GitHub metadata) | 302 | 302 | README rewrite, GitHub description/topics updated |
+| 32 | 2026-02-06 | Public messaging revamp (README v2 + GitHub About cleanup) | 302 | 302 | Professionalized README structure, tightened GitHub positioning and discovery topics |
 
 ---
 
 ## Detailed Iteration Logs
+
+### Iteration 32: Public README and GitHub About Revamp
+
+**Date**: 2026-02-06
+**Status**: COMPLETED
+**Previous Context**: Iteration 31 (Repository Presentation Refresh)
+
+#### 32.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Replace generic README language with product-grade messaging | High | DONE |
+| 2 | Clarify "why", status, and usage expectations for public users | High | DONE |
+| 3 | Expand quick-start and default hotkey reference coverage | Medium | DONE |
+| 4 | Ensure GitHub About metadata reflects current project scope | High | DONE |
+
+#### 32.2 Changes Made
+
+- Reworked `README.md` to improve first impression and reduce ambiguity:
+  - Added CI and license badges.
+  - Tightened positioning and "why this project exists" narrative.
+  - Added explicit product status (alpha) and expectation-setting.
+  - Expanded hotkey table to include monitor focus/move and refresh actions.
+  - Added config path and clearer architecture/doc references.
+- Updated GitHub repository metadata to align with project identity and discoverability:
+  - Description aligned to actual product behavior.
+  - Topics reviewed/updated for better categorization.
+
+#### 32.3 Test Results
+
+No Rust code changes in this iteration.
+
+**Test Growth**: 302 -> 302 (unchanged)
+
+#### 32.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| GitHub metadata check | `gh repo view AdEx-Partners-DE/OpenNiri-Windows --json description,repositoryTopics,url` | Description/topics match new positioning |
+| README sanity check | Manual markdown review | Sections render and link cleanly |
+
+---
 
 ### Iteration 30: Crash Safety and Reliability
 
@@ -2249,12 +2293,14 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | 28 | 87 | 15 | 16 (+2 ignored) | 89 (+29 cli, +22 integration, +1 ignored) | 261 |
 | 29 | 99 | 15 | 23 (+2 ignored) | 97 (+38 cli, +22 integration, +1 ignored) | 295 |
 | 30 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
+| 31 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
+| 32 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
 
 ---
 
 ## Architecture Evolution
 
-### Current State (Post-Iteration 30)
+### Current State (Post-Iteration 32)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -2309,7 +2355,7 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | Config `default_config_path` unused | Low | 10 | Minor (dead code warning) |
 | `monitors_list` method unused | Low | 11 | Minor (dead code warning) |
 | No end-to-end daemon integration tests | Medium | - | Partially addressed in Iteration 27 |
-| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 24 |
+| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 32 |
 
 ---
 
@@ -2352,7 +2398,34 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 
 ---
 
-### Iteration 31 (Planned)
+### Iteration 31 (Repository Presentation Refresh)
+
+**Focus**: Public-facing quality of project messaging and GitHub profile
+
+**Completed**:
+1. Rewrote `README.md` to present product intent, current capability surface, and practical quick-start flow.
+2. Removed low-signal public framing and replaced it with concise product-oriented positioning.
+3. Updated GitHub repository metadata (description + topics) to match project scope and quality bar.
+
+**Tests**: 302 -> 302 (no code changes in this iteration)
+
+---
+
+### Iteration 32 (Public README + GitHub About Revamp)
+
+**Focus**: Raise public repository quality and make onboarding expectations explicit
+
+**Completed**:
+1. Rebuilt `README.md` structure with clearer product framing and user expectations.
+2. Added fuller default-hotkey coverage and more direct quick-start/stop flow.
+3. Tightened architecture/documentation references for easier contributor orientation.
+4. Updated GitHub About metadata to better match current implementation surface.
+
+**Tests**: 302 -> 302 (no code changes in this iteration)
+
+---
+
+### Iteration 33 (Planned)
 
 **Focus**: Polish & Advanced Features
 

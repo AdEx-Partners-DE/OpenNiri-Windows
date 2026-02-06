@@ -1,95 +1,118 @@
 # OpenNiri-Windows
 
-An open-source scrollable-tiling window manager for Windows, inspired by [Niri](https://github.com/YaLTeR/niri).
+[![CI](https://github.com/AdEx-Partners-DE/OpenNiri-Windows/actions/workflows/ci.yml/badge.svg)](https://github.com/AdEx-Partners-DE/OpenNiri-Windows/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 
-## What is Scrollable Tiling?
+OpenNiri-Windows is a scrollable tiling window manager for Windows 10/11, built in Rust.
 
-Traditional tiling window managers divide your screen into fixed regions. When you open a new window, existing windows shrink to make room.
+It brings the Niri-style "infinite horizontal workspace" workflow to native Windows (without replacing DWM).
 
-**Scrollable tiling** takes a different approach: windows are arranged on an **infinite horizontal strip**, and your monitor acts as a **viewport** (camera) that slides over this strip. When you open a new window, it simply appends to the strip without affecting existing windows.
+## Why This Project Exists
 
-This paradigm offers significant ergonomic advantages:
-- Maintain spatial memory of your applications ("browser is to the right of terminal")
-- No window resizing when opening new apps
-- Navigate with smooth horizontal scrolling
-- Perfect for ultrawide monitors and multi-tasking workflows
+Most Windows tilers are tree/BSP-driven. OpenNiri-Windows uses a different model:
 
-## Project Status
+- Windows are arranged on a horizontal strip.
+- Your monitor acts as a viewport over that strip.
+- Navigation remains spatially consistent as windows are added.
+- You scroll and focus across workspace history instead of constantly re-splitting trees.
 
-**Early Development** - This project is in its initial stages. Core layout algorithms are being implemented.
+## What Works Today
 
-## Architecture
+- Multi-monitor workspaces with monitor-aware focus and move commands
+- Global hotkeys with live config reload
+- Floating and fullscreen toggles
+- Width presets (`Win+1/2/3`) and equalize (`Win+0`)
+- Smooth scroll animations, snap hints, and touchpad gestures
+- Optional focus-follows-mouse
+- System tray actions: pause/reload/open config/open logs/exit
+- Workspace persistence and safer shutdown/recovery behavior
 
-OpenNiri-Windows is structured as a Rust workspace with four crates:
+## Product Status
 
-| Crate | Purpose |
-|-------|---------|
-| `openniri-core-layout` | Platform-agnostic scrollable strip layout engine |
-| `openniri-platform-win32` | Windows-specific HWND manipulation, DWM cloaking |
-| `openniri-daemon` | Main event loop and state machine |
-| `openniri-cli` | Command-line interface for control |
+OpenNiri-Windows is **alpha** and under active development.
 
-## Why Not Port Niri Directly?
+What this means in practice:
 
-Niri is a Wayland compositor that owns the entire rendering pipeline. On Windows, the Desktop Window Manager (DWM) is the exclusive compositor - no user-space application can replace it. OpenNiri-Windows operates as a "window controller" that manipulates window positions while DWM handles compositing.
+- Core behavior is implemented and tested in CI.
+- UX is still keyboard/config-first (no full GUI configuration flow yet).
+- Some Windows-managed/system windows can reject movement or styling operations.
 
-## Comparison
-
-| Feature | Niri (Linux) | Komorebi | GlazeWM | OpenNiri-Windows |
-|---------|--------------|----------|---------|------------------|
-| Scrollable tiling | Yes | Partial | No | **Goal** |
-| Open source | GPL-3.0 | Source-available | GPL-3.0 | GPL-3.0 |
-| Redistributable | Yes | No | Yes | **Yes** |
-| Language | Rust | Rust | Rust | Rust |
-
-## Building
+## Quick Start
 
 ### Prerequisites
 
-- Rust (stable toolchain)
-- Visual Studio Build Tools with "C++ build tools" workload
+- Rust (stable)
+- GNU Windows target (`x86_64-pc-windows-gnu`)
 
-### Build Commands
+### Install and Run
 
 ```bash
-# Clone the repository
 git clone https://github.com/AdEx-Partners-DE/OpenNiri-Windows.git
 cd OpenNiri-Windows
-
-# Build all crates
 cargo build --release
-
-# Run tests
-cargo test --all
+cargo run -p openniri-cli -- init
+cargo run -p openniri-cli -- run
 ```
 
-### Troubleshooting
+### Check Status / Stop
 
-**Linker error: "link: extra operand"**
+```bash
+cargo run -p openniri-cli -- status
+cargo run -p openniri-cli -- stop
+```
 
-This occurs when Git Bash's `link` command shadows MSVC's `link.exe`. Solutions:
-1. Use the "Developer Command Prompt for VS" instead of Git Bash
-2. Or add MSVC bin directory to PATH before Git: `C:\Program Files\Microsoft Visual Studio\...\VC\Tools\MSVC\...\bin\Hostx64\x64`
+## Default Hotkeys
 
-## Usage
+| Key | Action |
+|---|---|
+| `Win+H / Win+L` | Focus left / right |
+| `Win+J / Win+K` | Focus down / up |
+| `Win+Shift+H / Win+Shift+L` | Move column left / right |
+| `Win+Ctrl+H / Win+Ctrl+L` | Shrink / grow column |
+| `Win+Alt+H / Win+Alt+L` | Focus monitor left / right |
+| `Win+Alt+Shift+H / Win+Alt+Shift+L` | Move window to monitor left / right |
+| `Win+Shift+Q` | Close focused window |
+| `Win+F` | Toggle floating |
+| `Win+Shift+F` | Toggle fullscreen |
+| `Win+1 / Win+2 / Win+3` | Set width to 1/3, 1/2, 2/3 |
+| `Win+0` | Equalize all column widths |
+| `Win+R` | Refresh (re-enumerate windows) |
 
-*Coming soon* - The project is in early development.
+Config file location:
+
+- `%APPDATA%\\openniri\\config\\config.toml`
+
+## Architecture
+
+OpenNiri-Windows is a Rust workspace:
+
+| Crate | Responsibility |
+|---|---|
+| `openniri-core-layout` | Platform-agnostic layout engine |
+| `openniri-platform-win32` | Win32 integration and window operations |
+| `openniri-ipc` | Named-pipe command/response protocol |
+| `openniri-daemon` | Runtime event loop and state management |
+| `openniri-cli` | User-facing command line interface |
+
+Technical docs:
+
+- `docs/SPEC.md`
+- `docs/ARCHITECTURE.md`
+- `docs/WINDOWS_CONSTRAINTS.md`
+- `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+
+## Platform Constraints
+
+OpenNiri-Windows is a **window controller**, not a compositor.
+
+- DWM remains the compositor.
+- Elevated or protected windows may reject placement/styling changes.
+- Behavior can vary across app frameworks (Win32/WPF/Electron/UWP).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See `CONTRIBUTING.md`.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Niri](https://github.com/YaLTeR/niri) - The original scrollable-tiling Wayland compositor
-- [PaperWM](https://github.com/paperwm/PaperWM) - GNOME extension that pioneered the scrollable tiling concept
-- [Komorebi](https://github.com/LGUG2Z/komorebi) - Windows tiling WM that informed Windows platform constraints
-- [GlazeWM](https://github.com/glzr-io/glazewm) - Open-source Windows tiling WM
-
-## Research
-
-The `0_Research/` directory contains feasibility studies and research documents that informed the project's technical decisions.
+GPL-3.0. See `LICENSE`.
