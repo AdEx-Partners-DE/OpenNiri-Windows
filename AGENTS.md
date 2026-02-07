@@ -81,4 +81,17 @@ Rust
 - `C:\dev\0_repo_overarching\docs\agents\multi_agent_concurrency_policy_v1.md`
 - `C:\dev\0_repo_overarching\docs\agents\review_role_policy_v1.md`
 - `C:\dev\0_repo_overarching\docs\agents\cross_repo_collaboration_protocol_v1.md`
+## Mandatory Preflight (Parallel Agents)
+- If same-repo parallel work exists or is expected, create a dedicated worktree before editing.
+- Shared-tree mode is single-lane only; do not attach a second lane to the shared tree.
+- In single-lane shared-tree mode, capture baseline first:
+  - `git status --porcelain`
+  - `git rev-parse --short HEAD`
+- For dependency-affecting changes, require:
+  - `docs/projects/portfolio_integration_board.md` row
+  - `docs/projects/change_packets/<change-id>.md`
+  - consumer acknowledgment before `done`
+  - producer+consumer tests + rollback artifact linked
+- Operational check command:
+  - `pwsh C:\dev\0_repo_overarching\scripts\portfolio\run-coordination-control-pass.ps1`
 
