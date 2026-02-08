@@ -90,7 +90,10 @@ Rust
 - For dependency-affecting changes, require:
   - `docs/projects/portfolio_integration_board.md` row
   - `docs/projects/change_packets/<change-id>.md`
+  - `docs/projects/cross_repo_handoff_queue.md` row
+  - if uncertain, treat change as dependency-affecting
   - consumer acknowledgment before `done`
+  - consumer acknowledgment recorded on integration board
   - producer+consumer tests + rollback artifact linked
 - Operational check command:
   - `pwsh C:\dev\0_repo_overarching\scripts\portfolio\run-coordination-control-pass.ps1`
