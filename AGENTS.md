@@ -97,4 +97,13 @@ Rust
   - producer+consumer tests + rollback artifact linked
 - Operational check command:
   - `pwsh C:\dev\0_repo_overarching\scripts\portfolio\run-coordination-control-pass.ps1`
+## Visual Intake (Screenshots)
+
+- If user asks for screenshot/image review and no explicit path is provided, check:
+  - `C:\Users\stark\Downloads`
+  - `C:\Users\stark\OneDrive\Bilder\Screenshots`
+- Prefer newest image by timestamp (target freshness <= 10 minutes unless user says otherwise).
+- Preferred command:
+  - `pwsh C:\dev\0_repo_overarching\scripts\portfolio\find-latest-screenshot.ps1 -MaxAgeMinutes 10`
+
 
