@@ -22,6 +22,7 @@ windows = { version = "0.59", features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
@@ -50,3 +51,8 @@ anyhow = "1"
 # Configuration
 toml = "0.8"
 directories = "5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

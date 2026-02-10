@@ -34,6 +34,8 @@ Implemented now:
 - Optional focus-follows-mouse
 - System tray actions (pause/reload/open config/open logs/exit)
 - Workspace persistence and safer shutdown/recovery behavior
+- Safe mode for troubleshooting (`--safe-mode`)
+- Built-in diagnostics (`openniri-cli doctor`)
 
 ## Product Status
 
@@ -44,36 +46,67 @@ What this means in practice:
 - Core behavior is implemented and tested in CI.
 - UX is currently keyboard/config-first (no full GUI setup flow yet).
 - Some Windows-managed/system windows can reject movement or styling operations.
+- Current release state (as of 2026-02-08): no tagged public release yet, so source build is the primary install path.
 
-## Quick Start (3 Minutes)
+## Quick Start
 
-### Prerequisites
+### Option A: Download (When Available)
 
-- Rust (stable)
-- GNU Windows target (`x86_64-pc-windows-gnu`)
+1. Open [GitHub Releases](https://github.com/AdEx-Partners-DE/OpenNiri-Windows/releases)
+2. If a tagged release is available, download the latest `.zip` archive
+3. Extract `openniri.exe` and `openniri-cli.exe` to a folder
+4. (Optional) Add the folder to your `PATH`
+5. Generate a default config:
+   ```
+   openniri-cli init
+   ```
+6. Start the daemon:
+   ```
+   openniri-cli run
+   ```
 
-### Install and Run
+### Option B: Build from Source (Recommended for Current Alpha)
+
+Prerequisites: [Rust](https://rustup.rs) GNU toolchain (`stable-x86_64-pc-windows-gnu`) and MinGW linker
 
 ```bash
+rustup toolchain install stable-x86_64-pc-windows-gnu
 git clone https://github.com/AdEx-Partners-DE/OpenNiri-Windows.git
 cd OpenNiri-Windows
-cargo build --release
-cargo run -p openniri-cli -- init
-cargo run -p openniri-cli -- run
+cargo +stable-x86_64-pc-windows-gnu build --release
+cargo +stable-x86_64-pc-windows-gnu run -p openniri-cli -- init
+cargo +stable-x86_64-pc-windows-gnu run -p openniri-cli -- run
 ```
 
-### Verify / Stop
+The workspace is configured for GNU (`x86_64-pc-windows-gnu`) in `.cargo/config.toml`, and binaries are placed in `target/release/`.
 
-```bash
-cargo run -p openniri-cli -- status
-cargo run -p openniri-cli -- stop
+## First Steps After Install
+
+| Step | Command | What It Does |
+|------|---------|--------------|
+| Create config | `openniri-cli init` | Writes a default `config.toml` with comments |
+| Start daemon | `openniri-cli run` | Launches the window manager in the background |
+| Check status | `openniri-cli status` | Shows version, monitors, windows, uptime |
+| Run diagnostics | `openniri-cli doctor` | Checks binary, config, daemon, and system state |
+| Stop daemon | `openniri-cli stop` | Requests daemon shutdown (verify with `status` before restarting) |
+| Reload config | `openniri-cli reload` | Applies config changes without restarting |
+
+If the desktop feels stuck or windows go invisible, use non-destructive recovery first:
+
+```
+openniri-cli panic-revert
+openniri-cli status   # should fail with "Failed to connect..." before rerun
 ```
 
-### Daily Start
+If the CLI is blocked but the tray is reachable, use **Emergency: Uncloak All Windows**, then **Exit**.
 
-```bash
-cargo run -p openniri-cli -- run
+Only after `status` confirms shutdown should you retry in safe mode:
+
 ```
+openniri-cli run --safe-mode
+```
+
+For a full walkthrough, see [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
 ## Default Hotkeys
 
@@ -92,20 +125,32 @@ cargo run -p openniri-cli -- run
 | `Win+0` | Equalize all column widths |
 | `Win+R` | Refresh (re-enumerate windows) |
 
+## Start Automatically with Windows
+
+```bash
+openniri-cli autostart enable
+```
+
+This writes a Registry entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that launches the daemon on login. To disable:
+
+```bash
+openniri-cli autostart disable
+```
+
 ## Config and Runtime Paths
 
 Config file:
 
-- `%APPDATA%\\openniri\\config\\config.toml`
+- `%APPDATA%\openniri\config\config.toml`
 
 State data:
 
-- `%APPDATA%\\openniri\\data\\workspace-state.json`
+- `%APPDATA%\openniri\data\workspace-state.json`
 
 Daemon logs:
 
-- `%TEMP%\\openniri-daemon.log`
-- `%TEMP%\\openniri-daemon.err.log`
+- `%TEMP%\openniri-daemon.log`
+- `%TEMP%\openniri-daemon.err.log`
 
 ## Architecture
 
@@ -121,11 +166,12 @@ OpenNiri-Windows is a Rust workspace:
 
 Technical docs:
 
-- `docs/SPEC.md`
-- `docs/ARCHITECTURE.md`
-- `docs/WINDOWS_CONSTRAINTS.md`
-- `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
-- `docs/PUBLIC_READINESS_CHECKLIST.md`
+- [Getting Started](docs/GETTING_STARTED.md) - Step-by-step walkthrough
+- [Configuration](docs/CONFIGURATION.md) - Full config reference with examples
+- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and debugging guide
+- [Specification](docs/SPEC.md) - Design specification
+- [Architecture](docs/ARCHITECTURE.md) - Architecture overview
+- [Windows Constraints](docs/WINDOWS_CONSTRAINTS.md) - Win32 platform constraints
 
 ## Platform Constraints
 
@@ -134,12 +180,6 @@ OpenNiri-Windows is a **window controller**, not a compositor.
 - DWM remains the compositor.
 - Elevated or protected windows may reject placement/styling changes.
 - Behavior can vary across app frameworks (Win32/WPF/Electron/UWP).
-
-## Public Readiness Plan
-
-The execution checklist for shipping this as a polished public product is here:
-
-- `docs/PUBLIC_READINESS_CHECKLIST.md`
 
 ## Contributing
 

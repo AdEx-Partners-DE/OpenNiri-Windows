@@ -6,12 +6,12 @@
 //! - Exit daemon
 
 use std::sync::mpsc;
+use thiserror::Error;
+use tracing::{debug, info};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     TrayIcon, TrayIconBuilder,
 };
-use thiserror::Error;
-use tracing::{debug, info};
 
 /// Menu item IDs for tray context menu.
 mod menu_ids {
@@ -21,6 +21,7 @@ mod menu_ids {
     pub const TOGGLE_PAUSE: &str = "toggle_pause";
     pub const OPEN_CONFIG: &str = "open_config";
     pub const VIEW_LOGS: &str = "view_logs";
+    pub const EMERGENCY_UNCLOAK_ALL: &str = "emergency_uncloak_all";
 }
 
 /// Events emitted by the tray icon.
@@ -38,11 +39,15 @@ pub enum TrayEvent {
     OpenConfig,
     /// User clicked "View Logs" menu item.
     ViewLogs,
+    /// User clicked "Emergency: Uncloak All Windows" menu item.
+    EmergencyUncloakAll,
 }
 
 /// Manages the system tray icon and context menu.
 pub struct TrayManager {
-    _tray: TrayIcon,
+    tray: TrayIcon,
+    /// The pause/resume menu item, kept for dynamic text updates.
+    pause_item: MenuItem,
 }
 
 impl TrayManager {
@@ -57,7 +62,8 @@ impl TrayManager {
 
         // Title item (disabled)
         let title = MenuItem::new("OpenNiri Windows", false, None);
-        menu.append(&title).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&title)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Separator
         menu.append(&PredefinedMenuItem::separator())
@@ -65,23 +71,38 @@ impl TrayManager {
 
         // Refresh Windows
         let refresh = MenuItem::with_id(menu_ids::REFRESH, "Refresh Windows", true, None);
-        menu.append(&refresh).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&refresh)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Reload Config
         let reload = MenuItem::with_id(menu_ids::RELOAD, "Reload Config", true, None);
-        menu.append(&reload).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&reload)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Toggle Pause
         let toggle_pause = MenuItem::with_id(menu_ids::TOGGLE_PAUSE, "Pause Tiling", true, None);
-        menu.append(&toggle_pause).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&toggle_pause)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Open Config
         let open_config = MenuItem::with_id(menu_ids::OPEN_CONFIG, "Open Config", true, None);
-        menu.append(&open_config).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&open_config)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // View Logs
         let view_logs = MenuItem::with_id(menu_ids::VIEW_LOGS, "View Logs", true, None);
-        menu.append(&view_logs).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&view_logs)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+        // Emergency: Uncloak All Windows
+        let emergency_uncloak = MenuItem::with_id(
+            menu_ids::EMERGENCY_UNCLOAK_ALL,
+            "Emergency: Uncloak All Windows",
+            true,
+            None,
+        );
+        menu.append(&emergency_uncloak)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Separator
         menu.append(&PredefinedMenuItem::separator())
@@ -89,7 +110,8 @@ impl TrayManager {
 
         // Exit
         let exit = MenuItem::with_id(menu_ids::EXIT, "Exit", true, None);
-        menu.append(&exit).map_err(|e| TrayError::Menu(e.to_string()))?;
+        menu.append(&exit)
+            .map_err(|e| TrayError::Menu(e.to_string()))?;
 
         // Create the tray icon with a simple embedded icon
         let icon = create_default_icon()?;
@@ -107,17 +129,9 @@ impl TrayManager {
         std::thread::spawn(move || {
             let menu_channel = MenuEvent::receiver();
             while let Ok(event) = menu_channel.recv() {
-                let tray_event = match event.id.0.as_str() {
-                    menu_ids::REFRESH => TrayEvent::Refresh,
-                    menu_ids::RELOAD => TrayEvent::Reload,
-                    menu_ids::EXIT => TrayEvent::Exit,
-                    menu_ids::TOGGLE_PAUSE => TrayEvent::TogglePause,
-                    menu_ids::OPEN_CONFIG => TrayEvent::OpenConfig,
-                    menu_ids::VIEW_LOGS => TrayEvent::ViewLogs,
-                    id => {
-                        debug!("Unknown menu item clicked: {}", id);
-                        continue;
-                    }
+                let Some(tray_event) = map_menu_id_to_event(event.id.0.as_str()) else {
+                    debug!("Unknown menu item clicked: {}", event.id.0);
+                    continue;
                 };
 
                 if event_sender.send(tray_event).is_err() {
@@ -128,9 +142,73 @@ impl TrayManager {
         });
 
         Ok(Self {
-            _tray: tray,
+            tray,
+            pause_item: toggle_pause,
         })
     }
+
+    /// Update the pause menu item text based on the current paused state.
+    pub fn update_pause_text(&self, paused: bool) {
+        let text = if paused {
+            "Resume Tiling"
+        } else {
+            "Pause Tiling"
+        };
+        self.pause_item.set_text(text);
+    }
+
+    /// Update the tray tooltip to reflect current state.
+    ///
+    /// If `hotkey_mismatch` is provided as `Some((registered, requested))` and
+    /// registered < requested, a warning is appended to the tooltip.
+    pub fn update_tooltip(
+        &self,
+        window_count: usize,
+        monitor_count: usize,
+        paused: bool,
+        hotkey_mismatch: Option<(usize, usize)>,
+    ) {
+        let tooltip = format_tooltip_text(window_count, monitor_count, paused, hotkey_mismatch);
+        let _ = self.tray.set_tooltip(Some(&tooltip));
+    }
+}
+
+fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {
+    match menu_id {
+        menu_ids::REFRESH => Some(TrayEvent::Refresh),
+        menu_ids::RELOAD => Some(TrayEvent::Reload),
+        menu_ids::EXIT => Some(TrayEvent::Exit),
+        menu_ids::TOGGLE_PAUSE => Some(TrayEvent::TogglePause),
+        menu_ids::OPEN_CONFIG => Some(TrayEvent::OpenConfig),
+        menu_ids::VIEW_LOGS => Some(TrayEvent::ViewLogs),
+        menu_ids::EMERGENCY_UNCLOAK_ALL => Some(TrayEvent::EmergencyUncloakAll),
+        _ => None,
+    }
+}
+
+/// Format the tray tooltip text (testable without requiring a real tray icon).
+pub fn format_tooltip_text(
+    window_count: usize,
+    monitor_count: usize,
+    paused: bool,
+    hotkey_mismatch: Option<(usize, usize)>,
+) -> String {
+    let status = if paused { "Paused" } else { "Active" };
+    let mut tooltip = format!(
+        "OpenNiri - {} ({} windows, {} monitors)",
+        status, window_count, monitor_count
+    );
+    if let Some((registered, requested)) = hotkey_mismatch {
+        if registered < requested {
+            tooltip.push_str(&format!(
+                "\nHotkeys: {}/{} ({} failed)",
+                registered,
+                requested,
+                requested - registered
+            ));
+        }
+    }
+    tooltip
 }
 
 /// Create a default icon for the tray.
@@ -217,5 +295,103 @@ mod tests {
     fn test_create_default_icon() {
         let icon = create_default_icon();
         assert!(icon.is_ok(), "Should create default icon successfully");
+    }
+
+    #[test]
+    fn test_tray_event_toggle_pause_variant() {
+        let event = TrayEvent::TogglePause;
+        assert!(matches!(event, TrayEvent::TogglePause));
+    }
+
+    #[test]
+    fn test_tray_event_emergency_uncloak_variant() {
+        let event = TrayEvent::EmergencyUncloakAll;
+        assert!(matches!(event, TrayEvent::EmergencyUncloakAll));
+    }
+
+    #[test]
+    fn test_map_menu_id_to_event() {
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::REFRESH),
+            Some(TrayEvent::Refresh)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::RELOAD),
+            Some(TrayEvent::Reload)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::EXIT),
+            Some(TrayEvent::Exit)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::TOGGLE_PAUSE),
+            Some(TrayEvent::TogglePause)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::OPEN_CONFIG),
+            Some(TrayEvent::OpenConfig)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::VIEW_LOGS),
+            Some(TrayEvent::ViewLogs)
+        ));
+        assert!(matches!(
+            map_menu_id_to_event(menu_ids::EMERGENCY_UNCLOAK_ALL),
+            Some(TrayEvent::EmergencyUncloakAll)
+        ));
+        assert!(map_menu_id_to_event("unknown").is_none());
+    }
+
+    #[test]
+    fn test_tooltip_format() {
+        let active = format_tooltip_text(14, 2, false, None);
+        assert_eq!(active, "OpenNiri - Active (14 windows, 2 monitors)");
+
+        let paused = format_tooltip_text(3, 1, true, None);
+        assert_eq!(paused, "OpenNiri - Paused (3 windows, 1 monitors)");
+    }
+
+    #[test]
+    fn test_tooltip_format_with_hotkey_mismatch() {
+        let tooltip = format_tooltip_text(10, 2, false, Some((7, 10)));
+        assert_eq!(
+            tooltip,
+            "OpenNiri - Active (10 windows, 2 monitors)\nHotkeys: 7/10 (3 failed)"
+        );
+    }
+
+    #[test]
+    fn test_tooltip_format_no_hotkey_mismatch() {
+        // When registered == requested, no mismatch line
+        let tooltip = format_tooltip_text(10, 2, false, Some((10, 10)));
+        assert_eq!(tooltip, "OpenNiri - Active (10 windows, 2 monitors)");
+    }
+
+    #[test]
+    fn test_tooltip_format_paused_with_mismatch() {
+        let tooltip = format_tooltip_text(5, 1, true, Some((3, 8)));
+        assert!(tooltip.contains("Paused"));
+        assert!(tooltip.contains("3/8 (5 failed)"));
+    }
+
+    #[test]
+    fn test_menu_ids_constants() {
+        // Ensure menu IDs are distinct
+        let ids = [
+            menu_ids::REFRESH,
+            menu_ids::RELOAD,
+            menu_ids::EXIT,
+            menu_ids::TOGGLE_PAUSE,
+            menu_ids::OPEN_CONFIG,
+            menu_ids::VIEW_LOGS,
+            menu_ids::EMERGENCY_UNCLOAK_ALL,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for (j, b) in ids.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "Menu IDs must be distinct");
+                }
+            }
+        }
     }
 }

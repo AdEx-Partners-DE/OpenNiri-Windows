@@ -1,0 +1,200 @@
+{
+  "plan_id": "codex_fix_plan_review_32_incident_49",
+  "last_updated": "2026-02-08",
+  "status": "in_progress",
+  "owner": {
+    "implementation": "Claude",
+    "review": "Codex"
+  },
+  "source_review": {
+    "file": "docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md",
+    "review_id": 32
+  },
+  "scope": {
+    "in_scope": [
+      "Host-level Win32 E2E validation coverage",
+      "Created-event path testability for focus_new_windows=false",
+      "Deterministic daemon singleton test coverage",
+      "Critical desktop lockout incident after apply (focus/shell recovery failure)",
+      "Recovery safety guidance and non-destructive fallback path"
+    ],
+    "out_of_scope": [
+      "Signed binaries and installer packaging",
+      "Feature expansion unrelated to review findings"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "R32-C1",
+      "priority": "high",
+      "title": "Add repeatable host smoke tests for real window control behavior",
+      "targets": [
+        "docs/TESTING_GUIDE.md"
+      ],
+      "status": "done",
+      "evidence": "Host Smoke Test section added to TESTING_GUIDE.md lines 240-299 with scripted PowerShell steps (iter 41)"
+    },
+    {
+      "id": "R32-C2",
+      "priority": "medium",
+      "title": "Refactor Created-event window enumeration behind injectable boundary for deterministic tests",
+      "targets": [
+        "crates/daemon/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "Added injected_window_info HashMap, lookup_window_info(), is_known_window() with #[cfg(test)] injectable boundary. 5 tests added (iter 41)"
+    },
+    {
+      "id": "R32-C3",
+      "priority": "low",
+      "title": "Replace ignored daemon singleton test with deterministic alternative",
+      "targets": [
+        "crates/daemon/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "test_check_already_running_with_isolated_pipe uses unique pipe name, runs in default CI without #[ignore] (iter 41)"
+    },
+    {
+      "id": "INC-49-1",
+      "priority": "critical",
+      "title": "Triage and reproduce desktop lockout/focus-trap reported after `openniri-cli apply`",
+      "targets": [
+        "docs/1_Progress and review/INCIDENT_2026-02-07_DESKTOP_LOCKOUT.md"
+      ],
+      "status": "in_progress",
+      "evidence": "Root-cause hardening implemented across CLI/daemon/platform/docs; host-side reproduction/closure run still pending"
+    },
+    {
+      "id": "INC-49-2",
+      "priority": "critical",
+      "title": "Implement non-destructive panic-revert command path that restores windows and exits daemon safely",
+      "targets": [
+        "crates/daemon/src/main.rs",
+        "crates/cli/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "Added IPC/CLI `panic_revert`, unified shutdown cleanup, bounded IPC enqueue/response handling, and MoveOffScreen restoration wiring; stop/panic-revert now require shutdown confirmation (iterations 50-54)"
+    },
+    {
+      "id": "INC-49-3",
+      "priority": "high",
+      "title": "Add recovery guardrail docs: last-resort recovery steps must warn about interrupting active file operations",
+      "targets": [
+        "docs/SUPPORT_PLAYBOOK.md",
+        "docs/TROUBLESHOOTING.md"
+      ],
+      "status": "done",
+      "evidence": "Support/troubleshooting/readme/getting-started/testing docs enforce panic-revert-first recovery and explicit last-resort interruption-risk warnings (iterations 50-54)"
+    },
+    {
+      "id": "INC-49-4",
+      "priority": "high",
+      "title": "Add host-level acceptance case for lockout scenario with explicit pass/fail recovery criteria",
+      "targets": [
+        "docs/TESTING_GUIDE.md"
+      ],
+      "status": "in_progress",
+      "evidence": "Added explicit host lockout + long-running-file-operation acceptance scenarios and pass/fail criteria; execution evidence pending"
+    },
+    {
+      "id": "INC-49-5",
+      "priority": "high",
+      "title": "Block tagging/publishing until incident closure evidence is captured",
+      "targets": [
+        "docs/PUBLIC_READINESS_CHECKLIST.md",
+        "docs/PRE_STABLE_EXECUTION_PLAN.md"
+      ],
+      "status": "done",
+      "evidence": "Release/readiness/finalization docs now explicitly block tag/publish while INC-49 remains open"
+    }
+  ],
+  "required_tests": [
+    {
+      "id": "R32-T1",
+      "title": "Created-event test proving focus_new_windows=false preserves focus through handle_window_event",
+      "targets": [
+        "crates/daemon/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "test_created_event_uses_injected_window_info and related tests validate Created path with injected WindowInfo (iter 41)"
+    },
+    {
+      "id": "R32-T2",
+      "title": "Daemon singleton check test no longer ignored in default CI run",
+      "targets": [
+        "crates/daemon/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "test_check_already_running_with_isolated_pipe uses isolated pipe name — no #[ignore], runs in CI (iter 41)"
+    },
+    {
+      "id": "INC-49-T1",
+      "title": "Host-level manual test: apply + recovery path does not leave user unable to focus active terminal windows",
+      "targets": [
+        "docs/TESTING_GUIDE.md"
+      ],
+      "status": "open"
+    },
+    {
+      "id": "INC-49-T2",
+      "title": "CLI/daemon panic-revert command test coverage in default workspace suite",
+      "targets": [
+        "crates/cli/src/main.rs",
+        "crates/daemon/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "Added panic_revert command mapping/roundtrip tests in CLI/IPC/integration and daemon command test coverage"
+    }
+  ],
+  "validation_gate": [
+    {
+      "id": "V1",
+      "command": "cargo test --all --verbose",
+      "status": "done",
+      "evidence": "530 total: 526 passed, 4 ignored (Iteration 54 validation rerun)"
+    },
+    {
+      "id": "V2",
+      "command": "cargo test --workspace -- --ignored",
+      "status": "done",
+      "evidence": "4 ignored tests executed successfully (1 daemon + 3 platform hardware-dependent tests)"
+    },
+    {
+      "id": "V3",
+      "command": "cargo clippy --all -- -D warnings",
+      "status": "done",
+      "evidence": "Passed in Iteration 54 full validation sweep"
+    },
+    {
+      "id": "V4",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "status": "done",
+      "evidence": "Passed in Iteration 54 supplemental validation sweep (non-CI gate)"
+    },
+    {
+      "id": "V5",
+      "command": "cargo fmt --all -- --check",
+      "status": "done",
+      "evidence": "Passed in Iteration 54 full validation sweep"
+    },
+    {
+      "id": "V6",
+      "command": "cargo build --release --all",
+      "status": "done",
+      "evidence": "Passed in Iteration 54 full validation sweep"
+    }
+  ],
+  "lifecycle_rules": {
+    "task_status_values": [
+      "open",
+      "in_progress",
+      "done"
+    ],
+    "done_requires": [
+      "code_or_doc_change_land",
+      "linked evidence",
+      "validation_gate_passed"
+    ],
+    "archive_when": "all tasks and required_tests are done"
+  }
+}

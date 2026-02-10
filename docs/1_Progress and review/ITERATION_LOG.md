@@ -2,7 +2,7 @@
 
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
-> **Last Updated**: 2026-02-06 (Iteration 33 — Public Readiness Checklist and Messaging Polish)
+> **Last Updated**: 2026-02-08 (Iteration 54 — Lockout Recovery Hardening + Tracker Sync)
 
 ---
 
@@ -80,10 +80,457 @@ OpenNiri-Windows/
 | 31 | 2026-02-05 | Public repo presentation refresh (README + GitHub metadata) | 302 | 302 | README rewrite, GitHub description/topics updated |
 | 32 | 2026-02-06 | Public messaging revamp (README v2 + GitHub About cleanup) | 302 | 302 | Professionalized README structure, tightened GitHub positioning and discovery topics |
 | 33 | 2026-02-06 | Public readiness planning and enterprise README polish | 302 | 302 | Added public-readiness execution checklist and refined README for adoption clarity |
+| 34 | 2026-02-06 | Pre-stable execution lock and backlog triage | 302 | 302 | Added explicit pre-stable development plan and deferred post-stable packaging work |
+| 35 | 2026-02-06 | Minimize/Restore handling + dynamic tray text | 302 | 380 | Workspace minimize tracking, daemon minimize/restore handlers, tray pause text toggle, hex color validation, regex size limit, shutdown timeout, config warnings, hotkey counts, workspace mutation tests, config edge cases |
+| 36 | 2026-02-06 | Codex review fixes | 380 | 383 | Fix pipe-busy duplicate daemon detection, fix restore order (scroll offset clamped to 0), wire tray hotkey mismatch, cargo fmt, doc sync |
+| 37 | 2026-02-06 | Pre-testing readiness | 383 | 390 | MovedOrResized feedback loop fix, config error-path tests, fullscreen-minimize regression test, release profile (LTO), SECURITY.md, issue templates, cargo audit CI, testing guide, antivirus docs |
+| 38 | 2026-02-06 | Codex Review 29 Fixes | 390 | 393 | Scroll offset restore preservation, true OS-registered hotkey count, overlay doc-test no_run, applying_layout error-path test, 3 new tests |
+| 39 | 2026-02-06 | Codex Review 30 Fixes | 393 | 398 | insert_window_no_focus for focus_new_windows=false, ToggleFloating roundtrip, format_startup_banner/format_tooltip_text extraction, output assertion tests, test-count doc sync |
+| 40 | 2026-02-06 | Codex Review 31 Fixes | 398 | 401 | Focused event updates previous_focused_hwnd for floating windows, event validation skips is_valid_window for managed windows, ToggleFloating roundtrip test rewritten to use real event path, platform test-count fix (27 not 28), 3 new tests |
+| 41 | 2026-02-06 | R32 Review Fixes + Public Readiness Phase 1 | 401 | 407 | Injectable window enumeration (`lookup_window_info`, `is_known_window`), deterministic singleton test, host smoke test procedure, Created-event tests with injected window info, 6 new tests |
+| 42 | 2026-02-06 | CLI Completeness (Phase 2) | 407 | 411 | `collect-logs` subcommand, `setup` first-run assistant, `config reset/backup/restore` subcommands, config backup/restore roundtrip test, 4 new tests |
+| 43 | 2026-02-06 | Reliability Hardening (Phase 3) | 411 | 415 | `HealthCheck` IPC command + `health` CLI, structured crash reports (`format_crash_report`), `HealthInfo` response variant, 4 new tests |
+| 44 | 2026-02-06 | Compatibility & UX Quality (Phase 4) | 415 | 419 | COMPATIBILITY.md, fallback behavior docs, profile presets (developer/laptop/ultrawide), `--profile` flag for init, 4 new tests |
+| 45 | 2026-02-06 | Security & Trust (Phase 5) | 419 | 419 | Threat model summary, privacy statement, log redaction audit, named pipe security analysis, support window definition — all in SECURITY.md |
+| 46 | 2026-02-06 | Support & Operations (Phase 6) | 419 | 419 | Enhanced bug report template with required diagnostics, issue template chooser (config.yml), SUPPORT_PLAYBOOK.md, "Getting Help" section in GETTING_STARTED.md |
+| 47 | 2026-02-06 | Release Engineering (Phase 7) | 419 | 419 | Pre-release channels (alpha/beta/rc), SHA-256 checksums in CI, UPGRADING.md (rollback instructions), unsigned binary documentation |
+| 48 | 2026-02-07 | Full remediation pass (runtime + docs/CI) | 419 | 440 | Fixed fullscreen removal, transactional cross-monitor moves, Win32 overlay/event lifecycle issues, protocol forward-compat fallback, tracker/docs/CI consistency, and expanded tests |
+| 49 | 2026-02-07 | Critical field incident documentation + blocker re-open | 440 | 440 | Documented desktop lockout incident after apply, reopened active blockers, added safety/process guardrails and release block |
+| 50 | 2026-02-07 | Incident mitigation implementation + validation | 440 | 459 | Implemented panic-revert and shutdown hardening, MoveOffScreen restoration, emergency tray uncloak, safer CLI run/stop semantics, and updated runbooks/release gates with full quality-gate pass |
+| 51 | 2026-02-07 | Documentation consistency sync (metrics + incident gate truth) | 459 | 459 | Synced SPEC/ARCH metrics to 459/455/4, aligned blocker MD with canonical JSON, added PanicRevert + emergency uncloak to command/menu docs, kept release gate marked pending host evidence |
+| 52 | 2026-02-07 | Validation evidence refresh + tracker metric sync | 459 | 480 | Re-ran workspace/all-features/ignored tests, synced active docs + trackers to 480/476/4, and kept release gate blocked pending host closure evidence |
+| 53 | 2026-02-08 | Parallel critical fix sweep + validation sync | 480 | 508 | Landed daemon apply/shutdown race hardening, platform event/hotkey safeguards, core focus/fullscreen invariants, CLI timeout/read-path fixes, IPC scoped-pipe helpers wired into daemon/cli, CI gate hardening, and docs/tracker consistency refresh |
+| 54 | 2026-02-08 | Lockout recovery hardening + tracker sync | 508 | 530 | Hardened overlay/hotkey shutdown rollback behavior, improved CLI timeout recovery guidance, added scroll-invariant clamps with restore-safe scroll semantics, refreshed recovery docs, and re-ran full validation gates |
 
 ---
 
 ## Detailed Iteration Logs
+
+### Iteration 54: Lockout Recovery Hardening + Tracker Sync
+
+**Date**: 2026-02-08
+**Status**: COMPLETED (code + docs + validation), host closure evidence still pending
+**Previous Context**: Iteration 53 (parallel critical fix sweep + validation sync)
+
+#### 54.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Close critical lockout-adjacent runtime gaps found in post-fix review | Critical | DONE |
+| 2 | Improve user-facing recovery guidance for timeout/stuck scenarios | High | DONE |
+| 3 | Refresh validation evidence + tracker consistency to current baseline | High | DONE |
+
+#### 54.2 Changes Made
+
+- Runtime hardening:
+  - `crates/platform_win32/src/overlay.rs` (lines ~25-36, ~110-214, ~344-393): added overlay thread-id capture, fallback quit signaling (`PostThreadMessageW`), and bounded non-blocking drop join behavior to avoid shutdown hangs.
+  - `crates/platform_win32/src/lib.rs` (lines ~1860-1869, ~1959, ~2091-2112, ~2862-2895): added hotkey global rollback helper; rollback now runs on hotkey init failures; added regression test for sender cleanup.
+  - `crates/daemon/src/main.rs` (line ~2201): clippy-compliant dropped-event logging condition (`is_multiple_of(100)`).
+  - `crates/core_layout/src/lib.rs` (lines ~667-669, ~817-824, ~954-968, ~1065-1105, ~1229-1235, ~1253-1381, ~1600-1639, tests ~2003-2075): added workspace-width scroll clamps after width-affecting operations, negative viewport-width normalization in scroll/visibility paths, and preserved direct restore semantics for `set_scroll_offset`.
+  - `crates/cli/src/main.rs` (lines ~459-513, ~626-723, tests ~1988-2043): added timeout-chain detection and actionable stop/panic-revert recovery messaging; improved panic-revert not-running guidance.
+- Documentation/recovery clarity:
+  - `README.md` (lines ~94-109): switched quick recovery path to panic-revert-first with explicit tray fallback + shutdown confirmation.
+  - `docs/SUPPORT_PLAYBOOK.md` (lines ~7-107): clarified `apply/reload` incident header, enforced tray uncloak+exit sequence, made panic-revert first for invisible windows, and added explicit config backup before reset.
+  - `docs/TESTING_GUIDE.md` (line ~30): cold-start scenario now requires clean stop + failed status confirmation before rerun.
+  - `docs/GETTING_STARTED.md` (lines ~201-209): uninstall section now warns about config/state deletion before optional cleanup.
+- Tracker sync:
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`
+  - `docs/1_Progress and review/OPEN_ITEMS.md`
+  - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+  - `docs/1_Progress and review/ITERATION_LOG.md`
+
+#### 54.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| All tests | `cargo test --all --verbose` | PASSED: 530 total (526 passed, 4 ignored) |
+| Ignored tests | `cargo test --workspace -- --ignored` | PASSED: 4 ignored tests executed |
+| Clippy (gate) | `cargo clippy --all -- -D warnings` | PASSED |
+| Clippy (supplemental) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASSED |
+| Formatting | `cargo fmt --all -- --check` | PASSED |
+| Release build | `cargo build --release --all` | PASSED |
+| Coordination pass | `pwsh C:\\dev\\0_repo_overarching\\scripts\\portfolio\\run-coordination-control-pass.ps1` | PASSED (snapshots written) |
+
+#### 54.4 Impact Statement
+
+- Shutdown/recovery paths now fail safer and are less likely to leave users stuck behind non-responsive overlay/hotkey infrastructure.
+- CLI recovery instructions are clearer in timeout paths and align with panic-revert-first guidance.
+- Validation/tracker artifacts now reflect the current tested baseline (`530/526/4`) while keeping release blocked until host incident-evidence tasks close.
+
+### Iteration 53: Parallel Critical Fix Sweep + Validation Sync
+
+**Date**: 2026-02-08
+**Status**: COMPLETED (runtime fixes + full validation), incident closure evidence still pending
+**Previous Context**: Iteration 52 (validation evidence refresh + tracker metric sync)
+
+#### 53.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Address high-risk lockout and event-storm runtime findings across daemon/platform/core/cli | Critical | DONE |
+| 2 | Add/refresh deterministic tests around new safety behavior | High | DONE |
+| 3 | Harden IPC/CI/process consistency and refresh tracker metrics to current baseline | High | DONE |
+
+#### 53.2 Changes Made
+
+- Runtime hardening:
+  - `crates/daemon/src/main.rs` — cancellation/join safety for timed-out apply workers, post-apply move/resize suppression window, robust cleanup window-ID merge, conservative singleton probe across candidate pipes, and IPC connection concurrency limiting.
+  - `crates/platform_win32/src/lib.rs` — non-blocking hotkey-thread shutdown fallback, event manageability filtering for focus/foreground, root-window normalization in mouse hook, safer cloak-query fallback, and improved DWM border error mapping.
+  - `crates/core_layout/src/lib.rs` — focus index clamping after removals, visible-window targeting for fullscreen entry, fullscreen/minimized consistency fallback, and animated/non-animated stacked-height parity.
+  - `crates/cli/src/main.rs` — split connect/response timeouts, longer apply response budget, readiness/apply separation in `run`, bounded response-frame parsing, and candidate-pipe probing/open retry logic.
+  - `crates/ipc/src/lib.rs` — user-scoped pipe helper APIs (`preferred_pipe_name`, `pipe_name_candidates`) and protocol-version helper APIs with tests.
+- CI/process/docs:
+  - `.github/workflows/ci.yml` — scheduled run + matrix/all-target/release-smoke coverage improvements.
+  - `docs/*` + `docs/1_Progress and review/*` — command/hotkey wording corrections, recovery wording cleanup, tracker/gate consistency fixes, and metric refresh.
+
+#### 53.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| Workspace tests | `cargo test --workspace` | PASSED: 508 total (504 passed, 4 ignored) |
+| All tests | `cargo test --all` | PASSED: 508 total (504 passed, 4 ignored) |
+| Ignored tests | `cargo test --workspace -- --ignored` | PASSED: 4 ignored tests executed successfully |
+| Clippy (workspace targets) | `cargo clippy --workspace --all-targets -- -D warnings` | PASSED |
+| Clippy (all targets) | `cargo clippy --all --all-targets -- -D warnings` | PASSED |
+| Clippy (all features) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASSED |
+| Formatting | `cargo fmt --all -- --check` | PASSED |
+| Release build | `cargo build --release --all` | PASSED |
+
+#### 53.4 Impact Statement
+
+- Critical lockout-class behaviors identified in review were addressed with code-level safeguards and expanded tests.
+- IPC connectivity now supports scoped preferred pipe names with legacy fallback, and daemon/cli both use the shared candidate strategy.
+- Active docs and tracker artifacts were refreshed to the new validated quality gate metric (`508/504/4`).
+
+### Iteration 52: Validation Evidence Refresh + Tracker Metric Sync
+
+**Date**: 2026-02-07
+**Status**: COMPLETED (validation + docs sync), incident closure evidence still pending
+**Previous Context**: Iteration 51 (documentation consistency sync)
+
+#### 52.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Re-run quality gate to capture current deterministic totals after remediation tests landed | High | DONE |
+| 2 | Sync active trackers/docs from 459/455/4 to current validated totals | High | DONE |
+| 3 | Keep release gate truth unchanged (`INC-49` remains open pending host evidence) | Critical | DONE |
+
+#### 52.2 Changes Made
+
+- Validation evidence refresh:
+  - Re-ran `cargo test --workspace`, `cargo test --workspace --all-features`, and `cargo test --workspace -- --ignored`.
+- Metric synchronization updates:
+  - `docs/SPEC.md` (implementation status metric line).
+  - `docs/ARCHITECTURE.md` (planned vs implemented quality-gate metric line).
+  - `docs/PUBLIC_READINESS_CHECKLIST.md` (current baseline metric line).
+  - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` (verification evidence line).
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.md` (V1 validation snapshot line).
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json` (canonical V1 validation evidence).
+  - `docs/1_Progress and review/OPEN_ITEMS.md` (V1 validation line + last updated stamp).
+  - `docs/1_Progress and review/CLAUDE_FINALIZATION_CHECKLIST.md` (baseline test metric line).
+
+#### 52.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| Workspace tests | `cargo test --workspace` | PASSED: 480 total (476 passed, 4 ignored) |
+| Workspace tests (all features) | `cargo test --workspace --all-features` | PASSED: 480 total (476 passed, 4 ignored) |
+| Ignored tests | `cargo test --workspace -- --ignored` | PASSED: 4 ignored tests executed successfully |
+
+#### 52.4 Impact Statement
+
+- Active docs and tracker artifacts now reference a single current quality-gate metric (`480/476/4`).
+- Validation evidence trail is up to date in both human-readable and canonical tracker files.
+- Release gate status is unchanged: `INC-49` remains open until host-level closure evidence is captured and linked.
+
+### Iteration 51: Documentation Consistency Sync (Metrics + Incident Gate Truth)
+
+**Date**: 2026-02-07
+**Status**: COMPLETED (docs-only synchronization), host closure evidence still pending
+**Previous Context**: Iteration 50 (incident mitigation implementation + validation)
+
+#### 51.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Align current validation metrics across active docs to latest validated run | High | DONE |
+| 2 | Remove blocker tracker contradiction between Markdown and canonical JSON | Critical | DONE |
+| 3 | Ensure `panic_revert` command and emergency uncloak tray action are present in SPEC/ARCH lists | High | DONE |
+| 4 | Keep incident gate wording truthful (implementation done, host evidence pending) | Critical | DONE |
+
+#### 51.2 Changes Made
+
+- Updated behavior/architecture docs:
+  - `docs/SPEC.md` — refreshed implementation metric line to `459 total, 455 passed, 4 ignored`; added tray menu `Emergency: Uncloak All Windows`; added `PanicRevert` to command coverage summary.
+  - `docs/ARCHITECTURE.md` — added `PanicRevert` to IPC command lists; expanded tray context-menu listings with emergency uncloak action; replaced stale per-crate test-count callouts with validated quality-gate metric summary.
+- Reconciled blocker trackers:
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.md` — replaced stale open-R32 checklist with explicit non-canonical snapshot synced to `CODEX_BLOCKER_FIX_PLAN.json` and current open incident-evidence tasks.
+- Corrected release-readiness gate wording:
+  - `docs/PUBLIC_READINESS_CHECKLIST.md` — updated baseline metric line to `459/455/4` and added explicit gate-truth note.
+  - `docs/PRE_STABLE_EXECUTION_PLAN.md` — added explicit critical-gate truth line: mitigation implementation done, host closure evidence pending.
+
+#### 51.3 Test Results
+
+No runtime/code changes in this iteration; no new test execution required.
+
+| Item | Command | Result |
+|------|---------|--------|
+| Workspace tests | `cargo test --workspace` | Not re-run (docs-only). Baseline remains latest validated run from iteration 50: 459 total (455 passed, 4 ignored). |
+| Ignored tests | `cargo test --workspace -- --ignored` | Not re-run (docs-only). Baseline remains latest validated run from iteration 50: 4 ignored tests executed successfully. |
+
+#### 51.4 Impact Statement
+
+- Active tracker docs now present one consistent status model: mitigation implementation completed, host evidence gate still open.
+- SPEC/ARCH command and tray-menu coverage now includes `PanicRevert` and emergency uncloak recovery paths.
+- Release remains blocked until `INC-49-1`, `INC-49-4`, and `INC-49-T1` host evidence is captured and linked.
+
+### Iteration 50: Incident Mitigation Implementation + Validation
+
+**Date**: 2026-02-07
+**Status**: COMPLETED (implementation + validation), incident closure evidence pending
+**Previous Context**: Iteration 49 (critical incident documentation + blocker re-open)
+
+#### 50.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Implement panic-revert and deterministic recovery hardening in CLI/daemon/platform | Critical | DONE |
+| 2 | Add explicit emergency user escape path and stop/safe-mode semantics hardening | Critical | DONE |
+| 3 | Propagate Win32 placement/hide failures instead of silently masking them | High | DONE |
+| 4 | Update support/testing/release docs to enforce user-safe recovery and release block | High | DONE |
+| 5 | Re-run full validation gates and capture evidence | High | DONE |
+
+#### 50.2 Changes Made
+
+- Runtime safety and recovery:
+  - `crates/ipc/src/lib.rs` - added `IpcCommand::PanicRevert`.
+  - `crates/cli/src/main.rs` - added `panic-revert` command mapping, stop idempotence path (`Daemon not running`), and fail-fast `run --safe-mode` guard when daemon already running.
+  - `crates/daemon/src/main.rs` - unified shutdown cleanup, bounded IPC response timeout, stop ACK after cleanup, `panic_revert` handling, focus sync fixes, MoveOffScreen restore integration.
+  - `crates/platform_win32/src/lib.rs` - propagate side-effect failures from placement/hide paths, conservative cloaked detection on API failure, hardened foreground API path, added MoveOffScreen restore helpers.
+  - `crates/daemon/src/tray.rs` - added `Emergency: Uncloak All Windows` tray action.
+- Verification tests:
+  - `crates/daemon/tests/integration.rs` - panic_revert JSON shape + stop response payload semantics.
+  - Extended CLI/daemon/platform unit coverage for new recovery and robustness paths.
+- Documentation and process gates:
+  - `README.md`, `docs/GETTING_STARTED.md`, `docs/TROUBLESHOOTING.md`, `docs/SUPPORT_PLAYBOOK.md`, `docs/TESTING_GUIDE.md`
+  - `docs/PUBLIC_READINESS_CHECKLIST.md`, `docs/PRE_STABLE_EXECUTION_PLAN.md`, `docs/1_Progress and review/CLAUDE_FINALIZATION_CHECKLIST.md`
+
+#### 50.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| Workspace tests | `cargo test --workspace` | PASSED: 459 total (455 passed, 4 ignored) |
+| Ignored tests | `cargo test --workspace -- --ignored` | PASSED: 4 ignored tests executed successfully |
+| Clippy (targets) | `cargo clippy --workspace --all-targets -- -D warnings` | PASSED |
+| Clippy (all features) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASSED |
+| Formatting | `cargo fmt --all -- --check` | PASSED |
+| Release build | `cargo build --release` | PASSED |
+
+#### 50.4 Impact Statement
+
+- Critical recovery primitives are now implemented and covered in default automated suites.
+- User-facing recovery guidance no longer implies unsafe or ambiguous stop/restart flows.
+- Release remains blocked until host-level incident closure evidence (`INC-49-1`, `INC-49-4`, `INC-49-T1`) is executed and logged.
+
+### Iteration 49: Critical Field Incident Documentation + Blocker Re-open
+
+**Date**: 2026-02-07
+**Status**: COMPLETED (documentation/triage), remediation OPEN
+**Previous Context**: Iteration 48 (Full remediation pass)
+
+#### 49.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Document reported desktop lockout/focus-trap incident with concrete impact | Critical | DONE |
+| 2 | Re-open tracking artifacts (review status, blocker plan, open items) | Critical | DONE |
+| 3 | Add immediate support/playbook guardrails to prevent repeat recovery harm | High | DONE |
+| 4 | Explicitly block release/tag flow pending incident closure evidence | High | DONE |
+
+#### 49.2 Changes Made
+
+- Added incident record:
+  - `docs/1_Progress and review/INCIDENT_2026-02-07_DESKTOP_LOCKOUT.md`
+- Reopened active tracking status:
+  - `docs/1_Progress and review/OPEN_ITEMS.md`
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`
+  - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`
+- Added safety guardrail language:
+  - `docs/SUPPORT_PLAYBOOK.md` (critical non-destructive recovery-first guidance)
+- Updated release/prioritization docs to reflect active incident gate:
+  - `docs/PUBLIC_READINESS_CHECKLIST.md`
+  - `docs/PRE_STABLE_EXECUTION_PLAN.md`
+
+#### 49.3 Test Results
+
+No code-path changes in this iteration; documentation and governance updates only.
+
+| Item | Command | Result |
+|------|---------|--------|
+| Workspace tests | `cargo test --workspace` | Not re-run (no code changes in iteration 49) |
+| Formatting | N/A | Markdown-only updates |
+
+#### 49.4 Impact Statement
+
+- A critical user-reported local test incident is now explicitly tracked as open.
+- Release/publish readiness is blocked until incident-class mitigation and verification are documented.
+
+---
+
+### Iteration 48: Full Remediation Pass (Runtime + Docs/CI)
+
+**Date**: 2026-02-07
+**Status**: COMPLETED (fully verified)
+**Previous Context**: Iteration 47 (Release Engineering)
+
+#### 48.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Fix high-severity runtime defects (fullscreen removal, cross-monitor move state loss, Win32 resource/lifecycle issues) | High | DONE |
+| 2 | Improve protocol robustness and command validation coverage | High | DONE |
+| 3 | Reconcile tracker/docs/CI consistency and GNU toolchain guidance | High | DONE |
+| 4 | Re-run full quality gates and record concrete evidence | High | DONE |
+
+#### 48.2 Changes Made
+
+- Core layout/runtime correctness:
+  - `crates/core_layout/src/lib.rs` — clear fullscreen state when removing fullscreen tiled/floating windows; added regression tests.
+- Daemon/CLI/IPC robustness:
+  - `crates/daemon/src/main.rs` — transactional focused-window monitor moves; set-width fraction validation in command path.
+  - `crates/daemon/src/config.rs` — non-negative column width validation + invalid `behavior.log_level` warning/reset.
+  - `crates/daemon/tests/integration.rs` — expanded IPC command/response roundtrip coverage and unknown-response handling.
+  - `crates/cli/src/main.rs` — set-width parser validation; unknown IPC response handling as non-success.
+  - `crates/ipc/src/lib.rs` — `IpcResponse::Unknown` forward-compatibility fallback.
+- Win32 platform hardening:
+  - `crates/platform_win32/src/overlay.rs` — fixed paint-brush leak, singleton guard for overlay instance, explicit destroy/unregister cleanup.
+  - `crates/platform_win32/src/lib.rs` — re-installable event sender lifecycle, hidden top-level hotkey window for `WM_DISPLAYCHANGE`, event filtering parity with enumeration, explicit destroy/unregister cleanup.
+- Docs/CI/tracker reconciliation:
+  - `.github/workflows/ci.yml`, `README.md`, `docs/GETTING_STARTED.md`, `docs/TESTING_GUIDE.md`, `CHANGELOG.md`, `docs/PUBLIC_READINESS_CHECKLIST.md`, `docs/PRE_STABLE_EXECUTION_PLAN.md`, `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`, `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`, `docs/1_Progress and review/OPEN_ITEMS.md`.
+
+#### 48.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| Workspace tests | `cargo test --workspace` | PASSED: 440 total (436 passed, 4 ignored) |
+| Ignored tests | `cargo test --workspace -- --ignored` | PASSED: 4 passed |
+| Clippy (targets) | `cargo clippy --workspace --all-targets -- -D warnings` | PASSED |
+| Clippy (all features) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASSED |
+| Formatting | `cargo fmt --all -- --check` | PASSED |
+| Release build | `cargo build --release` | PASSED |
+
+#### 48.4 Verification Evidence
+
+- Local validation transcript captured in this iteration run (full workspace gates all green).
+- Tracker/docs consistency aligned to `2026-02-07` across review/blocker/open-items/readiness/pre-stable docs.
+- CI metadata gate logic present and validated in `.github/workflows/ci.yml` (tag/version/changelog checks).
+
+---
+
+### Iteration 35: Minimize/Restore Handling + Dynamic Tray Text
+
+**Date**: 2026-02-06
+**Status**: COMPLETED
+**Previous Context**: Iteration 34 (Pre-Stable Focus Lock)
+
+#### 35.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Implement minimize tracking in Workspace (core_layout) | High | DONE |
+| 2 | Wire daemon minimize/restore event handlers | High | DONE |
+| 3 | Add dynamic tray pause/resume text | Medium | DONE |
+| 4 | Comprehensive test coverage for all changes | High | DONE |
+
+#### 35.2 Changes Made
+
+**`crates/core_layout/src/lib.rs`** — Workspace minimize tracking:
+- Added `minimized_windows: HashSet<WindowId>` field with `#[serde(default)]`
+- Added `mark_minimized(wid) -> bool`, `mark_restored(wid) -> bool`, `is_minimized(wid) -> bool`, `minimized_count() -> usize`
+- Modified `remove_window()`: clears window from minimized set
+- Modified `compute_placements()` and `compute_placements_animated()`: skip minimized windows, redistribute height among remaining visible windows in column
+- Added `use std::collections::HashSet` import
+
+**`crates/daemon/src/main.rs`** — Event handlers:
+- Replaced stub `Minimized` handler: marks window minimized, adjusts focus if minimized window was focused, applies layout, syncs foreground
+- Replaced minimal `Restored` handler: marks window restored, focuses it, applies layout, syncs foreground
+- Renamed `_tray_manager` to `tray_manager` for active use
+- Added `update_pause_text()` call in `TogglePause` tray event handler
+
+**`crates/daemon/src/tray.rs`** — Dynamic menu text:
+- Added `pause_item: MenuItem` field to `TrayManager` struct
+- Added `update_pause_text(&self, paused: bool)` method using `MenuItem::set_text()`
+
+#### 35.3 Test Results
+
+| Crate | Before | After | Delta |
+|-------|--------|-------|-------|
+| core_layout | 99 | 113 | +14 |
+| daemon (binary) | 100 | 107 | +7 |
+| ipc | 15 | 15 | 0 |
+| cli | 38 | 38 | 0 |
+| integration | 22 | 22 | 0 |
+| platform | 27 | 27 | 0 |
+| **Total** | **302** | **323** | **+21** |
+
+New core_layout tests: mark_minimized (managed, unknown, floating, idempotent), mark_restored, mark_restored_not_minimized, placements_skip_minimized, placements_animated_skip_minimized, minimize_height_redistribution, minimize_all_in_column, remove_window_clears_minimized, all_window_ids_includes_minimized, contains_window_minimized, minimized_window_count_unchanged
+
+New daemon tests: minimize_marks_workspace_window, restore_clears_minimized, minimize_unmanaged_window_noop, minimize_preserves_window_in_workspace, minimize_focus_moves_to_next
+
+New tray tests: tray_event_toggle_pause_variant, menu_ids_constants
+
+#### 35.4 Evidence & Verification
+
+| Item | Command | Result |
+|------|---------|--------|
+| All tests pass | `cargo test --workspace` | 318 passed, 5 ignored |
+| Clippy clean | `cargo clippy --workspace --all-targets -- -D warnings` | 0 warnings |
+| Release build | `cargo build --release` | Success |
+
+---
+
+### Iteration 34: Pre-Stable Focus Lock
+
+**Date**: 2026-02-06
+**Status**: COMPLETED
+**Previous Context**: Iteration 33 (Public Readiness Checklist and Messaging Polish)
+
+#### 34.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Prevent unstable-phase work from drifting into release packaging tasks | High | DONE |
+| 2 | Capture concrete pre-stable execution order to avoid iteration drift | High | DONE |
+| 3 | Keep public-facing docs aligned with pre-stable strategy | Medium | DONE |
+
+#### 34.2 Changes Made
+
+- Added `docs/PRE_STABLE_EXECUTION_PLAN.md`:
+  - Defines active pre-stable scope.
+  - Defines explicit post-stable deferred backlog.
+  - Adds execution order for iterations 35-39.
+- Updated `docs/PUBLIC_READINESS_CHECKLIST.md`:
+  - Added "Active Development Focus" linking to pre-stable plan.
+  - Moved signing/installer/channel-hardening into deferred section.
+  - Updated immediate top-10 list to pre-stable priorities.
+- Updated `README.md`:
+  - Linked pre-stable execution plan in public readiness section.
+
+#### 34.3 Test Results
+
+No Rust code changes in this iteration.
+
+**Test Growth**: 302 -> 302 (unchanged)
+
+#### 34.4 Evidence & Verification
+
+| Item | Command | Expected Result |
+|------|---------|-----------------|
+| Strategy docs check | Manual markdown review | Pre-stable and deferred scopes are explicit and non-conflicting |
+| README linkage check | Manual markdown review | Readiness section links to both checklist and pre-stable plan |
+
+---
 
 ### Iteration 33: Public Readiness Checklist and Messaging Polish
 
@@ -2337,12 +2784,14 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | 31 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
 | 32 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
 | 33 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
+| 34 | 99 | 15 | 24 (+3 ignored) | 100 (+38 cli, +22 integration, +1 ignored) | 302 |
+| 35 | 113 | 15 | 24 (+3 ignored) | 107 (+38 cli, +22 integration, +1 ignored) | 323 |
 
 ---
 
 ## Architecture Evolution
 
-### Current State (Post-Iteration 33)
+### Current State (Post-Iteration 35)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -2397,7 +2846,7 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 | Config `default_config_path` unused | Low | 10 | Minor (dead code warning) |
 | `monitors_list` method unused | Low | 11 | Minor (dead code warning) |
 | No end-to-end daemon integration tests | Medium | - | Partially addressed in Iteration 27 |
-| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 33 |
+| ARCHITECTURE.md/SPEC.md may drift again | Low | 24 | Refreshed in Iteration 34 |
 
 ---
 
@@ -2481,16 +2930,29 @@ TOTAL: 63 passed, 0 failed, 2 ignored
 
 ---
 
-### Iteration 34 (Planned)
+### Iteration 34 (Pre-Stable Focus Lock)
 
-**Focus**: Polish & Advanced Features
+**Focus**: Freeze development priorities around reliability/usability before packaging work
+
+**Completed**:
+1. Added `docs/PRE_STABLE_EXECUTION_PLAN.md` to explicitly track do-now scope.
+2. Marked signing/installer/release-channel hardening as deferred post-stable.
+3. Updated readiness checklist to prioritize diagnostics, safe mode, and reliability tests.
+4. Linked the new pre-stable plan from README.
+
+**Tests**: 302 -> 302 (no code changes in this iteration)
+
+---
+
+### Iteration 35 (Planned)
+
+**Focus**: Pre-stable reliability and diagnostics (Execution Plan Step 1)
 
 **Objectives**:
-1. Multi-workspace support (named workspaces per monitor, switch between them)
-2. Enhanced window rules (assign to specific workspace/monitor)
-3. Performance profiling and optimization
-4. End-to-end integration tests (spawn daemon, CLI interaction)
-5. Window layout import/export
+1. Add `openniri-cli doctor` with actionable checks and remediation hints.
+2. Add GitHub issue templates that require doctor/log output.
+3. Define and document alpha exit criteria in readiness docs.
+4. Keep post-stable packaging tasks in deferred backlog.
 
 ---
 

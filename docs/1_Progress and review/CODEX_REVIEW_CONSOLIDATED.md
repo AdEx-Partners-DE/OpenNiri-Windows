@@ -1,29 +1,28 @@
-# Codex Consolidated Review (Latest: Review 24)
-Date: 2026-02-05
+# Codex Consolidated Review (Latest: Review 32)
+Date: 2026-02-08
 Reviewer: Codex
-Scope: End-of-day wrap-up validation after Iteration 30 stabilization updates.
-Status: Review complete. No blocking issues found.
+Scope: Full QA pass and regression review after latest Claude updates.
+Status: Review-32 findings are closed. INC-49 mitigation code/docs landed, but host validation evidence is still open. Release remains blocked until incident closure evidence exists.
 
 ## Verification Evidence
-- `cargo test --workspace` -> PASSED: **297 passed, 0 failed, 5 ignored** (**302 total**).
-- `cargo clippy --workspace --all-targets -- -D warnings` -> PASSED.
-- `cargo clippy --all-targets --all-features -- -D warnings` -> PASSED.
-- `cargo build --release` -> PASSED.
+- `cargo test --all --verbose` -> PASSED: **530 total** (**526 passed, 4 ignored**) (Iteration 54 rerun)
+- `cargo test --workspace -- --ignored` -> PASSED: 4 ignored tests executed successfully (supplemental manual validation)
+- `cargo clippy --all -- -D warnings` -> PASSED (Iteration 54 rerun)
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> PASSED (supplemental; not part of CI-enforced gate)
+- `cargo fmt --all -- --check` -> PASSED
+- `cargo build --release --all` -> PASSED
 
-## What Was Verified
-- Unified shutdown path now includes tray exit:
-  - `tray::TrayEvent::Exit` sends `DaemonEvent::Shutdown` at `crates/daemon/src/main.rs:2139`.
-  - Shared cleanup executes in `DaemonEvent::Shutdown` branch at `crates/daemon/src/main.rs:2215`.
-- Crash-safety/reliability features present and wired:
-  - Ctrl+C shutdown signal task (`crates/daemon/src/main.rs:1874`)
-  - Managed-window uncloak/reset (`crates/platform_win32/src/lib.rs:899`)
-  - Panic-hook emergency uncloak (`crates/daemon/src/main.rs:1594`, `crates/platform_win32/src/lib.rs:918`)
-  - DPI awareness init at process start (`crates/daemon/src/main.rs:1559`, `crates/platform_win32/src/lib.rs:941`)
-- Documentation now reflects Iteration 30 reality:
-  - `docs/SPEC.md` updated to 302 total / 297 passing / 5 ignored.
-  - `docs/ARCHITECTURE.md` updated counts and reliability feature coverage.
-  - `docs/1_Progress and review/ITERATION_LOG.md` updated with Iteration 30 completion and Iteration 31 planning.
+## Review-32 Resolution Status
+- `R32-C1` host-level Win32 validation gap: closed via documented Host Smoke Test procedure.
+  - `docs/TESTING_GUIDE.md`
+- `R32-C2` created-event testability gap for `focus_new_windows=false`: closed via injectable lookup boundary and deterministic tests.
+  - `crates/daemon/src/main.rs`
+- `R32-C3` ignored daemon singleton test gap: closed via isolated-pipe deterministic test in default CI path.
+  - `crates/daemon/src/main.rs`
 
-## Residual Risks (Non-Blocking)
-- Recovery-path tests are still mostly "no panic" style; full runtime e2e validation for crash/shutdown behavior remains manual.
-- One daemon test remains ignored due environment coupling (`test_check_already_running_returns_false_when_no_daemon`).
+## Open Items
+- `INC-49` (Critical): Desktop lockout/focus-trap reported after local `openniri-cli apply` test, including failed in-session recovery and workflow disruption.
+  - Implemented: `panic_revert` IPC/CLI path, shutdown cleanup hardening, MoveOffScreen restoration, emergency tray uncloak, and recovery/runbook/release-gate doc updates.
+  - Remaining: execute and record host-level lockout recovery acceptance evidence (`INC-49-1`, `INC-49-4`, `INC-49-T1`).
+  - Incident record: `docs/1_Progress and review/INCIDENT_2026-02-07_DESKTOP_LOCKOUT.md`
+  - Tracking plan: `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`
