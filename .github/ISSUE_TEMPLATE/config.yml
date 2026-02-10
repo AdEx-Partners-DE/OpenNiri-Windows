@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting Guide
+    url: https://github.com/AdEx-Partners-DE/OpenNiri-Windows/blob/main/docs/TROUBLESHOOTING.md
+    about: Check the troubleshooting guide before filing an issue
+  - name: Getting Started
+    url: https://github.com/AdEx-Partners-DE/OpenNiri-Windows/blob/main/docs/GETTING_STARTED.md
+    about: New to OpenNiri? Start here

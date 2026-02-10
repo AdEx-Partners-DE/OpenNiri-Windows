@@ -334,6 +334,8 @@ impl WindowRule {
 /// - resize_grow, resize_shrink (by 50px)
 /// - scroll_left, scroll_right (by 100px)
 /// - refresh, reload
+/// - panic_revert (emergency visibility restore + shutdown)
+/// - toggle_pause (pause/resume tiling)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyConfig {
@@ -365,11 +367,19 @@ impl Default for HotkeyConfig {
         bindings.insert("Win+Alt+L".to_string(), "focus_monitor_right".to_string());
 
         // Move to monitor with Win+Alt+Shift
-        bindings.insert("Win+Alt+Shift+H".to_string(), "move_to_monitor_left".to_string());
-        bindings.insert("Win+Alt+Shift+L".to_string(), "move_to_monitor_right".to_string());
+        bindings.insert(
+            "Win+Alt+Shift+H".to_string(),
+            "move_to_monitor_left".to_string(),
+        );
+        bindings.insert(
+            "Win+Alt+Shift+L".to_string(),
+            "move_to_monitor_right".to_string(),
+        );
 
         // Utility
         bindings.insert("Win+R".to_string(), "refresh".to_string());
+        // Emergency escape hatch: revert visibility state and stop daemon.
+        bindings.insert("Win+Ctrl+Escape".to_string(), "panic_revert".to_string());
 
         // Close focused window
         bindings.insert("Win+Shift+Q".to_string(), "close_window".to_string());
@@ -564,6 +574,8 @@ pub fn parse_command(cmd: &str) -> Option<openniri_ipc::IpcCommand> {
         "scroll_right" => Some(IpcCommand::Scroll { delta: 100.0 }),
         "refresh" => Some(IpcCommand::Refresh),
         "reload" => Some(IpcCommand::Reload),
+        "panic_revert" | "panic-revert" => Some(IpcCommand::PanicRevert),
+        "toggle_pause" | "toggle-pause" => Some(IpcCommand::TogglePause),
         "close_window" => Some(IpcCommand::CloseWindow),
         "toggle_floating" => Some(IpcCommand::ToggleFloating),
         "toggle_fullscreen" => Some(IpcCommand::ToggleFullscreen),
@@ -615,9 +627,48 @@ impl Config {
         if self.layout.outer_gap < 0 {
             warnings.push(ConfigWarning {
                 field: "layout.outer_gap".to_string(),
-                message: format!("Negative outer_gap ({}) clamped to 0", self.layout.outer_gap),
+                message: format!(
+                    "Negative outer_gap ({}) clamped to 0",
+                    self.layout.outer_gap
+                ),
             });
             self.layout.outer_gap = 0;
+        }
+
+        // min_column_width must be >= 0
+        if self.layout.min_column_width < 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.min_column_width".to_string(),
+                message: format!(
+                    "Negative min_column_width ({}) clamped to 0",
+                    self.layout.min_column_width
+                ),
+            });
+            self.layout.min_column_width = 0;
+        }
+
+        // max_column_width must be >= 0
+        if self.layout.max_column_width < 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.max_column_width".to_string(),
+                message: format!(
+                    "Negative max_column_width ({}) clamped to 0",
+                    self.layout.max_column_width
+                ),
+            });
+            self.layout.max_column_width = 0;
+        }
+
+        // default_column_width must be >= 0
+        if self.layout.default_column_width < 0 {
+            warnings.push(ConfigWarning {
+                field: "layout.default_column_width".to_string(),
+                message: format!(
+                    "Negative default_column_width ({}) clamped to 0",
+                    self.layout.default_column_width
+                ),
+            });
+            self.layout.default_column_width = 0;
         }
 
         // min_column_width must be <= max_column_width
@@ -639,10 +690,10 @@ impl Config {
         if self.layout.default_column_width < self.layout.min_column_width
             || self.layout.default_column_width > self.layout.max_column_width
         {
-            let clamped = self.layout.default_column_width.clamp(
-                self.layout.min_column_width,
-                self.layout.max_column_width,
-            );
+            let clamped = self
+                .layout
+                .default_column_width
+                .clamp(self.layout.min_column_width, self.layout.max_column_width);
             warnings.push(ConfigWarning {
                 field: "layout.default_column_width".to_string(),
                 message: format!(
@@ -680,6 +731,41 @@ impl Config {
             self.snap_hints.duration_ms = 50;
         }
 
+        // active_border_color must be exactly 6 hex characters
+        {
+            let color = &self.appearance.active_border_color;
+            let is_valid = color.len() == 6 && color.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_valid {
+                warnings.push(ConfigWarning {
+                    field: "appearance.active_border_color".to_string(),
+                    message: format!(
+                        "Invalid hex color '{}' (must be 6 hex chars, e.g. \"4285F4\"), reset to default",
+                        color
+                    ),
+                });
+                self.appearance.active_border_color = default_active_border_color();
+            }
+        }
+
+        // behavior.log_level must be one of trace/debug/info/warn/error
+        {
+            let normalized = self.behavior.log_level.to_lowercase();
+            let valid = matches!(
+                normalized.as_str(),
+                "trace" | "debug" | "info" | "warn" | "error"
+            );
+            if !valid {
+                warnings.push(ConfigWarning {
+                    field: "behavior.log_level".to_string(),
+                    message: format!(
+                        "Invalid log_level '{}' (must be trace/debug/info/warn/error), reset to default",
+                        self.behavior.log_level
+                    ),
+                });
+                self.behavior.log_level = default_log_level();
+            }
+        }
+
         warnings
     }
 
@@ -691,12 +777,16 @@ impl Config {
 
         for rule in &self.window_rules {
             let class_regex = match &rule.match_class {
-                Some(pattern) => match regex::Regex::new(pattern) {
+                Some(pattern) => match regex::RegexBuilder::new(pattern)
+                    .size_limit(1_000_000)
+                    .build()
+                {
                     Ok(re) => Some(re),
                     Err(e) => {
                         tracing::warn!(
                             "Invalid regex in window rule match_class '{}': {}. Skipping rule.",
-                            pattern, e
+                            pattern,
+                            e
                         );
                         continue;
                     }
@@ -705,12 +795,16 @@ impl Config {
             };
 
             let title_regex = match &rule.match_title {
-                Some(pattern) => match regex::Regex::new(pattern) {
+                Some(pattern) => match regex::RegexBuilder::new(pattern)
+                    .size_limit(1_000_000)
+                    .build()
+                {
                     Ok(re) => Some(re),
                     Err(e) => {
                         tracing::warn!(
                             "Invalid regex in window rule match_title '{}': {}. Skipping rule.",
-                            pattern, e
+                            pattern,
+                            e
                         );
                         continue;
                     }
@@ -827,9 +921,22 @@ mod tests {
     fn test_hotkey_config_default() {
         let config = HotkeyConfig::default();
         assert!(!config.bindings.is_empty());
-        assert_eq!(config.bindings.get("Win+H"), Some(&"focus_left".to_string()));
-        assert_eq!(config.bindings.get("Win+L"), Some(&"focus_right".to_string()));
-        assert_eq!(config.bindings.get("Win+Shift+H"), Some(&"move_column_left".to_string()));
+        assert_eq!(
+            config.bindings.get("Win+H"),
+            Some(&"focus_left".to_string())
+        );
+        assert_eq!(
+            config.bindings.get("Win+L"),
+            Some(&"focus_right".to_string())
+        );
+        assert_eq!(
+            config.bindings.get("Win+Shift+H"),
+            Some(&"move_column_left".to_string())
+        );
+        assert_eq!(
+            config.bindings.get("Win+Ctrl+Escape"),
+            Some(&"panic_revert".to_string())
+        );
     }
 
     #[test]
@@ -838,11 +945,26 @@ mod tests {
 
         assert_eq!(parse_command("focus_left"), Some(IpcCommand::FocusLeft));
         assert_eq!(parse_command("FOCUS_RIGHT"), Some(IpcCommand::FocusRight));
-        assert_eq!(parse_command("move_column_left"), Some(IpcCommand::MoveColumnLeft));
-        assert_eq!(parse_command("focus_monitor_left"), Some(IpcCommand::FocusMonitorLeft));
-        assert_eq!(parse_command("resize_grow"), Some(IpcCommand::Resize { delta: 50 }));
-        assert_eq!(parse_command("resize_shrink"), Some(IpcCommand::Resize { delta: -50 }));
+        assert_eq!(
+            parse_command("move_column_left"),
+            Some(IpcCommand::MoveColumnLeft)
+        );
+        assert_eq!(
+            parse_command("focus_monitor_left"),
+            Some(IpcCommand::FocusMonitorLeft)
+        );
+        assert_eq!(
+            parse_command("resize_grow"),
+            Some(IpcCommand::Resize { delta: 50 })
+        );
+        assert_eq!(
+            parse_command("resize_shrink"),
+            Some(IpcCommand::Resize { delta: -50 })
+        );
         assert_eq!(parse_command("refresh"), Some(IpcCommand::Refresh));
+        assert_eq!(parse_command("panic_revert"), Some(IpcCommand::PanicRevert));
+        assert_eq!(parse_command("PANIC-REVERT"), Some(IpcCommand::PanicRevert));
+        assert_eq!(parse_command("toggle_pause"), Some(IpcCommand::TogglePause));
         assert_eq!(parse_command("unknown_command"), None);
     }
 
@@ -854,8 +976,14 @@ mod tests {
             "Ctrl+Alt+B" = "focus_right"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.hotkeys.bindings.get("Win+A"), Some(&"focus_left".to_string()));
-        assert_eq!(config.hotkeys.bindings.get("Ctrl+Alt+B"), Some(&"focus_right".to_string()));
+        assert_eq!(
+            config.hotkeys.bindings.get("Win+A"),
+            Some(&"focus_left".to_string())
+        );
+        assert_eq!(
+            config.hotkeys.bindings.get("Ctrl+Alt+B"),
+            Some(&"focus_right".to_string())
+        );
     }
 
     #[test]
@@ -935,7 +1063,11 @@ mod tests {
             height: Some(600),
         };
 
-        assert!(rule.matches("Chrome_WidgetWin_1", "DevTools - localhost:3000", "chrome.exe"));
+        assert!(rule.matches(
+            "Chrome_WidgetWin_1",
+            "DevTools - localhost:3000",
+            "chrome.exe"
+        ));
         assert!(rule.matches("SomeClass", "Firefox DevTools", "firefox.exe"));
         assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
     }
@@ -968,9 +1100,14 @@ mod tests {
         };
 
         // Both patterns must match
-        assert!(rule.matches("Chrome_WidgetWin_1", "YouTube - Google Chrome", "chrome.exe"));
+        assert!(rule.matches(
+            "Chrome_WidgetWin_1",
+            "YouTube - Google Chrome",
+            "chrome.exe"
+        ));
         assert!(!rule.matches("Firefox", "YouTube - Mozilla Firefox", "firefox.exe")); // Class doesn't match
-        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe")); // Title doesn't match
+        assert!(!rule.matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe"));
+        // Title doesn't match
     }
 
     #[test]
@@ -1007,15 +1144,24 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.window_rules.len(), 3);
 
-        assert_eq!(config.window_rules[0].match_class, Some("Notepad".to_string()));
+        assert_eq!(
+            config.window_rules[0].match_class,
+            Some("Notepad".to_string())
+        );
         assert_eq!(config.window_rules[0].action, WindowAction::Float);
         assert_eq!(config.window_rules[0].width, Some(800));
         assert_eq!(config.window_rules[0].height, Some(600));
 
-        assert_eq!(config.window_rules[1].match_executable, Some("spotify.exe".to_string()));
+        assert_eq!(
+            config.window_rules[1].match_executable,
+            Some("spotify.exe".to_string())
+        );
         assert_eq!(config.window_rules[1].action, WindowAction::Float);
 
-        assert_eq!(config.window_rules[2].match_title, Some(".*dialog.*".to_string()));
+        assert_eq!(
+            config.window_rules[2].match_title,
+            Some(".*dialog.*".to_string())
+        );
         assert_eq!(config.window_rules[2].action, WindowAction::Ignore);
     }
 
@@ -1283,6 +1429,44 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_negative_min_column_width_clamped() {
+        let mut config = Config::default();
+        config.layout.min_column_width = -200;
+        config.layout.max_column_width = 900;
+        let warnings = config.validate();
+        assert_eq!(config.layout.min_column_width, 0);
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "layout.min_column_width"));
+    }
+
+    #[test]
+    fn test_validate_negative_max_column_width_clamped() {
+        let mut config = Config::default();
+        config.layout.min_column_width = 0;
+        config.layout.max_column_width = -900;
+        config.layout.default_column_width = 0;
+        let warnings = config.validate();
+        assert_eq!(config.layout.max_column_width, 0);
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "layout.max_column_width"));
+    }
+
+    #[test]
+    fn test_validate_negative_default_width_clamped_and_cohered() {
+        let mut config = Config::default();
+        config.layout.min_column_width = 300;
+        config.layout.max_column_width = 1000;
+        config.layout.default_column_width = -50;
+        let warnings = config.validate();
+        assert_eq!(config.layout.default_column_width, 300);
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "layout.default_column_width"));
+    }
+
+    #[test]
     fn test_validate_min_gt_max_swapped() {
         let mut config = Config::default();
         config.layout.min_column_width = 2000;
@@ -1290,7 +1474,9 @@ mod tests {
         let warnings = config.validate();
         assert_eq!(config.layout.min_column_width, 500);
         assert_eq!(config.layout.max_column_width, 2000);
-        assert!(warnings.iter().any(|w| w.field.contains("min_column_width")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.field.contains("min_column_width")));
     }
 
     #[test]
@@ -1301,7 +1487,9 @@ mod tests {
         config.layout.default_column_width = 1500; // above max
         let warnings = config.validate();
         assert_eq!(config.layout.default_column_width, 1000);
-        assert!(warnings.iter().any(|w| w.field == "layout.default_column_width"));
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "layout.default_column_width"));
     }
 
     #[test]
@@ -1311,7 +1499,9 @@ mod tests {
         config.behavior.focus_follows_mouse_delay_ms = 10;
         let warnings = config.validate();
         assert_eq!(config.behavior.focus_follows_mouse_delay_ms, 50);
-        assert!(warnings.iter().any(|w| w.field == "behavior.focus_follows_mouse_delay_ms"));
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "behavior.focus_follows_mouse_delay_ms"));
     }
 
     #[test]
@@ -1325,10 +1515,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_invalid_log_level_resets_to_default() {
+        let mut config = Config::default();
+        config.behavior.log_level = "verbose".to_string();
+        let warnings = config.validate();
+        assert_eq!(config.behavior.log_level, "info");
+        assert!(warnings.iter().any(|w| w.field == "behavior.log_level"));
+    }
+
+    #[test]
+    fn test_validate_log_level_case_insensitive_valid() {
+        let mut config = Config::default();
+        config.behavior.log_level = "DEBUG".to_string();
+        let warnings = config.validate();
+        assert!(warnings.iter().all(|w| w.field != "behavior.log_level"));
+        assert_eq!(config.behavior.log_level, "DEBUG");
+    }
+
+    #[test]
     fn test_validate_valid_config_no_warnings() {
         let mut config = Config::default();
         let warnings = config.validate();
-        assert!(warnings.is_empty(), "Default config should produce no warnings, got: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "Default config should produce no warnings, got: {:?}",
+            warnings
+        );
     }
 
     // =========================================================================
@@ -1363,7 +1575,11 @@ mod tests {
         assert_eq!(compiled.len(), 2);
 
         // First rule: class + title regex
-        assert!(compiled[0].matches("Chrome_WidgetWin_1", "YouTube - Google Chrome", "chrome.exe"));
+        assert!(compiled[0].matches(
+            "Chrome_WidgetWin_1",
+            "YouTube - Google Chrome",
+            "chrome.exe"
+        ));
         assert!(!compiled[0].matches("Firefox", "YouTube", "firefox.exe")); // class doesn't match
         assert!(!compiled[0].matches("Chrome_WidgetWin_1", "Google Chrome", "chrome.exe")); // title doesn't match
 
@@ -1401,5 +1617,238 @@ mod tests {
         // First rule should be skipped due to invalid regex
         assert_eq!(compiled.len(), 1);
         assert!(compiled[0].matches("ValidClass", "Any Title", "any.exe"));
+    }
+
+    #[test]
+    fn test_focus_new_windows_false_parsed() {
+        let toml_str = r#"
+            [behavior]
+            focus_new_windows = false
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.behavior.focus_new_windows);
+    }
+
+    #[test]
+    fn test_focus_new_windows_defaults_to_true() {
+        let toml_str = r#"
+            [behavior]
+            log_level = "info"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.behavior.focus_new_windows);
+    }
+
+    // =========================================================================
+    // Hex Color Validation Tests (Iteration 34)
+    // =========================================================================
+
+    #[test]
+    fn test_validate_hex_color_valid() {
+        let mut config = Config::default();
+        config.appearance.active_border_color = "ff0000".to_string();
+        let warnings = config.validate();
+        assert_eq!(config.appearance.active_border_color, "ff0000");
+        assert!(!warnings
+            .iter()
+            .any(|w| w.field == "appearance.active_border_color"));
+    }
+
+    #[test]
+    fn test_validate_hex_color_invalid_chars() {
+        let mut config = Config::default();
+        config.appearance.active_border_color = "ZZZZZZ".to_string();
+        let warnings = config.validate();
+        assert_eq!(
+            config.appearance.active_border_color,
+            default_active_border_color()
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "appearance.active_border_color"));
+    }
+
+    #[test]
+    fn test_validate_hex_color_too_short() {
+        let mut config = Config::default();
+        config.appearance.active_border_color = "FFF".to_string();
+        let warnings = config.validate();
+        assert_eq!(
+            config.appearance.active_border_color,
+            default_active_border_color()
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "appearance.active_border_color"));
+    }
+
+    #[test]
+    fn test_validate_hex_color_with_hash_prefix() {
+        let mut config = Config::default();
+        config.appearance.active_border_color = "#4285F4".to_string();
+        let warnings = config.validate();
+        // Hash prefix makes it 7 chars, so it should be rejected
+        assert_eq!(
+            config.appearance.active_border_color,
+            default_active_border_color()
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.field == "appearance.active_border_color"));
+    }
+
+    // =========================================================================
+    // Config Edge Case Tests (Iteration 34)
+    // =========================================================================
+
+    #[test]
+    fn test_empty_config_uses_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        let default = Config::default();
+        assert_eq!(config.layout.gap, default.layout.gap);
+        assert_eq!(config.layout.outer_gap, default.layout.outer_gap);
+        assert_eq!(
+            config.layout.default_column_width,
+            default.layout.default_column_width
+        );
+        assert_eq!(
+            config.appearance.active_border_color,
+            default.appearance.active_border_color
+        );
+        assert!(config.behavior.focus_new_windows);
+        assert!(config.window_rules.is_empty());
+    }
+
+    #[test]
+    fn test_all_zero_numeric_values() {
+        let toml_str = r#"
+            [layout]
+            gap = 0
+            outer_gap = 0
+            min_column_width = 0
+            max_column_width = 0
+            default_column_width = 0
+        "#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        let warnings = config.validate();
+        // gap=0 and outer_gap=0 are valid (not negative)
+        assert_eq!(config.layout.gap, 0);
+        assert_eq!(config.layout.outer_gap, 0);
+        // min=max=default=0 is degenerate but should not panic
+        assert!(!warnings.iter().any(|w| w.field == "layout.gap"));
+    }
+
+    #[test]
+    fn test_unknown_toml_keys_ignored() {
+        let toml_str = r#"
+            [layout]
+            gap = 15
+            unknown_key = "hello"
+            another_unknown = 42
+        "#;
+        // serde(default) + deny_unknown_fields is NOT set, so this should parse
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.layout.gap, 15);
+    }
+
+    #[test]
+    fn test_empty_hotkey_bindings() {
+        let toml_str = r#"
+            [hotkeys]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.hotkeys.bindings.is_empty());
+    }
+
+    #[test]
+    fn test_hex_color_case_insensitive() {
+        let mut config1 = Config::default();
+        config1.appearance.active_border_color = "ff0000".to_string();
+        let warnings1 = config1.validate();
+        assert!(!warnings1
+            .iter()
+            .any(|w| w.field == "appearance.active_border_color"));
+
+        let mut config2 = Config::default();
+        config2.appearance.active_border_color = "FF0000".to_string();
+        let warnings2 = config2.validate();
+        assert!(!warnings2
+            .iter()
+            .any(|w| w.field == "appearance.active_border_color"));
+    }
+
+    // =========================================================================
+    // Regex Size Limit Test (Iteration 34)
+    // =========================================================================
+
+    #[test]
+    fn test_regex_size_limit_rejects_oversized_pattern() {
+        // Directly verify that RegexBuilder with size_limit rejects patterns that
+        // exceed the compiled NFA size limit. Use a very small limit to guarantee rejection.
+        let pattern = "[a-z]{100}";
+        let result = regex::RegexBuilder::new(pattern)
+            .size_limit(100) // Tiny limit to guarantee rejection
+            .build();
+        assert!(
+            result.is_err(),
+            "Pattern should be rejected with a very small size limit"
+        );
+
+        // Also verify that the same pattern succeeds without a tight limit (our production limit)
+        let result = regex::RegexBuilder::new(pattern)
+            .size_limit(1_000_000)
+            .build();
+        assert!(result.is_ok(), "Pattern should succeed with 1MB limit");
+    }
+
+    // =========================================================================
+    // Config Error-Path Tests (Iteration 37)
+    // =========================================================================
+
+    #[test]
+    fn test_invalid_toml_syntax_returns_error() {
+        let bad_toml = r#"
+            [layout
+            gap = 10
+        "#;
+        let result: Result<Config, _> = toml::from_str(bad_toml);
+        assert!(
+            result.is_err(),
+            "Invalid TOML (missing bracket) should fail to parse"
+        );
+    }
+
+    #[test]
+    fn test_empty_string_parses_to_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.layout.gap, default_gap());
+        assert_eq!(config.layout.outer_gap, default_outer_gap());
+        assert_eq!(config.layout.default_column_width, default_column_width());
+    }
+
+    #[test]
+    fn test_unknown_keys_are_ignored() {
+        // serde(default) without deny_unknown_fields means extra keys are silently ignored
+        let toml_str = r#"
+            totally_unknown_section = "hello"
+            [layout]
+            gap = 20
+            nonexistent_field = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.layout.gap, 20);
+    }
+
+    #[test]
+    fn test_wrong_type_returns_error() {
+        let toml_str = r#"
+            [layout]
+            gap = "not_a_number"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "String where integer expected should fail to parse"
+        );
     }
 }

@@ -20,16 +20,17 @@
 use crate::Win32Error;
 use openniri_core_layout::Rect;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, RegisterClassW,
-    SetWindowPos, ShowWindow, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
-    SW_SHOWNA, WM_PAINT, WM_USER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
+    RegisterClassW, SetWindowPos, ShowWindow, UnregisterClassW, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_PAINT, WM_USER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 /// Custom message to quit the overlay thread.
@@ -43,6 +44,7 @@ static OVERLAY_STATE: std::sync::Mutex<OverlayState> = std::sync::Mutex::new(Ove
     rect: None,
     color: OVERLAY_COLOR,
 });
+static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Current overlay display state.
 struct OverlayState {
@@ -67,8 +69,10 @@ struct OverlayState {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let overlay = OverlayWindow::new()?;
+/// ```no_run
+/// use openniri_platform_win32::overlay::OverlayWindow;
+/// use openniri_core_layout::Rect;
+/// let overlay = OverlayWindow::new().unwrap();
 /// overlay.show_snap_target(Rect::new(100, 100, 800, 600));
 /// // ... later
 /// overlay.hide();
@@ -104,6 +108,12 @@ impl OverlayWindow {
     /// Returns [`Win32Error::HookInstallFailed`](crate::Win32Error::HookInstallFailed)
     /// if the overlay window or thread cannot be created.
     pub fn new() -> Result<Self, Win32Error> {
+        if OVERLAY_ACTIVE.swap(true, Ordering::SeqCst) {
+            return Err(Win32Error::HookInstallFailed(
+                "Overlay window already active".to_string(),
+            ));
+        }
+
         let (init_tx, init_rx) = mpsc::channel::<Result<isize, Win32Error>>();
 
         let thread = std::thread::spawn(move || {
@@ -113,7 +123,6 @@ impl OverlayWindow {
                 let wc = WNDCLASSW {
                     lpfnWndProc: Some(overlay_window_proc),
                     lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
-                    hbrBackground: CreateSolidBrush(windows::Win32::Foundation::COLORREF(OVERLAY_COLOR)),
                     ..Default::default()
                 };
                 RegisterClassW(&wc);
@@ -175,13 +184,26 @@ impl OverlayWindow {
                     }
                     let _ = DispatchMessageW(&msg);
                 }
+
+                let _ = DestroyWindow(hwnd);
+                let _ = UnregisterClassW(windows::core::PCWSTR(class_name.as_ptr()), None);
             }
         });
 
         // Wait for initialization
-        let hwnd_raw = init_rx
-            .recv()
-            .map_err(|_| Win32Error::HookInstallFailed("Overlay thread init failed".to_string()))??;
+        let hwnd_raw = match init_rx.recv() {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => {
+                OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
+                return Err(e);
+            }
+            Err(_) => {
+                OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
+                return Err(Win32Error::HookInstallFailed(
+                    "Overlay thread init failed".to_string(),
+                ));
+            }
+        };
 
         let hwnd = HWND(hwnd_raw as *mut c_void);
 
@@ -321,6 +343,7 @@ impl Drop for OverlayWindow {
             let _ = thread.join();
         }
 
+        OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
         tracing::debug!("Overlay window destroyed");
     }
 }
@@ -349,12 +372,7 @@ unsafe extern "system" fn overlay_window_proc(
 }
 
 /// Inner implementation of overlay window procedure.
-fn overlay_window_proc_inner(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+fn overlay_window_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let _ = wparam; // Unused in current implementation
     let _ = lparam; // Unused in current implementation
     match msg {
@@ -372,6 +390,7 @@ fn overlay_window_proc_inner(
             // Fill with the overlay color
             let brush = unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(color)) };
             let _ = unsafe { FillRect(hdc, &ps.rcPaint, brush) };
+            let _ = unsafe { DeleteObject(brush.into()) };
 
             let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
@@ -439,9 +458,9 @@ impl Default for SnapHintConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            resize_color: 0x00FF8040,  // Semi-transparent blue
-            move_color: 0x0040FF40,    // Semi-transparent green
-            focus_color: 0x004080FF,   // Semi-transparent orange
+            resize_color: 0x00FF8040, // Semi-transparent blue
+            move_color: 0x0040FF40,   // Semi-transparent green
+            focus_color: 0x004080FF,  // Semi-transparent orange
             duration_ms: 200,
         }
     }

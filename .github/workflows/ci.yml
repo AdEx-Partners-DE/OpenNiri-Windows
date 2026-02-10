@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    tags: ['v*']
+    tags: ['**']
   pull_request:
     branches: [main]
 
@@ -16,11 +16,99 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Rust toolchain
+      - name: Install MinGW (GNU linker)
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust GNU toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable-x86_64-pc-windows-gnu
           components: rustfmt, clippy
+
+      - name: Validate release metadata (tag/version/changelog)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z\.-]+)?)$') {
+            throw "Tag '$tag' must match v<semver> (example: v0.1.0 or v0.1.0-alpha.1)."
+          }
+          $tagVersion = $Matches['version']
+
+          $cargoToml = Get-Content -Raw Cargo.toml
+          $workspaceSection = [regex]::Match($cargoToml, '(?ms)^\[workspace\.package\]\s*(?<body>.*?)(^\[|\z)')
+          if (-not $workspaceSection.Success) {
+            throw "Could not find [workspace.package] section in Cargo.toml."
+          }
+          $versionMatch = [regex]::Match($workspaceSection.Groups['body'].Value, '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$')
+          if (-not $versionMatch.Success) {
+            throw "Could not find workspace version in Cargo.toml."
+          }
+          $cargoVersion = $versionMatch.Groups['version'].Value
+
+          if ($tagVersion -ne $cargoVersion) {
+            throw "Tag version '$tagVersion' does not match Cargo.toml workspace version '$cargoVersion'."
+          }
+
+          $escapedVersion = [regex]::Escape($tagVersion)
+          $changelog = Get-Content -Raw CHANGELOG.md
+          $changelogPattern = "(?m)^##\s+\[$escapedVersion\](?:\s+-\s+.*)?$"
+          if ($changelog -notmatch $changelogPattern) {
+            throw "CHANGELOG.md must contain a release heading '## [$tagVersion]' before tagging."
+          }
+
+          Write-Host "Release metadata checks passed for $tag."
+
+      - name: Enforce INC-49 release closure gate
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $planPath = "docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json"
+          if (-not (Test-Path $planPath)) {
+            throw "Missing required incident gate file: $planPath"
+          }
+          $plan = Get-Content -Raw $planPath | ConvertFrom-Json
+          $requiredTaskIds = @("INC-49-1", "INC-49-4")
+          foreach ($taskId in $requiredTaskIds) {
+            $task = $plan.tasks | Where-Object { $_.id -eq $taskId } | Select-Object -First 1
+            if (-not $task) {
+              throw "Missing required task '$taskId' in $planPath"
+            }
+            if ($task.status -ne "done") {
+              throw "Release blocked: task '$taskId' status is '$($task.status)' (expected 'done')."
+            }
+          }
+          $requiredHostTest = $plan.required_tests | Where-Object { $_.id -eq "INC-49-T1" } | Select-Object -First 1
+          if (-not $requiredHostTest) {
+            throw "Missing required host test 'INC-49-T1' in $planPath"
+          }
+          if ($requiredHostTest.status -ne "done") {
+            throw "Release blocked: host test 'INC-49-T1' status is '$($requiredHostTest.status)' (expected 'done')."
+          }
+          Write-Host "INC-49 release closure gate passed."
+
+      - name: Enforce tag is main HEAD
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          git fetch origin main --depth=1
+          $mainHead = (git rev-parse origin/main).Trim()
+          $tagCommit = (git rev-parse HEAD).Trim()
+          if ($tagCommit -ne $mainHead) {
+            throw "Release blocked: tag commit ($tagCommit) is not the current origin/main HEAD ($mainHead)."
+          }
+          Write-Host "Tag commit matches origin/main HEAD."
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -39,11 +127,26 @@ jobs:
       - name: Run tests
         run: cargo test --all --verbose
 
+      - name: Run all-features tests
+        run: cargo test --workspace --all-features --verbose
+
+      - name: Run ignored tests
+        run: cargo test --workspace -- --ignored
+
+      - name: Run release-profile tests (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cargo test --all --release --verbose
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy --all -- -D warnings
+
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
   release:
     needs: build
@@ -55,9 +158,95 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Rust toolchain
+      - name: Install MinGW (GNU linker)
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust GNU toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Validate release metadata (tag/version/changelog)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z\.-]+)?)$') {
+            throw "Tag '$tag' must match v<semver> (example: v0.1.0 or v0.1.0-alpha.1)."
+          }
+          $tagVersion = $Matches['version']
+
+          $cargoToml = Get-Content -Raw Cargo.toml
+          $workspaceSection = [regex]::Match($cargoToml, '(?ms)^\[workspace\.package\]\s*(?<body>.*?)(^\[|\z)')
+          if (-not $workspaceSection.Success) {
+            throw "Could not find [workspace.package] section in Cargo.toml."
+          }
+          $versionMatch = [regex]::Match($workspaceSection.Groups['body'].Value, '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$')
+          if (-not $versionMatch.Success) {
+            throw "Could not find workspace version in Cargo.toml."
+          }
+          $cargoVersion = $versionMatch.Groups['version'].Value
+
+          if ($tagVersion -ne $cargoVersion) {
+            throw "Tag version '$tagVersion' does not match Cargo.toml workspace version '$cargoVersion'."
+          }
+
+          $escapedVersion = [regex]::Escape($tagVersion)
+          $changelog = Get-Content -Raw CHANGELOG.md
+          $changelogPattern = "(?m)^##\s+\[$escapedVersion\](?:\s+-\s+.*)?$"
+          if ($changelog -notmatch $changelogPattern) {
+            throw "CHANGELOG.md must contain a release heading '## [$tagVersion]' before tagging."
+          }
+
+          Write-Host "Release metadata checks passed for $tag."
+
+      - name: Enforce INC-49 release closure gate
+        shell: pwsh
+        run: |
+          $planPath = "docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json"
+          if (-not (Test-Path $planPath)) {
+            throw "Missing required incident gate file: $planPath"
+          }
+          $plan = Get-Content -Raw $planPath | ConvertFrom-Json
+          $requiredTaskIds = @("INC-49-1", "INC-49-4")
+          foreach ($taskId in $requiredTaskIds) {
+            $task = $plan.tasks | Where-Object { $_.id -eq $taskId } | Select-Object -First 1
+            if (-not $task) {
+              throw "Missing required task '$taskId' in $planPath"
+            }
+            if ($task.status -ne "done") {
+              throw "Release blocked: task '$taskId' status is '$($task.status)' (expected 'done')."
+            }
+          }
+          $requiredHostTest = $plan.required_tests | Where-Object { $_.id -eq "INC-49-T1" } | Select-Object -First 1
+          if (-not $requiredHostTest) {
+            throw "Missing required host test 'INC-49-T1' in $planPath"
+          }
+          if ($requiredHostTest.status -ne "done") {
+            throw "Release blocked: host test 'INC-49-T1' status is '$($requiredHostTest.status)' (expected 'done')."
+          }
+          Write-Host "INC-49 release closure gate passed."
+
+      - name: Enforce tag is main HEAD
+        shell: pwsh
+        run: |
+          git fetch origin main --depth=1
+          $mainHead = (git rev-parse origin/main).Trim()
+          $tagCommit = (git rev-parse HEAD).Trim()
+          if ($tagCommit -ne $mainHead) {
+            throw "Release blocked: tag commit ($tagCommit) is not the current origin/main HEAD ($mainHead)."
+          }
+          Write-Host "Tag commit matches origin/main HEAD."
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -83,6 +272,34 @@ jobs:
           Compress-Archive -Path release/* -DestinationPath openniri-windows-${{ github.ref_name }}.zip
         shell: pwsh
 
+      - name: Generate checksums
+        run: |
+          $files = @(
+            "openniri-windows-${{ github.ref_name }}.zip",
+            "target/release/openniri.exe",
+            "target/release/openniri-cli.exe"
+          )
+          $checksums = foreach ($file in $files) {
+            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+            $name = Split-Path $file -Leaf
+            "$hash  $name"
+          }
+          $checksums | Out-File -FilePath checksums.txt -Encoding utf8
+          Write-Host "Generated checksums:"
+          Get-Content checksums.txt
+        shell: pwsh
+
+      - name: Determine pre-release status
+        id: prerelease
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match '-(alpha|beta|rc)') {
+            echo "is_prerelease=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "is_prerelease=false" >> $env:GITHUB_OUTPUT
+          }
+        shell: pwsh
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -90,4 +307,6 @@ jobs:
             openniri-windows-${{ github.ref_name }}.zip
             target/release/openniri.exe
             target/release/openniri-cli.exe
+            checksums.txt
           generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}

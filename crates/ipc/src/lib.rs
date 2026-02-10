@@ -6,9 +6,85 @@ use serde::{Deserialize, Serialize};
 
 /// Named pipe path for IPC communication.
 pub const PIPE_NAME: &str = r"\\.\pipe\openniri";
+/// Maximum length of sanitized user scope appended to the pipe path.
+const MAX_PIPE_SCOPE_SEGMENT_LEN: usize = 64;
+
+/// IPC protocol version for lightweight compatibility checks.
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+/// Minimum protocol version this crate supports.
+pub const IPC_MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 /// Maximum IPC message size (64 KiB). Messages larger than this are rejected.
 pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024;
+
+fn sanitize_pipe_scope_segment(scope: &str) -> String {
+    let mut sanitized = String::with_capacity(scope.len());
+    for ch in scope.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            sanitized.push(ch.to_ascii_lowercase());
+        } else {
+            sanitized.push('_');
+        }
+        if sanitized.len() >= MAX_PIPE_SCOPE_SEGMENT_LEN {
+            break;
+        }
+    }
+    sanitized.trim_matches('_').to_string()
+}
+
+/// Build a user-scoped pipe name from an arbitrary user/domain scope string.
+pub fn scoped_pipe_name_for_user(scope: &str) -> String {
+    let segment = sanitize_pipe_scope_segment(scope);
+    if segment.is_empty() {
+        PIPE_NAME.to_string()
+    } else {
+        format!("{PIPE_NAME}_{segment}")
+    }
+}
+
+/// Preferred pipe name for this process/user with legacy fallback available.
+///
+/// Resolution order:
+/// 1. `OPENNIRI_PIPE_SCOPE` environment override
+/// 2. `USERDOMAIN\\USERNAME`
+/// 3. legacy global `PIPE_NAME`
+pub fn preferred_pipe_name() -> String {
+    if let Ok(scope) = std::env::var("OPENNIRI_PIPE_SCOPE") {
+        let scoped = scoped_pipe_name_for_user(&scope);
+        if scoped != PIPE_NAME {
+            return scoped;
+        }
+    }
+
+    let domain = std::env::var("USERDOMAIN").ok();
+    let user = std::env::var("USERNAME").ok();
+    match (domain, user) {
+        (Some(domain), Some(user)) if !domain.trim().is_empty() && !user.trim().is_empty() => {
+            scoped_pipe_name_for_user(&format!("{domain}\\{user}"))
+        }
+        _ => PIPE_NAME.to_string(),
+    }
+}
+
+/// Candidate pipe names in preference order with legacy compatibility fallback.
+pub fn pipe_name_candidates() -> Vec<String> {
+    let preferred = preferred_pipe_name();
+    if preferred == PIPE_NAME {
+        vec![preferred]
+    } else {
+        vec![preferred, PIPE_NAME.to_string()]
+    }
+}
+
+/// Return the protocol identifier for this crate version.
+pub fn protocol_id() -> u32 {
+    IPC_PROTOCOL_VERSION
+}
+
+/// Whether a remote protocol version is supported by this crate.
+pub fn is_protocol_version_supported(version: u32) -> bool {
+    (IPC_MIN_SUPPORTED_PROTOCOL_VERSION..=IPC_PROTOCOL_VERSION).contains(&version)
+}
 
 /// Rectangle for IPC serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,7 +97,12 @@ pub struct IpcRect {
 
 impl IpcRect {
     pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -104,6 +185,10 @@ pub enum IpcCommand {
     Reload,
     /// Stop the daemon.
     Stop,
+    /// Emergency recovery command to revert managed windows to a safe state.
+    PanicRevert,
+    /// Toggle paused state for tiling operations.
+    TogglePause,
 
     /// Query detailed information about all managed windows.
     QueryAllWindows,
@@ -123,6 +208,8 @@ pub enum IpcCommand {
     EqualizeColumnWidths,
     /// Query daemon status information.
     QueryStatus,
+    /// Health check — returns uptime, window count, and error count.
+    HealthCheck,
 }
 
 /// Responses from the daemon to the CLI.
@@ -184,6 +271,22 @@ pub enum IpcResponse {
         /// Daemon uptime in seconds.
         uptime_seconds: u64,
     },
+    /// Health check response.
+    HealthInfo {
+        /// Whether the daemon considers itself healthy.
+        healthy: bool,
+        /// Daemon uptime in seconds.
+        uptime_seconds: u64,
+        /// Total managed windows.
+        total_windows: usize,
+        /// Number of monitors detected.
+        monitors: usize,
+        /// Whether tiling is paused.
+        paused: bool,
+    },
+    /// Forward-compatibility fallback for newer daemon responses unknown to this client.
+    #[serde(other)]
+    Unknown,
 }
 
 impl IpcResponse {
@@ -218,6 +321,16 @@ mod tests {
 
         let cmd2: IpcCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, cmd2);
+    }
+
+    #[test]
+    fn test_panic_revert_wire_name_is_stable() {
+        let cmd = IpcCommand::PanicRevert;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"panic_revert"}"#);
+
+        let parsed: IpcCommand = serde_json::from_str(r#"{"type":"panic_revert"}"#).unwrap();
+        assert_eq!(parsed, IpcCommand::PanicRevert);
     }
 
     #[test]
@@ -283,6 +396,8 @@ mod tests {
             IpcCommand::Apply,
             IpcCommand::Reload,
             IpcCommand::Stop,
+            IpcCommand::PanicRevert,
+            IpcCommand::TogglePause,
             IpcCommand::CloseWindow,
             IpcCommand::ToggleFloating,
             IpcCommand::ToggleFullscreen,
@@ -290,6 +405,7 @@ mod tests {
             IpcCommand::SetColumnWidth { fraction: 0.333 },
             IpcCommand::EqualizeColumnWidths,
             IpcCommand::QueryStatus,
+            IpcCommand::HealthCheck,
         ];
 
         for cmd in commands {
@@ -341,9 +457,7 @@ mod tests {
                     is_focused: true,
                 }],
             },
-            IpcResponse::WindowList {
-                windows: vec![],
-            },
+            IpcResponse::WindowList { windows: vec![] },
             IpcResponse::FocusedWindowInfo {
                 window: Some(WindowInfo {
                     window_id: 42,
@@ -359,14 +473,19 @@ mod tests {
                     is_focused: true,
                 }),
             },
-            IpcResponse::FocusedWindowInfo {
-                window: None,
-            },
+            IpcResponse::FocusedWindowInfo { window: None },
             IpcResponse::StatusInfo {
                 version: "0.1.0".to_string(),
                 monitors: 2,
                 total_windows: 5,
                 uptime_seconds: 3600,
+            },
+            IpcResponse::HealthInfo {
+                healthy: true,
+                uptime_seconds: 120,
+                total_windows: 3,
+                monitors: 1,
+                paused: false,
             },
         ];
 
@@ -468,7 +587,7 @@ mod tests {
         assert!(result.is_err());
 
         let result: Result<IpcResponse, _> = serde_json::from_str("{\"status\": \"invalid\"}");
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(IpcResponse::Unknown)));
     }
 
     #[test]
@@ -476,6 +595,29 @@ mod tests {
         // Verify pipe name follows Windows named pipe convention
         assert!(PIPE_NAME.starts_with(r"\\.\pipe\"));
         assert_eq!(PIPE_NAME, r"\\.\pipe\openniri");
+    }
+
+    #[test]
+    fn test_scoped_pipe_name_for_user_sanitizes_and_scopes() {
+        let scoped = scoped_pipe_name_for_user("ACME\\Alice Example!");
+        assert!(scoped.starts_with(PIPE_NAME));
+        assert_ne!(scoped, PIPE_NAME);
+        assert!(scoped.ends_with("acme_alice_example"));
+    }
+
+    #[test]
+    fn test_pipe_name_candidates_include_legacy_fallback() {
+        let candidates = pipe_name_candidates();
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates.last().unwrap(), PIPE_NAME);
+    }
+
+    #[test]
+    fn test_protocol_version_helpers() {
+        assert_eq!(protocol_id(), IPC_PROTOCOL_VERSION);
+        assert!(is_protocol_version_supported(IPC_PROTOCOL_VERSION));
+        assert!(!is_protocol_version_supported(0));
+        assert!(!is_protocol_version_supported(IPC_PROTOCOL_VERSION + 1));
     }
 
     #[test]

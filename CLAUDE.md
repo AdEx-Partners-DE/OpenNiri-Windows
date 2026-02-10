@@ -5,6 +5,9 @@ This file is a thin wrapper. The canonical instructions for this repo are in `AG
 ## How to Work Here
 - Read `AGENTS.md` first and follow it as the source of truth.
 - Review `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` for feedback and open items.
+- Use `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json` as machine-readable task state.
+- Keep `docs/1_Progress and review/OPEN_ITEMS.md` in sync with completed/open status.
+- Follow `docs/1_Progress and review/REVIEW_HOUSEKEEPING.md` for archiving superseded docs.
 - For non-trivial changes, produce a short plan before editing.
 - Run the relevant checks listed in `AGENTS.md` before finishing.
 - Prefer reuse before adding new code.

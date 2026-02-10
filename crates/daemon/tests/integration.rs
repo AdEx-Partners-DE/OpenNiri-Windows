@@ -5,8 +5,13 @@
 //! - Command serialization/deserialization
 //! - Response formatting
 //! - Protocol flow
+//!
+//! Limits:
+//! - These tests validate IPC serde and line-delimited wire shape only.
+//! - They do not launch the daemon event loop or exercise real Win32 focus/desktop recovery.
+//! - Lockout/recovery behavior must be verified in host/manual scenarios.
 
-use openniri_ipc::{IpcCommand, IpcResponse, IpcRect, WindowInfo};
+use openniri_ipc::{IpcCommand, IpcRect, IpcResponse, WindowInfo};
 
 // ============================================================================
 // IPC Command Roundtrip Tests
@@ -33,10 +38,21 @@ fn test_all_commands_roundtrip() {
         IpcCommand::QueryWorkspace,
         IpcCommand::QueryFocused,
         IpcCommand::QueryAllWindows,
+        IpcCommand::CloseWindow,
+        IpcCommand::ToggleFloating,
+        IpcCommand::ToggleFullscreen,
+        IpcCommand::SetColumnWidth { fraction: 0.333 },
+        IpcCommand::SetColumnWidth { fraction: 0.5 },
+        IpcCommand::SetColumnWidth { fraction: 1.0 },
+        IpcCommand::EqualizeColumnWidths,
+        IpcCommand::QueryStatus,
+        IpcCommand::HealthCheck,
         IpcCommand::Refresh,
         IpcCommand::Apply,
         IpcCommand::Reload,
         IpcCommand::Stop,
+        IpcCommand::PanicRevert,
+        IpcCommand::TogglePause,
     ];
 
     for cmd in commands {
@@ -54,7 +70,9 @@ fn test_all_commands_roundtrip() {
 fn test_all_responses_roundtrip() {
     let responses = vec![
         IpcResponse::Ok,
-        IpcResponse::Error { message: "Test error".to_string() },
+        IpcResponse::Error {
+            message: "Test error".to_string(),
+        },
         IpcResponse::WorkspaceState {
             columns: 3,
             windows: 5,
@@ -74,21 +92,48 @@ fn test_all_responses_roundtrip() {
             window_index: 0,
         },
         IpcResponse::WindowList {
-            windows: vec![
-                WindowInfo {
-                    window_id: 100,
-                    title: "Test Window".to_string(),
-                    class_name: "TestClass".to_string(),
-                    process_id: 1234,
-                    executable: "test.exe".to_string(),
-                    rect: IpcRect::new(0, 0, 800, 600),
-                    column_index: Some(0),
-                    window_index: Some(0),
-                    monitor_id: 1,
-                    is_floating: false,
-                    is_focused: true,
-                },
-            ],
+            windows: vec![WindowInfo {
+                window_id: 100,
+                title: "Test Window".to_string(),
+                class_name: "TestClass".to_string(),
+                process_id: 1234,
+                executable: "test.exe".to_string(),
+                rect: IpcRect::new(0, 0, 800, 600),
+                column_index: Some(0),
+                window_index: Some(0),
+                monitor_id: 1,
+                is_floating: false,
+                is_focused: true,
+            }],
+        },
+        IpcResponse::FocusedWindowInfo {
+            window: Some(WindowInfo {
+                window_id: 101,
+                title: "Focused Window".to_string(),
+                class_name: "FocusClass".to_string(),
+                process_id: 5678,
+                executable: "focused.exe".to_string(),
+                rect: IpcRect::new(50, 60, 900, 700),
+                column_index: Some(1),
+                window_index: Some(0),
+                monitor_id: 2,
+                is_floating: false,
+                is_focused: true,
+            }),
+        },
+        IpcResponse::FocusedWindowInfo { window: None },
+        IpcResponse::StatusInfo {
+            version: "0.1.0-test".to_string(),
+            monitors: 2,
+            total_windows: 7,
+            uptime_seconds: 3600,
+        },
+        IpcResponse::HealthInfo {
+            healthy: true,
+            uptime_seconds: 3600,
+            total_windows: 7,
+            monitors: 2,
+            paused: false,
         },
     ];
 
@@ -137,6 +182,59 @@ fn test_response_newline_delimited() {
     let _parsed: IpcResponse = serde_json::from_str(trimmed).expect("parse trimmed");
 }
 
+/// Test panic_revert command roundtrip using exact protocol JSON shape.
+#[test]
+fn test_panic_revert_command_json_shape_roundtrip() {
+    let cmd = IpcCommand::PanicRevert;
+    let json = serde_json::to_string(&cmd).expect("serialize");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("parse value");
+
+    assert_eq!(value, serde_json::json!({ "type": "panic_revert" }));
+
+    let parsed: IpcCommand =
+        serde_json::from_str(r#"{"type":"panic_revert"}"#).expect("deserialize canonical");
+    assert_eq!(parsed, IpcCommand::PanicRevert);
+}
+
+/// Test stop command/response payload expectations in this serde-only integration suite.
+#[test]
+fn test_stop_command_response_payload_shapes() {
+    // Canonical stop request: command tag only, no payload.
+    let stop_cmd = IpcCommand::Stop;
+    let cmd_json = serde_json::to_string(&stop_cmd).expect("serialize stop");
+    let cmd_value: serde_json::Value = serde_json::from_str(&cmd_json).expect("parse stop value");
+    assert_eq!(cmd_value, serde_json::json!({ "type": "stop" }));
+
+    // Canonical success response for stop: status tag only.
+    let stop_response = IpcResponse::Ok;
+    let response_json = serde_json::to_string(&stop_response).expect("serialize response");
+    let response_value: serde_json::Value =
+        serde_json::from_str(&response_json).expect("parse response value");
+    assert_eq!(response_value, serde_json::json!({ "status": "ok" }));
+
+    // Validate parse path from exact line-delimited wire messages.
+    let parsed_cmd: IpcCommand =
+        serde_json::from_str(r#"{"type":"stop"}"#).expect("parse canonical stop");
+    let parsed_response: IpcResponse =
+        serde_json::from_str(r#"{"status":"ok"}"#).expect("parse canonical ok");
+    assert_eq!(parsed_cmd, IpcCommand::Stop);
+    assert_eq!(parsed_response, IpcResponse::Ok);
+}
+
+/// Test toggle_pause command payload expectations in this serde-only integration suite.
+#[test]
+fn test_toggle_pause_command_payload_shape() {
+    let cmd = IpcCommand::TogglePause;
+    let cmd_json = serde_json::to_string(&cmd).expect("serialize toggle_pause");
+    let cmd_value: serde_json::Value =
+        serde_json::from_str(&cmd_json).expect("parse toggle_pause value");
+    assert_eq!(cmd_value, serde_json::json!({ "type": "toggle_pause" }));
+
+    let parsed_cmd: IpcCommand =
+        serde_json::from_str(r#"{"type":"toggle_pause"}"#).expect("parse canonical toggle_pause");
+    assert_eq!(parsed_cmd, IpcCommand::TogglePause);
+}
+
 // ============================================================================
 // Error Response Tests
 // ============================================================================
@@ -145,7 +243,9 @@ fn test_response_newline_delimited() {
 #[test]
 fn test_error_response_message() {
     let error_msg = "Window not found: 12345";
-    let resp = IpcResponse::Error { message: error_msg.to_string() };
+    let resp = IpcResponse::Error {
+        message: error_msg.to_string(),
+    };
 
     let json = serde_json::to_string(&resp).expect("serialize");
     assert!(json.contains(error_msg));
@@ -161,7 +261,9 @@ fn test_error_response_message() {
 #[test]
 fn test_error_response_special_chars() {
     let error_msg = "Failed to process: \"window\" with <special> & chars";
-    let resp = IpcResponse::Error { message: error_msg.to_string() };
+    let resp = IpcResponse::Error {
+        message: error_msg.to_string(),
+    };
 
     let json = serde_json::to_string(&resp).expect("serialize");
     let parsed: IpcResponse = serde_json::from_str(&json).expect("deserialize");
@@ -193,7 +295,9 @@ fn test_workspace_state_edge_values() {
     let parsed: IpcResponse = serde_json::from_str(&json).expect("deserialize");
 
     match parsed {
-        IpcResponse::WorkspaceState { columns, windows, .. } => {
+        IpcResponse::WorkspaceState {
+            columns, windows, ..
+        } => {
             assert_eq!(columns, 0);
             assert_eq!(windows, 0);
         }
@@ -217,7 +321,11 @@ fn test_workspace_state_large_values() {
     let parsed: IpcResponse = serde_json::from_str(&json).expect("deserialize");
 
     match parsed {
-        IpcResponse::WorkspaceState { total_width, scroll_offset, .. } => {
+        IpcResponse::WorkspaceState {
+            total_width,
+            scroll_offset,
+            ..
+        } => {
             assert_eq!(total_width, 100000);
             assert!((scroll_offset - 50000.5).abs() < 0.001);
         }
@@ -399,15 +507,7 @@ fn test_scroll_command_values() {
 /// Test parsing invalid JSON.
 #[test]
 fn test_invalid_json_parsing() {
-    let invalid_inputs = vec![
-        "",
-        "not json",
-        "{",
-        "{invalid}",
-        "null",
-        "123",
-        "true",
-    ];
+    let invalid_inputs = vec!["", "not json", "{", "{invalid}", "null", "123", "true"];
 
     for input in invalid_inputs {
         let result: Result<IpcCommand, _> = serde_json::from_str(input);
@@ -426,9 +526,9 @@ fn test_unknown_command_type() {
 /// Test parsing unknown response type.
 #[test]
 fn test_unknown_response_type() {
-    let json = r#"{"UnknownResponse":{}}"#;
+    let json = r#"{"status":"future_response","payload":{"v":1}}"#;
     let result: Result<IpcResponse, _> = serde_json::from_str(json);
-    assert!(result.is_err());
+    assert!(matches!(result, Ok(IpcResponse::Unknown)));
 }
 
 // ============================================================================

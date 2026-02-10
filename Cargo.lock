@@ -1017,9 +1017,12 @@ dependencies = [
  "clap",
  "directories",
  "openniri-ipc",
+ "openniri-platform-win32",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
+ "windows",
  "winreg",
 ]
 
@@ -1036,6 +1039,7 @@ name = "openniri-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "directories",
  "openniri-core-layout",
  "openniri-ipc",

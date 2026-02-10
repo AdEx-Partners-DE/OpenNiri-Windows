@@ -1,29 +1,41 @@
-# Codex Consolidated Review (Latest: Review 24)
-Date: 2026-02-05
+# Codex Consolidated Review (Latest: Review 36)
+Date: 2026-02-09
 Reviewer: Codex
-Scope: End-of-day wrap-up validation after Iteration 30 stabilization updates.
-Status: Review complete. No blocking issues found.
+Scope: Strict automation QA gate rerun (Critical/High only), code-level exhaustion before host-manual testing.
+Status: Review-36 completed. No new code-level Critical/High findings were identified in either loop. Release remains blocked only by pending host-manual incident closure evidence (`INC-49-1`, `INC-49-4`, `INC-49-T1`).
+
+## Loop Records (Critical/High Only)
+
+### Loop 65-1
+- Findings added: 0
+- Findings closed: 0
+- New Critical/High: NONE
+
+### Loop 65-2
+- Findings added: 0
+- Findings closed: 0
+- New Critical/High: NONE
 
 ## Verification Evidence
-- `cargo test --workspace` -> PASSED: **297 passed, 0 failed, 5 ignored** (**302 total**).
-- `cargo clippy --workspace --all-targets -- -D warnings` -> PASSED.
-- `cargo clippy --all-targets --all-features -- -D warnings` -> PASSED.
-- `cargo build --release` -> PASSED.
+- Parallel review lanes executed across runtime, IPC framing/size/timeouts, Win32 foreground/hide/recovery paths, CLI recovery/non-success handling, and CI/test gate consistency.
+- External benchmark sanity-check reviewed against upstream references:
+  - niri design principles (`https://github.com/YaLTeR/niri/wiki/Design-Principles`)
+  - komorebi CLI/recovery docs (`https://lgug2z.github.io/komorebi/`)
+- Required QA commands passed in both loops:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all -- -D warnings`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --all --verbose` (546 test-binary total: 542 passed, 4 ignored; plus doc-test compile checks)
+  - `cargo test --workspace -- --ignored`
+  - `cargo build --release --all`
 
-## What Was Verified
-- Unified shutdown path now includes tray exit:
-  - `tray::TrayEvent::Exit` sends `DaemonEvent::Shutdown` at `crates/daemon/src/main.rs:2139`.
-  - Shared cleanup executes in `DaemonEvent::Shutdown` branch at `crates/daemon/src/main.rs:2215`.
-- Crash-safety/reliability features present and wired:
-  - Ctrl+C shutdown signal task (`crates/daemon/src/main.rs:1874`)
-  - Managed-window uncloak/reset (`crates/platform_win32/src/lib.rs:899`)
-  - Panic-hook emergency uncloak (`crates/daemon/src/main.rs:1594`, `crates/platform_win32/src/lib.rs:918`)
-  - DPI awareness init at process start (`crates/daemon/src/main.rs:1559`, `crates/platform_win32/src/lib.rs:941`)
-- Documentation now reflects Iteration 30 reality:
-  - `docs/SPEC.md` updated to 302 total / 297 passing / 5 ignored.
-  - `docs/ARCHITECTURE.md` updated counts and reliability feature coverage.
-  - `docs/1_Progress and review/ITERATION_LOG.md` updated with Iteration 30 completion and Iteration 31 planning.
+## Exit Criteria Result
+- Two consecutive full loops with zero new Critical/High findings: PASS
+- All required QA commands passed in both loops: PASS
+- All fixed Critical/High findings have tests or rationale: PASS (no new fixes required in this rerun)
 
-## Residual Risks (Non-Blocking)
-- Recovery-path tests are still mostly "no panic" style; full runtime e2e validation for crash/shutdown behavior remains manual.
-- One daemon test remains ignored due environment coupling (`test_check_already_running_returns_false_when_no_daemon`).
+## Open Items
+- `INC-49` (Critical incident): host-manual reproduction/recovery closure evidence still pending.
+  - Remaining: `INC-49-1`, `INC-49-4`, `INC-49-T1`.
+  - Incident record: `docs/1_Progress and review/INCIDENT_2026-02-07_DESKTOP_LOCKOUT.md`
+  - Tracking plan: `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`

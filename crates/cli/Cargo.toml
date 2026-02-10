@@ -13,12 +13,15 @@ path = "src/main.rs"
 
 [dependencies]
 openniri-ipc = { path = "../ipc" }
+openniri-platform-win32 = { path = "../platform_win32" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+toml = { workspace = true }
 directories = { workspace = true }
+windows = { workspace = true }
 winreg = "0.55"
 
 [dev-dependencies]

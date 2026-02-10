@@ -15,7 +15,7 @@ use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
 use std::sync::mpsc;
 use thiserror::Error;
-use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED,
 };
@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -30,16 +31,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CallNextHookEx, CreateWindowExW, DeferWindowPos, DefWindowProcW,
-    DispatchMessageW, EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetMessageW,
-    GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, RegisterClassW,
-    SetForegroundWindow, SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint,
-    BringWindowToTop, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, HHOOK, HWND_MESSAGE,
-    MSLLHOOKSTRUCT, MSG, SWP_NOACTIVATE, SWP_NOZORDER, WH_MOUSE_LL, WM_HOTKEY, WM_MOUSEMOVE,
-    WM_USER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
+    BeginDeferWindowPos, BringWindowToTop, CallNextHookEx, CreateWindowExW, DefWindowProcW,
+    DeferWindowPos, DestroyWindow, DispatchMessageW, EndDeferWindowPos, EnumWindows, GetAncestor,
+    GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, PostThreadMessageW, RegisterClassW, SetForegroundWindow,
+    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, UnregisterClassW,
+    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HHOOK, MSG, MSLLHOOKSTRUCT,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WH_MOUSE_LL, WM_HOTKEY, WM_MOUSEMOVE, WM_USER,
+    WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
 
 // WinEvent constants (not all are exposed by windows-rs)
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
@@ -55,13 +56,17 @@ const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
 // Window message for display configuration changes
 const WM_DISPLAYCHANGE: u32 = 0x007E;
+/// Sentinel coordinate used by MoveOffScreen strategy.
+pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = -100_000;
 
 /// Recover from a poisoned mutex, logging a warning.
 ///
 /// When a thread panics while holding a mutex, the mutex becomes "poisoned".
 /// This helper logs the event and recovers the inner data so the application
 /// can continue operating.
-fn recover_poisoned_mutex<T>(err: std::sync::PoisonError<std::sync::MutexGuard<'_, T>>) -> std::sync::MutexGuard<'_, T> {
+fn recover_poisoned_mutex<T>(
+    err: std::sync::PoisonError<std::sync::MutexGuard<'_, T>>,
+) -> std::sync::MutexGuard<'_, T> {
     eprintln!("[openniri] WARNING: Mutex poisoned, recovering");
     err.into_inner()
 }
@@ -75,6 +80,24 @@ fn window_id_to_hwnd(id: WindowId) -> Result<HWND, Win32Error> {
         return Err(Win32Error::WindowNotFound(id));
     }
     Ok(HWND(id as *mut c_void))
+}
+
+fn combine_operation_failures(context: &str, failures: Vec<String>) -> Win32Error {
+    debug_assert!(!failures.is_empty());
+    Win32Error::SetPositionFailed(format!(
+        "{} ({} failures): {}",
+        context,
+        failures.len(),
+        failures.join("; ")
+    ))
+}
+
+/// Whether an operation failure is a benign race where the window vanished.
+///
+/// These races are expected under concurrent window lifecycle churn and should
+/// not fail the entire placement batch.
+fn is_benign_window_race_error(error: &Win32Error) -> bool {
+    matches!(error, Win32Error::WindowNotFound(window_id) if *window_id != 0)
 }
 
 /// Errors that can occur during Win32 operations.
@@ -198,10 +221,7 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>, Win32Error> {
         // EnumWindows callback receives a raw pointer to our Vec
         let windows_ptr = &mut windows as *mut Vec<WindowInfo>;
 
-        let result = EnumWindows(
-            Some(enum_windows_callback),
-            LPARAM(windows_ptr as isize),
-        );
+        let result = EnumWindows(Some(enum_windows_callback), LPARAM(windows_ptr as isize));
 
         if result.is_err() {
             return Err(Win32Error::EnumerationFailed(
@@ -223,16 +243,17 @@ pub fn get_primary_monitor() -> Result<MonitorInfo, Win32Error> {
     monitors
         .into_iter()
         .find(|m| m.is_primary)
-        .ok_or_else(|| {
-            Win32Error::MonitorEnumerationFailed("No primary monitor found".to_string())
-        })
+        .ok_or_else(|| Win32Error::MonitorEnumerationFailed("No primary monitor found".to_string()))
 }
 
 /// Find which monitor contains the center of a given rectangle.
 ///
 /// Returns the monitor info if found, or None if no monitor contains the point.
 /// Falls back to primary monitor if no exact match.
-pub fn find_monitor_for_rect<'a>(monitors: &'a [MonitorInfo], rect: &Rect) -> Option<&'a MonitorInfo> {
+pub fn find_monitor_for_rect<'a>(
+    monitors: &'a [MonitorInfo],
+    rect: &Rect,
+) -> Option<&'a MonitorInfo> {
     // First, try to find a monitor that contains the rect's center
     let center_x = rect.x + rect.width / 2;
     let center_y = rect.y + rect.height / 2;
@@ -473,6 +494,129 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
     TRUE
 }
 
+/// Apply manageability filters to a window handle for WinEvent callback emission.
+///
+/// This mirrors enumeration filters so event callbacks don't emit churn for
+/// windows we would never manage.
+fn should_emit_window_event_with_policy(
+    hwnd: HWND,
+    require_visible: bool,
+    require_title: bool,
+    filter_cloaked: bool,
+) -> bool {
+    // Keep callback work best-effort and non-panicking.
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) as u32 };
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 };
+
+    if require_visible && !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return false;
+    }
+
+    if require_visible && style & WS_VISIBLE.0 == 0 {
+        return false;
+    }
+
+    let is_tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
+    let is_app_window = ex_style & WS_EX_APPWINDOW.0 != 0;
+    if is_tool_window && !is_app_window {
+        return false;
+    }
+
+    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
+        return false;
+    }
+
+    if let Ok(owner) = unsafe { GetWindow(hwnd, GW_OWNER) } {
+        if !owner.is_invalid() {
+            return false;
+        }
+    }
+
+    if filter_cloaked && is_window_cloaked(hwnd) {
+        return false;
+    }
+
+    if require_title {
+        let title_len = unsafe { GetWindowTextLengthW(hwnd) };
+        if title_len == 0 {
+            return false;
+        }
+
+        let mut title_buf: Vec<u16> = vec![0; (title_len + 1) as usize];
+        let actual_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+        if actual_len == 0 {
+            return false;
+        }
+        let title = String::from_utf16_lossy(&title_buf[..actual_len as usize]);
+        if should_skip_window_by_title(&title) {
+            return false;
+        }
+    }
+
+    let mut class_buf: Vec<u16> = vec![0; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class_buf) };
+    let class_name = if class_len > 0 {
+        String::from_utf16_lossy(&class_buf[..class_len as usize])
+    } else {
+        String::new()
+    };
+
+    if should_skip_window_by_class(&class_name) {
+        return false;
+    }
+
+    true
+}
+
+fn should_emit_window_event(hwnd: HWND) -> bool {
+    should_emit_window_event_with_policy(
+        hwnd, true, // visible only
+        true, // non-empty title
+        true, // filter cloaked windows
+    )
+}
+
+fn should_emit_window_event_for(event: u32, hwnd: HWND) -> bool {
+    match event {
+        // Creation can happen before title is set; keep manageability checks but
+        // allow empty title and cloaked transitional states.
+        EVENT_OBJECT_CREATE => should_emit_window_event_with_policy(hwnd, true, false, false),
+        // Focus must not be blocked by cloaked-state checks or empty titles.
+        EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => {
+            should_emit_window_event_with_policy(hwnd, true, false, false)
+        }
+        // Restore/minimize/destroy should still pass basic top-level filtering,
+        // but visibility/title can be transient during these transitions.
+        EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND | EVENT_OBJECT_DESTROY => {
+            should_emit_window_event_with_policy(hwnd, false, false, false)
+        }
+        EVENT_OBJECT_LOCATIONCHANGE => should_emit_window_event_with_policy(hwnd, true, true, true),
+        _ => false,
+    }
+}
+
+fn should_filter_window_event_by_manageability(event: u32) -> bool {
+    matches!(
+        event,
+        EVENT_OBJECT_CREATE
+            | EVENT_OBJECT_DESTROY
+            | EVENT_SYSTEM_FOREGROUND
+            | EVENT_SYSTEM_MINIMIZESTART
+            | EVENT_SYSTEM_MINIMIZEEND
+            | EVENT_OBJECT_LOCATIONCHANGE
+            | EVENT_OBJECT_FOCUS
+    )
+}
+
+fn normalize_to_root_window(hwnd: HWND) -> HWND {
+    let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if root_hwnd.0.is_null() {
+        hwnd
+    } else {
+        root_hwnd
+    }
+}
+
 /// Check if a window should be skipped based on its title.
 fn should_skip_window_by_title(title: &str) -> bool {
     const SKIP_TITLES: &[&str] = &[
@@ -499,24 +643,122 @@ fn is_window_cloaked(hwnd: HWND) -> bool {
             &mut cloaked as *mut u32 as *mut c_void,
             std::mem::size_of::<u32>() as u32,
         );
-        // If the call fails, assume not cloaked
-        result.is_ok() && cloaked != 0
+        match result {
+            Ok(()) => cloaked != 0,
+            Err(e) => {
+                let window_is_valid = IsWindow(Some(hwnd)).as_bool();
+                let treat_as_cloaked = should_treat_cloak_query_failure_as_cloaked(window_is_valid);
+                tracing::debug!(
+                    "DwmGetWindowAttribute(DWMWA_CLOAKED) failed for {:?}: {}. window_is_valid={} -> treat_as_cloaked={}",
+                    hwnd,
+                    e,
+                    window_is_valid,
+                    treat_as_cloaked
+                );
+                treat_as_cloaked
+            }
+        }
     }
+}
+
+fn should_treat_cloak_query_failure_as_cloaked(window_is_valid: bool) -> bool {
+    !window_is_valid
+}
+
+/// Check whether coordinates indicate MoveOffScreen sentinel placement.
+pub fn is_move_offscreen_sentinel_position(x: i32, y: i32) -> bool {
+    x <= MOVE_OFFSCREEN_SENTINEL_COORD && y <= MOVE_OFFSCREEN_SENTINEL_COORD
+}
+
+/// Check whether a rectangle indicates MoveOffScreen sentinel placement.
+pub fn is_move_offscreen_sentinel_rect(rect: &Rect) -> bool {
+    is_move_offscreen_sentinel_position(rect.x, rect.y)
+}
+
+fn move_offscreen_rect_for(rect: &Rect) -> Rect {
+    Rect::new(
+        MOVE_OFFSCREEN_SENTINEL_COORD,
+        MOVE_OFFSCREEN_SENTINEL_COORD,
+        rect.width,
+        rect.height,
+    )
+}
+
+fn compute_restore_rect_from_offscreen(current_rect: &Rect, work_area: &Rect) -> Rect {
+    let max_width = work_area.width.max(1);
+    let max_height = work_area.height.max(1);
+    let width = current_rect.width.max(1).min(max_width);
+    let height = current_rect.height.max(1).min(max_height);
+    Rect::new(work_area.x, work_area.y, width, height)
+}
+
+fn restore_window_if_offscreen_to_work_area(
+    window_id: WindowId,
+    work_area: &Rect,
+) -> Result<bool, Win32Error> {
+    let hwnd = window_id_to_hwnd(window_id)?;
+
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+
+        let mut current_rect = RECT::default();
+        GetWindowRect(hwnd, &mut current_rect).map_err(|e| {
+            Win32Error::SetPositionFailed(format!(
+                "GetWindowRect failed for window {}: {}",
+                window_id, e
+            ))
+        })?;
+
+        let current_rect = Rect::new(
+            current_rect.left,
+            current_rect.top,
+            current_rect.right - current_rect.left,
+            current_rect.bottom - current_rect.top,
+        );
+
+        if !is_move_offscreen_sentinel_rect(&current_rect) {
+            return Ok(false);
+        }
+
+        let restore_rect = compute_restore_rect_from_offscreen(&current_rect, work_area);
+
+        if let Err(e) = SetWindowPos(
+            hwnd,
+            None,
+            restore_rect.x,
+            restore_rect.y,
+            restore_rect.width,
+            restore_rect.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        ) {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(Win32Error::WindowNotFound(window_id));
+            }
+            return Err(Win32Error::SetPositionFailed(format!(
+                "Failed to restore off-screen window {}: {}",
+                window_id, e
+            )));
+        }
+    }
+
+    Ok(true)
 }
 
 /// Check if a window should be skipped based on its class name.
 fn should_skip_window_by_class(class_name: &str) -> bool {
     const SKIP_CLASSES: &[&str] = &[
-        "Progman",                          // Program Manager
-        "Shell_TrayWnd",                    // Taskbar
-        "Shell_SecondaryTrayWnd",           // Secondary taskbar
-        "WorkerW",                          // Desktop worker
-        "Windows.UI.Core.CoreWindow",       // UWP system windows
+        "Progman",                    // Program Manager
+        "Shell_TrayWnd",              // Taskbar
+        "Shell_SecondaryTrayWnd",     // Secondary taskbar
+        "WorkerW",                    // Desktop worker
+        "Windows.UI.Core.CoreWindow", // UWP system windows
         // ApplicationFrameWindow removed: allows tiling UWP apps (Calculator, Photos, etc.)
         // Empty/cloaked UWP frames are already filtered by the cloaked window check.
-        "XamlExplorerHostIslandWindow",     // XAML islands
+        "XamlExplorerHostIslandWindow", // XAML islands
         "TopLevelWindowForOverflowXamlIsland", // Overflow islands
-        // Add more system classes as needed
+                                        // Add more system classes as needed
     ];
 
     SKIP_CLASSES.contains(&class_name)
@@ -569,6 +811,160 @@ pub fn is_valid_window(hwnd: WindowId) -> bool {
     }
 }
 
+fn collect_uncloak_targets(
+    visible: &[&WindowPlacement],
+    offscreen: &[&WindowPlacement],
+    hide_strategy: HideStrategy,
+) -> Vec<WindowId> {
+    let mut targets: Vec<WindowId> = visible
+        .iter()
+        .map(|placement| placement.window_id)
+        .collect();
+    if hide_strategy == HideStrategy::MoveOffScreen {
+        for placement in offscreen {
+            if !targets.contains(&placement.window_id) {
+                targets.push(placement.window_id);
+            }
+        }
+    }
+    targets
+}
+
+fn ensure_foreground_window_remains_visible(
+    visible: &[&WindowPlacement],
+    offscreen: &[&WindowPlacement],
+) -> Option<WindowId> {
+    if offscreen.is_empty() {
+        return None;
+    }
+
+    let foreground_window_id = unsafe {
+        let raw_hwnd = GetForegroundWindow();
+        if raw_hwnd.0.is_null() {
+            return None;
+        }
+        let hwnd = normalize_to_root_window(raw_hwnd);
+        if hwnd.0.is_null() {
+            return None;
+        }
+        hwnd.0 as usize as WindowId
+    };
+
+    let foreground_will_be_hidden = offscreen_contains_window(offscreen, foreground_window_id);
+    if !foreground_will_be_hidden {
+        return None;
+    }
+
+    let fallback_window_id = select_visible_fallback_window(visible, foreground_window_id);
+
+    if let Some(window_id) = fallback_window_id {
+        match set_foreground_window(window_id) {
+            Ok(true) => return None,
+            Ok(false) => {
+                tracing::warn!(
+                    "Foreground switch from window {} to visible fallback {} was denied by the OS; keeping foreground window visible",
+                    foreground_window_id,
+                    window_id
+                );
+                return Some(foreground_window_id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to move foreground focus from window {} to visible fallback {} before hide: {}; keeping foreground window visible",
+                    foreground_window_id,
+                    window_id,
+                    e
+                );
+                return Some(foreground_window_id);
+            }
+        }
+    }
+
+    tracing::warn!(
+        "No visible fallback window was available while foreground window {} would be hidden; keeping foreground window visible",
+        foreground_window_id
+    );
+    Some(foreground_window_id)
+}
+
+fn offscreen_contains_window(offscreen: &[&WindowPlacement], window_id: WindowId) -> bool {
+    offscreen
+        .iter()
+        .any(|placement| placement.window_id == window_id)
+}
+
+fn select_visible_fallback_window(
+    visible: &[&WindowPlacement],
+    foreground_window_id: WindowId,
+) -> Option<WindowId> {
+    visible
+        .iter()
+        .find(|placement| placement.window_id != foreground_window_id)
+        .or_else(|| visible.first())
+        .map(|placement| placement.window_id)
+}
+
+fn rollback_apply_visibility_changes(
+    cloaked_window_ids: &[WindowId],
+    moved_offscreen_window_ids: &[WindowId],
+    visible_window_ids: &[WindowId],
+) {
+    for window_id in cloaked_window_ids {
+        if let Err(e) = uncloak_window(*window_id) {
+            tracing::warn!(
+                "Rollback failed while uncloaking window {} after apply error: {}",
+                window_id,
+                e
+            );
+        }
+    }
+
+    if !moved_offscreen_window_ids.is_empty() {
+        if let Err(e) = restore_windows_moved_offscreen(moved_offscreen_window_ids) {
+            tracing::warn!(
+                "Rollback failed while restoring moved-offscreen windows after apply error: {}",
+                e
+            );
+        }
+    }
+
+    for window_id in visible_window_ids {
+        match set_foreground_window(*window_id) {
+            Ok(true) => break,
+            Ok(false) => tracing::warn!(
+                "Rollback foreground restore was denied for window {}",
+                window_id
+            ),
+            Err(e) => tracing::warn!(
+                "Rollback foreground restore failed for window {}: {}",
+                window_id,
+                e
+            ),
+        }
+    }
+}
+
+fn record_apply_side_effect_failure(
+    side_effect_failures: &mut Vec<String>,
+    benign_race_count: &mut usize,
+    operation: &str,
+    window_id: WindowId,
+    error: Win32Error,
+) {
+    if is_benign_window_race_error(&error) {
+        *benign_race_count += 1;
+        tracing::debug!(
+            "Ignoring benign race during {} for window {}: {}",
+            operation,
+            window_id,
+            error
+        );
+    } else {
+        tracing::warn!("Failed to {} window {}: {}", operation, window_id, error);
+        side_effect_failures.push(format!("{} {} failed: {}", operation, window_id, error));
+    }
+}
+
 /// Apply window placements from the layout engine.
 ///
 /// This function:
@@ -587,6 +983,14 @@ pub fn apply_placements(
     let (visible, offscreen): (Vec<_>, Vec<_>) = placements
         .iter()
         .partition(|p| p.visibility == Visibility::Visible);
+    let visible_window_ids: Vec<WindowId> = visible
+        .iter()
+        .map(|placement| placement.window_id)
+        .collect();
+    let mut side_effect_failures: Vec<String> = Vec::new();
+    let mut benign_side_effect_races: usize = 0;
+    let mut cloaked_window_ids: Vec<WindowId> = Vec::new();
+    let mut moved_offscreen_window_ids: Vec<WindowId> = Vec::new();
 
     // Apply positions for visible windows
     if !visible.is_empty() {
@@ -595,11 +999,47 @@ pub fn apply_placements(
         } else {
             apply_placements_immediate(&visible)?;
         }
+    }
 
-        // Uncloak visible windows
-        for placement in &visible {
-            if let Err(e) = uncloak_window(placement.window_id) {
-                tracing::warn!("Failed to uncloak window {}: {}", placement.window_id, e);
+    // Keep windows visible under the active hide strategy.
+    for window_id in collect_uncloak_targets(&visible, &offscreen, config.hide_strategy) {
+        if let Err(e) = uncloak_window(window_id) {
+            record_apply_side_effect_failure(
+                &mut side_effect_failures,
+                &mut benign_side_effect_races,
+                "uncloak",
+                window_id,
+                e,
+            );
+        }
+    }
+
+    let protected_foreground_window =
+        ensure_foreground_window_remains_visible(&visible, &offscreen);
+
+    if let Some(window_id) = protected_foreground_window {
+        match config.hide_strategy {
+            HideStrategy::Cloak => {
+                if let Err(e) = uncloak_window(window_id) {
+                    record_apply_side_effect_failure(
+                        &mut side_effect_failures,
+                        &mut benign_side_effect_races,
+                        "uncloak protected foreground",
+                        window_id,
+                        e,
+                    );
+                }
+            }
+            HideStrategy::MoveOffScreen => {
+                if let Err(e) = restore_windows_moved_offscreen(&[window_id]) {
+                    record_apply_side_effect_failure(
+                        &mut side_effect_failures,
+                        &mut benign_side_effect_races,
+                        "restore protected foreground",
+                        window_id,
+                        e,
+                    );
+                }
             }
         }
     }
@@ -608,8 +1048,23 @@ pub fn apply_placements(
     match config.hide_strategy {
         HideStrategy::Cloak => {
             for placement in &offscreen {
+                if protected_foreground_window == Some(placement.window_id) {
+                    tracing::warn!(
+                        "Skipping cloak for foreground window {} because focus handoff was not confirmed",
+                        placement.window_id
+                    );
+                    continue;
+                }
                 if let Err(e) = cloak_window(placement.window_id) {
-                    tracing::warn!("Failed to cloak window {}: {}", placement.window_id, e);
+                    record_apply_side_effect_failure(
+                        &mut side_effect_failures,
+                        &mut benign_side_effect_races,
+                        "cloak",
+                        placement.window_id,
+                        e,
+                    );
+                } else {
+                    cloaked_window_ids.push(placement.window_id);
                 }
             }
         }
@@ -617,15 +1072,30 @@ pub fn apply_placements(
             // Move windows far off-screen (don't cloak them)
             // They remain in Alt-Tab but aren't visible
             for placement in &offscreen {
+                if protected_foreground_window == Some(placement.window_id) {
+                    tracing::warn!(
+                        "Skipping MoveOffScreen for foreground window {} because focus handoff was not confirmed",
+                        placement.window_id
+                    );
+                    continue;
+                }
                 // Move to far off-screen position
                 let offscreen_placement = WindowPlacement {
                     window_id: placement.window_id,
-                    rect: Rect::new(-32000, -32000, placement.rect.width, placement.rect.height),
+                    rect: move_offscreen_rect_for(&placement.rect),
                     visibility: Visibility::OffScreenLeft,
                     column_index: placement.column_index,
                 };
                 if let Err(e) = set_window_pos_immediate(&offscreen_placement) {
-                    tracing::warn!("Failed to move window {} off-screen: {}", placement.window_id, e);
+                    record_apply_side_effect_failure(
+                        &mut side_effect_failures,
+                        &mut benign_side_effect_races,
+                        "move off-screen",
+                        placement.window_id,
+                        e,
+                    );
+                } else {
+                    moved_offscreen_window_ids.push(placement.window_id);
                 }
             }
         }
@@ -637,6 +1107,25 @@ pub fn apply_placements(
         offscreen.len()
     );
 
+    if !side_effect_failures.is_empty() {
+        rollback_apply_visibility_changes(
+            &cloaked_window_ids,
+            &moved_offscreen_window_ids,
+            &visible_window_ids,
+        );
+        return Err(combine_operation_failures(
+            "apply_placements completed with side-effect failures",
+            side_effect_failures,
+        ));
+    }
+
+    if benign_side_effect_races > 0 {
+        tracing::debug!(
+            "apply_placements ignored {} benign side-effect race(s)",
+            benign_side_effect_races
+        );
+    }
+
     Ok(())
 }
 
@@ -647,12 +1136,16 @@ pub fn apply_placements(
 /// flicker and improving performance.
 ///
 /// If EndDeferWindowPos fails, falls back to individual SetWindowPos calls
-/// for all windows. If individual DeferWindowPos calls fail during the batch,
-/// those placements are tracked and retried individually after the batch.
+/// for all windows and returns an error if fallback cannot fully recover.
+/// If individual DeferWindowPos calls fail during the batch, those placements
+/// are tracked and retried individually after the batch; unrecovered failures
+/// are returned as an error.
 fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
     unsafe {
-        let hdwp = BeginDeferWindowPos(placements.len().min(i32::MAX as usize) as i32)
-            .map_err(|e| Win32Error::SetPositionFailed(format!("BeginDeferWindowPos failed: {}", e)))?;
+        let hdwp =
+            BeginDeferWindowPos(placements.len().min(i32::MAX as usize) as i32).map_err(|e| {
+                Win32Error::SetPositionFailed(format!("BeginDeferWindowPos failed: {}", e))
+            })?;
 
         let mut current_hdwp = hdwp;
         let mut failed_placements: Vec<&WindowPlacement> = Vec::new();
@@ -660,8 +1153,12 @@ fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win3
         for placement in placements {
             let hwnd = match window_id_to_hwnd(placement.window_id) {
                 Ok(h) => h,
-                Err(_) => {
-                    tracing::warn!("Skipping placement for invalid window ID 0");
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping deferred placement for invalid window ID {}: {}",
+                        placement.window_id,
+                        err
+                    );
                     failed_placements.push(placement);
                     continue;
                 }
@@ -699,25 +1196,76 @@ fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win3
                 e
             );
             // Fall back to individual positioning for ALL windows
+            let mut fallback_failures: Vec<String> = Vec::new();
+            let mut benign_races: usize = 0;
             for placement in placements {
-                if let Err(e) = set_window_pos_immediate(placement) {
-                    tracing::warn!(
-                        "Individual SetWindowPos also failed for {}: {}",
-                        placement.window_id,
-                        e
-                    );
+                if let Err(fallback_err) = set_window_pos_immediate(placement) {
+                    if is_benign_window_race_error(&fallback_err) {
+                        benign_races += 1;
+                        tracing::debug!(
+                            "Ignoring benign race during deferred fallback for window {}: {}",
+                            placement.window_id,
+                            fallback_err
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Individual SetWindowPos also failed for {}: {}",
+                            placement.window_id,
+                            fallback_err
+                        );
+                        fallback_failures
+                            .push(format!("window {}: {}", placement.window_id, fallback_err));
+                    }
                 }
+            }
+            if !fallback_failures.is_empty() {
+                fallback_failures.insert(0, format!("EndDeferWindowPos failed: {}", e));
+                return Err(combine_operation_failures(
+                    "Deferred positioning fallback could not fully recover",
+                    fallback_failures,
+                ));
+            }
+            if benign_races > 0 {
+                tracing::debug!(
+                    "Deferred fallback ignored {} benign window race(s)",
+                    benign_races
+                );
             }
         } else {
             // Batch succeeded, now handle any that failed during deferral
+            let mut fallback_failures: Vec<String> = Vec::new();
+            let mut benign_races: usize = 0;
             for placement in failed_placements {
-                if let Err(e) = set_window_pos_immediate(placement) {
-                    tracing::warn!(
-                        "Fallback SetWindowPos failed for {}: {}",
-                        placement.window_id,
-                        e
-                    );
+                if let Err(fallback_err) = set_window_pos_immediate(placement) {
+                    if is_benign_window_race_error(&fallback_err) {
+                        benign_races += 1;
+                        tracing::debug!(
+                            "Ignoring benign race during deferred retry for window {}: {}",
+                            placement.window_id,
+                            fallback_err
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Fallback SetWindowPos failed for {}: {}",
+                            placement.window_id,
+                            fallback_err
+                        );
+                        fallback_failures
+                            .push(format!("window {}: {}", placement.window_id, fallback_err));
+                    }
                 }
+            }
+            if !fallback_failures.is_empty() {
+                return Err(combine_operation_failures(
+                    "Deferred positioning had unrecovered per-window failures",
+                    fallback_failures,
+                ));
+            }
+            if benign_races > 0 {
+                tracing::debug!(
+                    "Deferred retry ignored {} benign window race(s)",
+                    benign_races
+                );
             }
         }
     }
@@ -728,18 +1276,33 @@ fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win3
 /// Apply placements using immediate SetWindowPos calls.
 fn apply_placements_immediate(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
     for placement in placements {
-        set_window_pos_immediate(placement)?;
+        if let Err(e) = set_window_pos_immediate(placement) {
+            if is_benign_window_race_error(&e) {
+                tracing::debug!(
+                    "Ignoring benign race during immediate placement for window {}: {}",
+                    placement.window_id,
+                    e
+                );
+                continue;
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }
 
 /// Set window position immediately using SetWindowPos.
 fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Error> {
-    let hwnd = window_id_to_hwnd(placement.window_id)?;
+    let window_id = placement.window_id;
+    let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+
         let rect = &placement.rect;
 
-        SetWindowPos(
+        if let Err(e) = SetWindowPos(
             hwnd,
             None,
             rect.x,
@@ -747,14 +1310,15 @@ fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Erro
             rect.width,
             rect.height,
             SWP_NOZORDER | SWP_NOACTIVATE,
-        )
-        .map_err(|e| {
-            Win32Error::SetPositionFailed(format!(
+        ) {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(Win32Error::WindowNotFound(window_id));
+            }
+            return Err(Win32Error::SetPositionFailed(format!(
                 "SetWindowPos failed for window {}: {}",
-                placement.window_id,
-                e
-            ))
-        })?;
+                window_id, e
+            )));
+        }
     }
     Ok(())
 }
@@ -764,8 +1328,13 @@ fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Erro
 /// Cloaked windows are hidden visually but remain in the taskbar
 /// and can still receive focus via Alt-Tab.
 pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
-    let hwnd = window_id_to_hwnd(hwnd)?;
+    let window_id = hwnd;
+    let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+
         let cloak_value: u32 = 1;
 
         let result = DwmSetWindowAttribute(
@@ -776,6 +1345,9 @@ pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
         );
 
         if result.is_err() {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(Win32Error::WindowNotFound(window_id));
+            }
             return Err(Win32Error::CloakFailed(format!(
                 "DwmSetWindowAttribute(CLOAK=1) failed for {:?}",
                 hwnd
@@ -787,8 +1359,13 @@ pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
 
 /// Uncloak a window (make visible again).
 pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
-    let hwnd = window_id_to_hwnd(hwnd)?;
+    let window_id = hwnd;
+    let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+
         let cloak_value: u32 = 0;
 
         let result = DwmSetWindowAttribute(
@@ -799,6 +1376,9 @@ pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
         );
 
         if result.is_err() {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return Err(Win32Error::WindowNotFound(window_id));
+            }
             return Err(Win32Error::CloakFailed(format!(
                 "DwmSetWindowAttribute(CLOAK=0) failed for {:?}",
                 hwnd
@@ -813,34 +1393,107 @@ pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
 /// Uses AttachThreadInput trick to reliably set foreground even when
 /// the calling process is not the foreground process.
 pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
-    let hwnd = window_id_to_hwnd(hwnd)?;
+    let window_id = hwnd;
+    let hwnd = window_id_to_hwnd(window_id)?;
+
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            if IsIconic(hwnd).as_bool() {
+                return Err(Win32Error::SetPositionFailed(format!(
+                    "Failed to restore minimized window {} before setting foreground",
+                    window_id
+                )));
+            }
+        }
+
         let target_thread = GetWindowThreadProcessId(hwnd, None);
+        if target_thread == 0 {
+            return Err(Win32Error::SetPositionFailed(format!(
+                "GetWindowThreadProcessId returned 0 for window {}",
+                window_id
+            )));
+        }
         let current_thread = GetCurrentThreadId();
+        let mut diagnostics: Vec<String> = Vec::new();
 
         // Attach to the target thread's input queue to allow SetForegroundWindow
         let mut attached = false;
-        if target_thread != current_thread && target_thread != 0 {
-            attached = windows::Win32::System::Threading::AttachThreadInput(
-                current_thread, target_thread, true,
-            ).as_bool();
+        if target_thread != current_thread {
+            if windows::Win32::System::Threading::AttachThreadInput(
+                current_thread,
+                target_thread,
+                true,
+            )
+            .as_bool()
+            {
+                attached = true;
+            } else {
+                diagnostics.push(format!(
+                    "AttachThreadInput attach failed (current_thread={}, target_thread={})",
+                    current_thread, target_thread
+                ));
+            }
         }
 
-        let result = SetForegroundWindow(hwnd).as_bool();
+        let mut foreground_set = SetForegroundWindow(hwnd).as_bool();
 
         // If SetForegroundWindow failed, try BringWindowToTop as fallback
-        if !result {
-            let _ = BringWindowToTop(hwnd);
+        if !foreground_set {
+            match BringWindowToTop(hwnd) {
+                Ok(()) => {
+                    foreground_set = SetForegroundWindow(hwnd).as_bool();
+                    if !foreground_set {
+                        diagnostics.push(
+                            "SetForegroundWindow returned FALSE after BringWindowToTop fallback"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(e) => diagnostics.push(format!("BringWindowToTop failed: {}", e)),
+            }
         }
 
         // Detach thread input
-        if attached {
-            let _ = windows::Win32::System::Threading::AttachThreadInput(
-                current_thread, target_thread, false,
-            );
+        if attached
+            && !windows::Win32::System::Threading::AttachThreadInput(
+                current_thread,
+                target_thread,
+                false,
+            )
+            .as_bool()
+        {
+            diagnostics.push(format!(
+                "AttachThreadInput detach failed (current_thread={}, target_thread={})",
+                current_thread, target_thread
+            ));
         }
 
-        Ok(result)
+        if foreground_set {
+            if !diagnostics.is_empty() {
+                tracing::warn!(
+                    "Foreground set for window {} with warnings: {}",
+                    window_id,
+                    diagnostics.join("; ")
+                );
+            }
+            return Ok(true);
+        }
+
+        if diagnostics.is_empty() {
+            // No explicit API error, but Windows denied foreground change.
+            return Ok(false);
+        }
+
+        Err(Win32Error::SetPositionFailed(format!(
+            "Failed to set foreground window {}: {}",
+            window_id,
+            diagnostics.join("; ")
+        )))
     }
 }
 
@@ -857,7 +1510,9 @@ pub fn close_window(hwnd: WindowId) -> Result<(), Win32Error> {
             windows::Win32::Foundation::WPARAM(0),
             windows::Win32::Foundation::LPARAM(0),
         )
-        .map_err(|e| Win32Error::SetPositionFailed(format!("PostMessageW(WM_CLOSE) failed: {}", e)))?;
+        .map_err(|e| {
+            Win32Error::SetPositionFailed(format!("PostMessageW(WM_CLOSE) failed: {}", e))
+        })?;
     }
     Ok(())
 }
@@ -866,8 +1521,13 @@ pub fn close_window(hwnd: WindowId) -> Result<(), Win32Error> {
 ///
 /// Returns Ok(true) if the border was set, Ok(false) if the API is unsupported.
 pub fn set_window_border_color(hwnd: WindowId, color: u32) -> Result<bool, Win32Error> {
-    let hwnd = window_id_to_hwnd(hwnd)?;
+    let window_id = hwnd;
+    let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err(Win32Error::WindowNotFound(window_id));
+        }
+
         // DWMWA_BORDER_COLOR = 34
         const DWMWA_BORDER_COLOR: u32 = 34;
         let colorref = color;
@@ -879,7 +1539,20 @@ pub fn set_window_border_color(hwnd: WindowId, color: u32) -> Result<bool, Win32
         );
         match result {
             Ok(()) => Ok(true),
-            Err(_) => Ok(false), // Unsupported on this Windows version
+            Err(e) => {
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    return Err(Win32Error::WindowNotFound(window_id));
+                }
+
+                if is_border_color_unsupported_hresult(e.code()) {
+                    return Ok(false);
+                }
+
+                Err(Win32Error::SetPositionFailed(format!(
+                    "DwmSetWindowAttribute(DWMWA_BORDER_COLOR) failed for {:?}: {}",
+                    hwnd, e
+                )))
+            }
         }
     }
 }
@@ -892,10 +1565,88 @@ pub fn reset_window_border_color(hwnd: WindowId) -> Result<bool, Win32Error> {
     set_window_border_color(hwnd, 0xFFFFFFFF)
 }
 
+fn is_border_color_unsupported_hresult(code: windows::core::HRESULT) -> bool {
+    const E_INVALIDARG_HRESULT: i32 = 0x8007_0057u32 as i32;
+    const E_NOTIMPL_HRESULT: i32 = 0x8000_4001u32 as i32;
+    code.0 == E_INVALIDARG_HRESULT || code.0 == E_NOTIMPL_HRESULT
+}
+
+/// Restore one window from MoveOffScreen sentinel coordinates to the primary monitor.
+///
+/// Returns `Ok(true)` if the window was restored, `Ok(false)` if it was not at
+/// sentinel coordinates, and `Err` if restore operations failed.
+pub fn restore_window_moved_offscreen(window_id: WindowId) -> Result<bool, Win32Error> {
+    let primary = get_primary_monitor()?;
+    restore_window_if_offscreen_to_work_area(window_id, &primary.work_area)
+}
+
+fn restore_windows_moved_offscreen_with_work_area<F>(
+    window_ids: &[WindowId],
+    work_area: &Rect,
+    mut restore_one: F,
+) -> (usize, Vec<String>)
+where
+    F: FnMut(WindowId, &Rect) -> Result<bool, Win32Error>,
+{
+    let mut restored_count: usize = 0;
+    let mut failures: Vec<String> = Vec::new();
+
+    for &window_id in window_ids {
+        match restore_one(window_id, work_area) {
+            Ok(true) => restored_count += 1,
+            Ok(false) => {}
+            Err(e) if is_benign_window_race_error(&e) => {
+                tracing::debug!(
+                    "Ignoring benign race during MoveOffScreen restore for {}: {}",
+                    window_id,
+                    e
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to restore off-screen window {} during shutdown recovery: {}",
+                    window_id,
+                    e
+                );
+                failures.push(format!("window {}: {}", window_id, e));
+            }
+        }
+    }
+
+    (restored_count, failures)
+}
+
+/// Restore all windows currently parked at MoveOffScreen sentinel coordinates.
+///
+/// Returns the number of restored windows. If any window restore fails, this
+/// returns an aggregated error after attempting all windows.
+pub fn restore_windows_moved_offscreen(window_ids: &[WindowId]) -> Result<usize, Win32Error> {
+    if window_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let primary = get_primary_monitor()?;
+    let (restored_count, failures) = restore_windows_moved_offscreen_with_work_area(
+        window_ids,
+        &primary.work_area,
+        restore_window_if_offscreen_to_work_area,
+    );
+
+    if !failures.is_empty() {
+        return Err(combine_operation_failures(
+            "Failed to restore one or more MoveOffScreen windows",
+            failures,
+        ));
+    }
+
+    Ok(restored_count)
+}
+
 /// Uncloak a list of managed windows, best-effort.
 ///
 /// Iterates through the provided window IDs and uncloaks each one.
-/// Logs warnings for failures but never panics. Also resets border colors.
+/// Logs warnings for failures but never panics. Also resets border colors and
+/// restores windows parked at MoveOffScreen sentinel coordinates.
 pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
     for &wid in window_ids {
         if wid == 0 {
@@ -907,18 +1658,91 @@ pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
         // Best-effort border reset
         let _ = reset_window_border_color(wid);
     }
-    tracing::info!("Uncloaked {} managed windows during shutdown", window_ids.len());
+
+    if let Err(e) = restore_windows_moved_offscreen(window_ids) {
+        tracing::warn!(
+            "MoveOffScreen shutdown recovery had one or more failures: {}",
+            e
+        );
+    }
+
+    tracing::info!(
+        "Uncloaked {} managed windows during shutdown",
+        window_ids.len()
+    );
+}
+
+unsafe extern "system" fn collect_all_window_ids_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let window_ids = &mut *(lparam.0 as *mut Vec<WindowId>);
+    let window_id = hwnd.0 as WindowId;
+    if window_id != 0 {
+        window_ids.push(window_id);
+    }
+    TRUE
+}
+
+fn collect_all_top_level_window_ids() -> Vec<WindowId> {
+    let mut window_ids: Vec<WindowId> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_all_window_ids_callback),
+            LPARAM((&mut window_ids as *mut Vec<WindowId>) as isize),
+        );
+    }
+    window_ids
+}
+
+/// Restore any top-level window parked at MoveOffScreen sentinel coordinates.
+///
+/// This helper is panic-safe and best-effort, making it suitable for panic
+/// hooks where daemon state may be unavailable or poisoned.
+pub fn restore_all_windows_moved_offscreen_best_effort() -> usize {
+    let primary = match get_primary_monitor() {
+        Ok(primary) => primary,
+        Err(e) => {
+            eprintln!(
+                "[openniri] Emergency MoveOffScreen restore skipped: no primary monitor ({})",
+                e
+            );
+            return 0;
+        }
+    };
+
+    let window_ids = collect_all_top_level_window_ids();
+    let (restored_count, failures) = restore_windows_moved_offscreen_with_work_area(
+        &window_ids,
+        &primary.work_area,
+        restore_window_if_offscreen_to_work_area,
+    );
+
+    if !failures.is_empty() {
+        eprintln!(
+            "[openniri] Emergency MoveOffScreen restore had {} hard failure(s)",
+            failures.len()
+        );
+    }
+
+    if restored_count > 0 {
+        eprintln!(
+            "[openniri] Emergency MoveOffScreen restore recovered {} window(s)",
+            restored_count
+        );
+    }
+
+    restored_count
 }
 
 /// Uncloak all visible windows on the system, best-effort.
 ///
 /// Uses `EnumWindows` to find all top-level windows and uncloaks them.
+/// Also restores any windows parked at MoveOffScreen sentinel coordinates.
 /// This does not require AppState and works even if state is poisoned,
 /// making it suitable for use in panic hooks.
 pub fn uncloak_all_visible_windows() {
     unsafe {
         let _ = EnumWindows(Some(uncloak_all_callback), LPARAM(0));
     }
+    let _ = restore_all_windows_moved_offscreen_best_effort();
     // eprintln because tracing may not work in a panic hook
     eprintln!("[openniri] Emergency uncloak of all windows complete");
 }
@@ -972,7 +1796,31 @@ pub enum WindowEvent {
 ///
 /// This uses a thread-safe channel because WinEvent callbacks run on Windows'
 /// internal thread pool and we need to forward events to the async runtime.
-static EVENT_SENDER: std::sync::OnceLock<mpsc::Sender<WindowEvent>> = std::sync::OnceLock::new();
+static EVENT_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
+    std::sync::Mutex::new(None);
+
+fn set_event_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
+    let mut guard = EVENT_SENDER
+        .lock()
+        .map_err(|_| Win32Error::HookInstallFailed("Event sender mutex poisoned".to_string()))?;
+    if guard.is_some() {
+        return Err(Win32Error::HookInstallFailed(
+            "Event sender already initialized - drop existing EventHookHandle first".to_string(),
+        ));
+    }
+    *guard = Some(sender);
+    Ok(())
+}
+
+fn clear_event_sender() {
+    let mut guard = EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+    *guard = None;
+}
+
+fn clone_event_sender() -> Option<mpsc::Sender<WindowEvent>> {
+    let guard = EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+    guard.as_ref().cloned()
+}
 
 /// Handle for installed event hooks.
 ///
@@ -990,6 +1838,7 @@ impl Drop for EventHookHandle {
                 }
             }
         }
+        clear_event_sender();
         tracing::debug!("Unhooked {} WinEvent hooks", self.hooks.len());
     }
 }
@@ -1010,19 +1859,17 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
     let (tx, rx) = mpsc::channel();
 
     // Store sender globally for callback access
-    EVENT_SENDER
-        .set(tx)
-        .map_err(|_| Win32Error::HookInstallFailed("Event sender already initialized".to_string()))?;
+    set_event_sender(tx)?;
 
     let mut hooks = Vec::new();
 
     // Define events to hook: (min_event, max_event)
     let event_ranges = [
-        (EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY),      // Create/Destroy
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY), // Create/Destroy
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND), // Foreground
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), // Minimize
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE), // Move/Resize
-        (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS),         // Focus within app
+        (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS),    // Focus within app
     ];
 
     unsafe {
@@ -1030,10 +1877,10 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
             let hook = SetWinEventHook(
                 min_event,
                 max_event,
-                None,                           // No DLL, use callback
-                Some(win_event_callback),       // Our callback
-                0,                              // All processes
-                0,                              // All threads
+                None,                     // No DLL, use callback
+                Some(win_event_callback), // Our callback
+                0,                        // All processes
+                0,                        // All threads
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             );
 
@@ -1042,6 +1889,7 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
                 for h in &hooks {
                     let _ = UnhookWinEvent(*h);
                 }
+                clear_event_sender();
                 return Err(Win32Error::HookInstallFailed(format!(
                     "SetWinEventHook failed for events {}-{}",
                     min_event, max_event
@@ -1070,7 +1918,15 @@ unsafe extern "system" fn win_event_callback(
     dwms_event_time: u32,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        win_event_callback_inner(hook, event, hwnd, id_object, id_child, id_event_thread, dwms_event_time)
+        win_event_callback_inner(
+            hook,
+            event,
+            hwnd,
+            id_object,
+            id_child,
+            id_event_thread,
+            dwms_event_time,
+        )
     }));
 
     if let Err(e) = result {
@@ -1099,38 +1955,30 @@ fn win_event_callback_inner(
         return;
     }
 
-    // Get the top-level window (in case we got a child window event)
-    let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    let hwnd = if root_hwnd.0.is_null() { hwnd } else { root_hwnd };
+    // Normalize to top-level window in case we got a child HWND.
+    let hwnd = normalize_to_root_window(hwnd);
+
+    if should_filter_window_event_by_manageability(event)
+        && !should_emit_window_event_for(event, hwnd)
+    {
+        return;
+    }
 
     let window_id = hwnd.0 as WindowId;
 
     // Map event to our WindowEvent type
     let window_event = match event {
-        EVENT_OBJECT_CREATE => {
-            // Quick filter: skip windows that don't look manageable
-            if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-                return;
-            }
-            WindowEvent::Created(window_id)
-        }
+        EVENT_OBJECT_CREATE => WindowEvent::Created(window_id),
         EVENT_OBJECT_DESTROY => WindowEvent::Destroyed(window_id),
         EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => WindowEvent::Focused(window_id),
         EVENT_SYSTEM_MINIMIZESTART => WindowEvent::Minimized(window_id),
         EVENT_SYSTEM_MINIMIZEEND => WindowEvent::Restored(window_id),
-        EVENT_OBJECT_LOCATIONCHANGE => {
-            // Only track visible windows
-            if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-                return;
-            }
-            WindowEvent::MovedOrResized(window_id)
-        }
+        EVENT_OBJECT_LOCATIONCHANGE => WindowEvent::MovedOrResized(window_id),
         _ => return,
     };
 
     // Send event through channel
-    if let Some(sender) = EVENT_SENDER.get() {
-        // Use try_send to avoid blocking if channel is full
+    if let Some(sender) = clone_event_sender() {
         let _ = sender.send(window_event);
     }
 }
@@ -1154,17 +2002,27 @@ pub struct Modifiers {
 impl Modifiers {
     /// Create modifiers with only the Win key.
     pub fn win() -> Self {
-        Self { win: true, ..Default::default() }
+        Self {
+            win: true,
+            ..Default::default()
+        }
     }
 
     /// Create modifiers with Win + Shift.
     pub fn win_shift() -> Self {
-        Self { win: true, shift: true, ..Default::default() }
+        Self {
+            win: true,
+            shift: true,
+            ..Default::default()
+        }
     }
 
     /// Create modifiers with Alt.
     pub fn alt() -> Self {
-        Self { alt: true, ..Default::default() }
+        Self {
+            alt: true,
+            ..Default::default()
+        }
     }
 
     /// Convert to Win32 HOT_KEY_MODIFIERS flags.
@@ -1224,11 +2082,58 @@ static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>
 /// Custom message to signal the hotkey thread to stop.
 const WM_QUIT_HOTKEY_THREAD: u32 = WM_USER + 1;
 
+fn clear_hotkey_globals() {
+    let mut sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+    *sender = None;
+    drop(sender);
+    let mut sender = DISPLAY_CHANGE_SENDER
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    *sender = None;
+}
+
+fn request_hotkey_thread_shutdown(hwnd: HWND, thread_id: u32) -> bool {
+    let mut shutdown_signal_sent = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            WM_QUIT_HOTKEY_THREAD,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        )
+        .is_ok()
+    };
+
+    if !shutdown_signal_sent {
+        tracing::warn!(
+            "PostMessageW quit signal failed for hotkey window {:?}; attempting thread message fallback",
+            hwnd
+        );
+        shutdown_signal_sent = unsafe {
+            PostThreadMessageW(
+                thread_id,
+                WM_QUIT_HOTKEY_THREAD,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            )
+            .is_ok()
+        };
+        if !shutdown_signal_sent {
+            tracing::warn!(
+                "PostThreadMessageW quit signal failed for hotkey thread {}; proceeding without blocking join",
+                thread_id
+            );
+        }
+    }
+
+    shutdown_signal_sent
+}
+
 /// Handle for the hotkey message window and thread.
 ///
 /// Dropping this handle will unregister all hotkeys and stop the message loop.
 pub struct HotkeyHandle {
     hwnd: HWND,
+    thread_id: u32,
     thread: Option<std::thread::JoinHandle<()>>,
     registered_ids: Vec<HotkeyId>,
 }
@@ -1251,26 +2156,32 @@ impl Drop for HotkeyHandle {
         tracing::debug!("Unregistered {} hotkeys", self.registered_ids.len());
 
         // Signal the message loop to quit
-        unsafe {
-            let _ = PostMessageW(
-                Some(self.hwnd),
-                WM_QUIT_HOTKEY_THREAD,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            );
-        }
+        let shutdown_signal_sent = request_hotkey_thread_shutdown(self.hwnd, self.thread_id);
 
-        // Wait for thread to finish
+        // Join if finished; otherwise detach to avoid hanging shutdown.
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if shutdown_signal_sent {
+                const HOTKEY_THREAD_WAIT_POLLS: usize = 30;
+                const HOTKEY_THREAD_WAIT_MS: u64 = 10;
+                for _ in 0..HOTKEY_THREAD_WAIT_POLLS {
+                    if thread.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(HOTKEY_THREAD_WAIT_MS));
+                }
+            }
+
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                tracing::warn!(
+                    "Hotkey thread did not exit promptly after shutdown signal; detaching to avoid hang"
+                );
+            }
         }
 
         // Clear the global senders to allow re-registration (recover from mutex poisoning)
-        let mut sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
-        drop(sender);
-        let mut sender = DISPLAY_CHANGE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
+        clear_hotkey_globals();
     }
 }
 
@@ -1279,9 +2190,9 @@ impl Drop for HotkeyHandle {
 /// This allows the hotkey window to forward WM_DISPLAYCHANGE messages
 /// to the window event channel. Call this before `register_hotkeys`.
 pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
-    let mut guard = DISPLAY_CHANGE_SENDER
-        .lock()
-        .map_err(|_| Win32Error::HookInstallFailed("Display change sender mutex poisoned".to_string()))?;
+    let mut guard = DISPLAY_CHANGE_SENDER.lock().map_err(|_| {
+        Win32Error::HookInstallFailed("Display change sender mutex poisoned".to_string())
+    })?;
     *guard = Some(sender);
     Ok(())
 }
@@ -1305,9 +2216,9 @@ pub fn register_hotkeys(
 
     // Store sender globally (check that it's not already set)
     {
-        let mut sender = HOTKEY_SENDER
-            .lock()
-            .map_err(|_| Win32Error::HotkeyRegistrationFailed("Hotkey sender mutex poisoned".to_string()))?;
+        let mut sender = HOTKEY_SENDER.lock().map_err(|_| {
+            Win32Error::HotkeyRegistrationFailed("Hotkey sender mutex poisoned".to_string())
+        })?;
         if sender.is_some() {
             return Err(Win32Error::HotkeyRegistrationFailed(
                 "Hotkey sender already initialized - drop existing HotkeyHandle first".to_string(),
@@ -1318,11 +2229,14 @@ pub fn register_hotkeys(
 
     // Create the message window and register hotkeys on a separate thread
     // We send isize (raw pointer value) instead of HWND because HWND is !Send
-    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(isize, Vec<HotkeyId>), Win32Error>>();
+    let (init_tx, init_rx) =
+        std::sync::mpsc::channel::<Result<(isize, u32, Vec<HotkeyId>), Win32Error>>();
     let hotkeys_clone = hotkeys.clone();
 
     let thread = std::thread::spawn(move || {
         unsafe {
+            let thread_id = GetCurrentThreadId();
+
             // Register window class
             let class_name: Vec<u16> = "OpenNiriHotkeyClass\0".encode_utf16().collect();
             let wc = WNDCLASSW {
@@ -1332,14 +2246,18 @@ pub fn register_hotkeys(
             };
             RegisterClassW(&wc);
 
-            // Create message-only window
+            // Create a hidden top-level window.
+            // WM_DISPLAYCHANGE is broadcast to top-level windows, but not to message-only windows.
             let hwnd = CreateWindowExW(
-                Default::default(),
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 windows::core::PCWSTR(class_name.as_ptr()),
                 None,
-                Default::default(),
-                0, 0, 0, 0,
-                Some(HWND_MESSAGE),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
                 None,
                 None,
                 None,
@@ -1378,30 +2296,63 @@ pub fn register_hotkeys(
 
             // Send initialization result (hwnd as isize for Send safety)
             let hwnd_raw = hwnd.0 as isize;
-            let _ = init_tx.send(Ok((hwnd_raw, registered_ids)));
+            let _ = init_tx.send(Ok((hwnd_raw, thread_id, registered_ids)));
 
             // Message loop
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, Some(hwnd), 0, 0).as_bool() {
+            loop {
+                let get_message_result = GetMessageW(&mut msg, None, 0, 0).0;
+                if get_message_result <= 0 {
+                    break;
+                }
                 if msg.message == WM_QUIT_HOTKEY_THREAD {
                     break;
                 }
                 let _ = DispatchMessageW(&msg);
             }
+
+            let _ = DestroyWindow(hwnd);
+            let _ = UnregisterClassW(windows::core::PCWSTR(class_name.as_ptr()), None);
         }
     });
 
     // Wait for initialization
-    let (hwnd_raw, registered_ids) = init_rx
-        .recv()
-        .map_err(|_| Win32Error::HotkeyRegistrationFailed("Thread initialization failed".to_string()))??;
+    let init_result = init_rx.recv().map_err(|_| {
+        clear_hotkey_globals();
+        Win32Error::HotkeyRegistrationFailed("Thread initialization failed".to_string())
+    })?;
+    let (hwnd_raw, thread_id, registered_ids) = match init_result {
+        Ok(v) => v,
+        Err(e) => {
+            clear_hotkey_globals();
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            return Err(e);
+        }
+    };
 
     // Reconstruct HWND from raw pointer
     let hwnd = HWND(hwnd_raw as *mut c_void);
 
-    if registered_ids.is_empty() && !hotkeys.is_empty() {
-        tracing::warn!("No hotkeys were successfully registered");
-    } else {
+    if !hotkeys.is_empty() && registered_ids.len() != hotkeys.len() {
+        tracing::warn!(
+            "Hotkey registration incomplete ({}/{}); aborting and unregistering all to avoid partial shortcut state",
+            registered_ids.len(),
+            hotkeys.len()
+        );
+        let _ = request_hotkey_thread_shutdown(hwnd, thread_id);
+        if thread.is_finished() {
+            let _ = thread.join();
+        }
+        clear_hotkey_globals();
+        return Err(Win32Error::HotkeyRegistrationFailed(format!(
+            "Only {}/{} hotkeys were registered; refusing to run with partial global shortcuts",
+            registered_ids.len(),
+            hotkeys.len()
+        )));
+    }
+    if !hotkeys.is_empty() {
         tracing::info!(
             "Registered {}/{} hotkeys",
             registered_ids.len(),
@@ -1412,6 +2363,7 @@ pub fn register_hotkeys(
     Ok((
         HotkeyHandle {
             hwnd,
+            thread_id,
             thread: Some(thread),
             registered_ids,
         },
@@ -1466,7 +2418,9 @@ fn hotkey_window_proc_inner(
             tracing::info!("Display configuration changed (WM_DISPLAYCHANGE)");
 
             // Send display change event through window event channel (recover from mutex poisoning)
-            let sender_guard = DISPLAY_CHANGE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+            let sender_guard = DISPLAY_CHANGE_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
             if let Some(sender) = sender_guard.as_ref() {
                 let _ = sender.send(WindowEvent::DisplayChange);
             }
@@ -1546,12 +2500,12 @@ pub mod vk {
     pub const ESCAPE: u32 = 0x1B;
 
     // Punctuation (for common shortcuts)
-    pub const MINUS: u32 = 0xBD;      // '-'
-    pub const EQUALS: u32 = 0xBB;     // '='
-    pub const BRACKET_LEFT: u32 = 0xDB;   // '['
-    pub const BRACKET_RIGHT: u32 = 0xDD;  // ']'
-    pub const COMMA: u32 = 0xBC;      // ','
-    pub const PERIOD: u32 = 0xBE;     // '.'
+    pub const MINUS: u32 = 0xBD; // '-'
+    pub const EQUALS: u32 = 0xBB; // '='
+    pub const BRACKET_LEFT: u32 = 0xDB; // '['
+    pub const BRACKET_RIGHT: u32 = 0xDD; // ']'
+    pub const COMMA: u32 = 0xBC; // ','
+    pub const PERIOD: u32 = 0xBE; // '.'
 }
 
 /// Parse a virtual key code from a key name string.
@@ -1671,8 +2625,7 @@ static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
 
 /// Global gesture accumulator state.
 /// Initialized to `None`; `register_gestures()` sets it to `Some(...)`.
-static GESTURE_STATE: std::sync::Mutex<Option<GestureAccumState>> =
-    std::sync::Mutex::new(None);
+static GESTURE_STATE: std::sync::Mutex<Option<GestureAccumState>> = std::sync::Mutex::new(None);
 
 /// Handle for gesture detection.
 ///
@@ -1715,12 +2668,13 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
 
     // Store sender globally
     {
-        let mut sender = GESTURE_SENDER
-            .lock()
-            .map_err(|_| Win32Error::HookInstallFailed("Gesture sender mutex poisoned".to_string()))?;
+        let mut sender = GESTURE_SENDER.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Gesture sender mutex poisoned".to_string())
+        })?;
         if sender.is_some() {
             return Err(Win32Error::HookInstallFailed(
-                "Gesture sender already initialized - drop existing GestureHandle first".to_string(),
+                "Gesture sender already initialized - drop existing GestureHandle first"
+                    .to_string(),
             ));
         }
         *sender = Some(tx);
@@ -1728,9 +2682,9 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
 
     // Initialize accumulator state
     {
-        let mut state = GESTURE_STATE
-            .lock()
-            .map_err(|_| Win32Error::HookInstallFailed("Gesture state mutex poisoned".to_string()))?;
+        let mut state = GESTURE_STATE.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Gesture state mutex poisoned".to_string())
+        })?;
         *state = Some(GestureAccumState {
             accum_x: 0,
             accum_y: 0,
@@ -1740,15 +2694,12 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
 
     // Install low-level mouse hook
     let hook = unsafe {
-        SetWindowsHookExW(
-            WH_MOUSE_LL,
-            Some(gesture_mouse_hook_proc),
-            None,
-            0,
-        )
-        .map_err(|e| Win32Error::HookInstallFailed(format!(
-            "SetWindowsHookExW for gesture hook failed: {}", e
-        )))?
+        SetWindowsHookExW(WH_MOUSE_LL, Some(gesture_mouse_hook_proc), None, 0).map_err(|e| {
+            Win32Error::HookInstallFailed(format!(
+                "SetWindowsHookExW for gesture hook failed: {}",
+                e
+            ))
+        })?
     };
 
     tracing::info!("Gesture detection registered (low-level mouse hook)");
@@ -1852,7 +2803,9 @@ impl Drop for MouseHookHandle {
         tracing::debug!("Mouse hook uninstalled");
 
         // Clear the global sender (recover from mutex poisoning)
-        let mut sender = MOUSE_EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        let mut sender = MOUSE_EVENT_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
         *sender = None;
     }
 }
@@ -1869,12 +2822,13 @@ pub fn install_mouse_hook(
 ) -> Result<MouseHookHandle, Win32Error> {
     // Store sender globally
     {
-        let mut sender = MOUSE_EVENT_SENDER
-            .lock()
-            .map_err(|_| Win32Error::HookInstallFailed("Mouse sender mutex poisoned".to_string()))?;
+        let mut sender = MOUSE_EVENT_SENDER.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Mouse sender mutex poisoned".to_string())
+        })?;
         if sender.is_some() {
             return Err(Win32Error::HookInstallFailed(
-                "Mouse sender already initialized - drop existing MouseHookHandle first".to_string(),
+                "Mouse sender already initialized - drop existing MouseHookHandle first"
+                    .to_string(),
             ));
         }
         *sender = Some(event_sender);
@@ -1882,13 +2836,9 @@ pub fn install_mouse_hook(
 
     // Install low-level mouse hook
     let hook = unsafe {
-        SetWindowsHookExW(
-            WH_MOUSE_LL,
-            Some(mouse_ll_hook_proc),
-            None,
-            0,
-        )
-        .map_err(|e| Win32Error::HookInstallFailed(format!("SetWindowsHookExW failed: {}", e)))?
+        SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_hook_proc), None, 0).map_err(|e| {
+            Win32Error::HookInstallFailed(format!("SetWindowsHookExW failed: {}", e))
+        })?
     };
 
     tracing::info!("Low-level mouse hook installed for focus-follows-mouse");
@@ -1917,20 +2867,34 @@ unsafe extern "system" fn mouse_ll_hook_proc(
         let point = mouse_struct.pt;
 
         // Find the window at the cursor position
-        let hwnd = WindowFromPoint(point);
+        let raw_hwnd = WindowFromPoint(point);
+        let candidate_hwnd = if raw_hwnd.is_invalid() {
+            None
+        } else {
+            let normalized = normalize_to_root_window(raw_hwnd);
+            if normalized.is_invalid() {
+                None
+            } else {
+                Some(normalized)
+            }
+        };
+        let candidate_window_id = candidate_hwnd.map(|hwnd| hwnd.0 as WindowId);
 
-        if !hwnd.is_invalid() {
-            let window_id = hwnd.0 as WindowId;
+        // Check if this is a different top-level window than before (recover from mutex poisoning)
+        let mut current = CURRENT_MOUSE_WINDOW
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        if *current != candidate_window_id {
+            *current = candidate_window_id;
 
-            // Check if this is a different window than before (recover from mutex poisoning)
-            let mut current = CURRENT_MOUSE_WINDOW.lock().unwrap_or_else(recover_poisoned_mutex);
-            if *current != Some(window_id) {
-                *current = Some(window_id);
-
-                // Send MouseEnterWindow event (recover from mutex poisoning)
-                let sender_guard = MOUSE_EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-                if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.send(WindowEvent::MouseEnterWindow(window_id));
+            if let Some(hwnd) = candidate_hwnd {
+                if should_emit_window_event(hwnd) {
+                    let sender_guard = MOUSE_EVENT_SENDER
+                        .lock()
+                        .unwrap_or_else(recover_poisoned_mutex);
+                    if let Some(sender) = sender_guard.as_ref() {
+                        let _ = sender.send(WindowEvent::MouseEnterWindow(hwnd.0 as WindowId));
+                    }
                 }
             }
         }
@@ -1943,6 +2907,137 @@ unsafe extern "system" fn mouse_ll_hook_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static GLOBAL_SENDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_event_sender_can_be_reinstalled_after_clear() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        clear_event_sender();
+
+        let (first_tx, _first_rx) = mpsc::channel::<WindowEvent>();
+        assert!(set_event_sender(first_tx).is_ok());
+
+        let (second_tx, _second_rx) = mpsc::channel::<WindowEvent>();
+        let err = set_event_sender(second_tx).unwrap_err();
+        assert!(matches!(err, Win32Error::HookInstallFailed(_)));
+
+        clear_event_sender();
+
+        let (third_tx, _third_rx) = mpsc::channel::<WindowEvent>();
+        assert!(set_event_sender(third_tx).is_ok());
+        clear_event_sender();
+    }
+
+    #[test]
+    fn test_clear_hotkey_globals_resets_senders() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+
+        let (hotkey_tx, _hotkey_rx) = mpsc::channel::<HotkeyEvent>();
+        let (display_tx, _display_rx) = mpsc::channel::<WindowEvent>();
+
+        {
+            let mut sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+            *sender_guard = Some(hotkey_tx);
+        }
+        {
+            let mut sender_guard = DISPLAY_CHANGE_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            *sender_guard = Some(display_tx);
+        }
+
+        clear_hotkey_globals();
+
+        let hotkey_sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        assert!(hotkey_sender.is_none());
+        drop(hotkey_sender);
+        let display_sender = DISPLAY_CHANGE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        assert!(display_sender.is_none());
+    }
+
+    #[test]
+    fn test_hotkey_window_proc_forwards_hotkey_events() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+
+        let (tx, rx) = mpsc::channel::<HotkeyEvent>();
+        {
+            let mut sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+            *sender_guard = Some(tx);
+        }
+
+        let lresult = hotkey_window_proc_inner(
+            HWND(std::ptr::null_mut()),
+            WM_HOTKEY,
+            windows::Win32::Foundation::WPARAM(77),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+        assert_eq!(lresult.0, 0);
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("hotkey event should be forwarded");
+        assert_eq!(event.id, 77);
+
+        let mut sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
+        *sender_guard = None;
+    }
+
+    #[test]
+    fn test_hotkey_window_proc_forwards_display_change_events() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+
+        let (tx, rx) = mpsc::channel::<WindowEvent>();
+        set_display_change_sender(tx).unwrap();
+
+        let lresult = hotkey_window_proc_inner(
+            HWND(std::ptr::null_mut()),
+            WM_DISPLAYCHANGE,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+        assert_eq!(lresult.0, 0);
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("display change event should be forwarded");
+        assert!(matches!(event, WindowEvent::DisplayChange));
+
+        let mut sender_guard = DISPLAY_CHANGE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        *sender_guard = None;
+    }
+
+    #[test]
+    fn test_hotkey_handle_drop_does_not_block_when_quit_post_fails() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+
+        let sleeping_thread = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+
+        let start = std::time::Instant::now();
+        drop(HotkeyHandle {
+            hwnd: HWND(std::ptr::null_mut()),
+            thread_id: 0,
+            thread: Some(sleeping_thread),
+            registered_ids: Vec::new(),
+        });
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    }
 
     #[test]
     fn test_platform_config_default() {
@@ -1977,7 +3072,10 @@ mod tests {
     fn test_get_primary_monitor() {
         let result = get_primary_monitor();
         if let Ok(primary) = result {
-            assert!(primary.is_primary, "Primary monitor should be marked as primary");
+            assert!(
+                primary.is_primary,
+                "Primary monitor should be marked as primary"
+            );
             assert!(primary.rect.width > 0);
             assert!(primary.work_area.width > 0);
         }
@@ -2192,7 +3290,12 @@ mod tests {
         assert!(flags.contains(MOD_NOREPEAT));
         assert!(!flags.contains(MOD_CONTROL));
 
-        let mods = Modifiers { ctrl: true, alt: true, shift: true, win: false };
+        let mods = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            win: false,
+        };
         let flags = mods.to_win32();
         assert!(flags.contains(MOD_CONTROL));
         assert!(flags.contains(MOD_ALT));
@@ -2218,11 +3321,262 @@ mod tests {
     }
 
     #[test]
+    fn test_is_benign_window_race_error_only_for_nonzero_not_found() {
+        assert!(is_benign_window_race_error(&Win32Error::WindowNotFound(
+            123
+        )));
+        assert!(!is_benign_window_race_error(&Win32Error::WindowNotFound(0)));
+        assert!(!is_benign_window_race_error(
+            &Win32Error::SetPositionFailed("hard failure".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_should_filter_window_event_by_manageability_covers_hooked_events() {
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_OBJECT_CREATE
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_OBJECT_LOCATIONCHANGE
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_SYSTEM_FOREGROUND
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_OBJECT_FOCUS
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_OBJECT_DESTROY
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_SYSTEM_MINIMIZESTART
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_SYSTEM_MINIMIZEEND
+        ));
+    }
+
+    #[test]
+    fn test_should_treat_cloak_query_failure_as_cloaked_only_for_invalid_windows() {
+        assert!(!should_treat_cloak_query_failure_as_cloaked(true));
+        assert!(should_treat_cloak_query_failure_as_cloaked(false));
+    }
+
+    #[test]
+    fn test_is_border_color_unsupported_hresult_mapping() {
+        assert!(is_border_color_unsupported_hresult(windows::core::HRESULT(
+            0x8007_0057u32 as i32
+        )));
+        assert!(is_border_color_unsupported_hresult(windows::core::HRESULT(
+            0x8000_4001u32 as i32
+        )));
+        assert!(!is_border_color_unsupported_hresult(
+            windows::core::HRESULT(0x8000_4005u32 as i32)
+        ));
+    }
+
+    #[test]
+    fn test_collect_uncloak_targets_move_offscreen_includes_offscreen() {
+        let visible = [WindowPlacement {
+            window_id: 1,
+            rect: Rect::new(0, 0, 100, 100),
+            visibility: Visibility::Visible,
+            column_index: 0,
+        }];
+        let offscreen = [
+            WindowPlacement {
+                window_id: 2,
+                rect: Rect::new(100, 0, 100, 100),
+                visibility: Visibility::OffScreenLeft,
+                column_index: 0,
+            },
+            WindowPlacement {
+                window_id: 1,
+                rect: Rect::new(200, 0, 100, 100),
+                visibility: Visibility::OffScreenLeft,
+                column_index: 0,
+            },
+        ];
+        let visible_refs: Vec<_> = visible.iter().collect();
+        let offscreen_refs: Vec<_> = offscreen.iter().collect();
+
+        let cloak_targets =
+            collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::Cloak);
+        assert_eq!(cloak_targets, vec![1]);
+
+        let move_targets =
+            collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::MoveOffScreen);
+        assert_eq!(move_targets, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_offscreen_contains_window_detects_target() {
+        let offscreen = [
+            WindowPlacement {
+                window_id: 10,
+                rect: Rect::new(0, 0, 100, 100),
+                visibility: Visibility::OffScreenLeft,
+                column_index: 0,
+            },
+            WindowPlacement {
+                window_id: 20,
+                rect: Rect::new(100, 0, 100, 100),
+                visibility: Visibility::OffScreenRight,
+                column_index: 0,
+            },
+        ];
+        let offscreen_refs: Vec<_> = offscreen.iter().collect();
+        assert!(offscreen_contains_window(&offscreen_refs, 10));
+        assert!(offscreen_contains_window(&offscreen_refs, 20));
+        assert!(!offscreen_contains_window(&offscreen_refs, 30));
+    }
+
+    #[test]
+    fn test_select_visible_fallback_window_prefers_non_foreground() {
+        let visible = [
+            WindowPlacement {
+                window_id: 1,
+                rect: Rect::new(0, 0, 100, 100),
+                visibility: Visibility::Visible,
+                column_index: 0,
+            },
+            WindowPlacement {
+                window_id: 2,
+                rect: Rect::new(100, 0, 100, 100),
+                visibility: Visibility::Visible,
+                column_index: 0,
+            },
+        ];
+        let visible_refs: Vec<_> = visible.iter().collect();
+        assert_eq!(select_visible_fallback_window(&visible_refs, 1), Some(2));
+        assert_eq!(select_visible_fallback_window(&visible_refs, 2), Some(1));
+    }
+
+    #[test]
+    fn test_select_visible_fallback_window_handles_empty_visible() {
+        let visible: [WindowPlacement; 0] = [];
+        let visible_refs: Vec<_> = visible.iter().collect();
+        assert_eq!(select_visible_fallback_window(&visible_refs, 42), None);
+    }
+
+    #[test]
+    fn test_restore_windows_moved_offscreen_with_work_area_ignores_benign_races() {
+        let window_ids = [10, 20, 30];
+        let work_area = Rect::new(0, 0, 1920, 1080);
+        let mut seen: Vec<WindowId> = Vec::new();
+        let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
+            &window_ids,
+            &work_area,
+            |window_id, _| {
+                seen.push(window_id);
+                match window_id {
+                    10 => Ok(true),
+                    20 => Err(Win32Error::WindowNotFound(20)),
+                    30 => Ok(false),
+                    _ => unreachable!(),
+                }
+            },
+        );
+
+        assert_eq!(seen, window_ids);
+        assert_eq!(restored, 1);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn test_restore_windows_moved_offscreen_with_work_area_reports_hard_failures() {
+        let window_ids = [7, 8];
+        let work_area = Rect::new(0, 0, 1920, 1080);
+        let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
+            &window_ids,
+            &work_area,
+            |window_id, _| match window_id {
+                7 => Ok(true),
+                8 => Err(Win32Error::SetPositionFailed("boom".to_string())),
+                _ => unreachable!(),
+            },
+        );
+
+        assert_eq!(restored, 1);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("window 8"));
+        assert!(failures[0].contains("boom"));
+    }
+
+    #[test]
     fn test_apply_placements_empty() {
         // Verify empty placements succeed without error
         let config = PlatformConfig::default();
         let result = apply_placements(&[], &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_apply_placements_reports_move_offscreen_errors() {
+        let config = PlatformConfig {
+            hide_strategy: HideStrategy::MoveOffScreen,
+            use_deferred_positioning: false,
+        };
+        let placements = vec![WindowPlacement {
+            window_id: 0,
+            rect: Rect::new(0, 0, 800, 600),
+            visibility: Visibility::OffScreenLeft,
+            column_index: 0,
+        }];
+
+        let result = apply_placements(&placements, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_move_offscreen_sentinel_detection() {
+        assert!(is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_SENTINEL_COORD
+        ));
+        assert!(is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD - 1,
+            MOVE_OFFSCREEN_SENTINEL_COORD - 500
+        ));
+        assert!(!is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD + 1,
+            MOVE_OFFSCREEN_SENTINEL_COORD
+        ));
+        assert!(!is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_SENTINEL_COORD + 1
+        ));
+    }
+
+    #[test]
+    fn test_move_offscreen_sentinel_does_not_match_minimized_coordinates() {
+        // Windows commonly reports minimized windows around (-32000, -32000).
+        assert!(!is_move_offscreen_sentinel_position(-32_000, -32_000));
+    }
+
+    #[test]
+    fn test_move_offscreen_restore_rect_clamps_size() {
+        let offscreen = Rect::new(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            5000,
+            0,
+        );
+        let work_area = Rect::new(100, 200, 1920, 1080);
+        let restored = compute_restore_rect_from_offscreen(&offscreen, &work_area);
+
+        assert_eq!(restored.x, 100);
+        assert_eq!(restored.y, 200);
+        assert_eq!(restored.width, 1920);
+        assert_eq!(restored.height, 1);
+        assert!(is_move_offscreen_sentinel_rect(&offscreen));
+        assert!(!is_move_offscreen_sentinel_rect(&restored));
+    }
+
+    #[test]
+    fn test_restore_windows_moved_offscreen_empty_list() {
+        let result = restore_windows_moved_offscreen(&[]);
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
@@ -2251,6 +3605,16 @@ mod tests {
     }
 
     #[test]
+    fn test_set_foreground_window_invalid_hwnd_fails() {
+        let result = set_foreground_window(u64::MAX);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            Win32Error::WindowNotFound(u64::MAX)
+        ));
+    }
+
+    #[test]
     fn test_close_window_zero_fails() {
         let result = close_window(0);
         assert!(result.is_err());
@@ -2265,6 +3629,16 @@ mod tests {
     }
 
     #[test]
+    fn test_set_window_border_color_invalid_hwnd_fails() {
+        let result = set_window_border_color(u64::MAX, 0x4285F4);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            Win32Error::WindowNotFound(u64::MAX)
+        ));
+    }
+
+    #[test]
     fn test_reset_window_border_color_zero_fails() {
         let result = reset_window_border_color(0);
         assert!(result.is_err());
@@ -2274,7 +3648,10 @@ mod tests {
     #[test]
     fn test_skip_classes_does_not_contain_application_frame_window() {
         let skip = should_skip_window_by_class("ApplicationFrameWindow");
-        assert!(!skip, "ApplicationFrameWindow should NOT be in skip list (UWP apps should be tiled)");
+        assert!(
+            !skip,
+            "ApplicationFrameWindow should NOT be in skip list (UWP apps should be tiled)"
+        );
     }
 
     #[test]
