@@ -5,13 +5,26 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: build (${{ matrix.os }} / ${{ matrix.tier }})
+    if: matrix.tier == 'full' || !startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            tier: full
+          - os: windows-2022
+            tier: smoke
 
     steps:
       - name: Checkout
@@ -29,21 +42,33 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.tier }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.tier }}-
             ${{ runner.os }}-cargo-
 
-      - name: Build
-        run: cargo build --all --verbose
+      - name: Build all targets (debug)
+        if: matrix.tier == 'full'
+        run: cargo build --workspace --all-targets --verbose --locked
 
-      - name: Run tests
-        run: cargo test --all --verbose
+      - name: Run tests (all targets, debug)
+        if: matrix.tier == 'full'
+        run: cargo test --workspace --all-targets --verbose --locked
+
+      - name: Compile smoke check (all targets, debug)
+        if: matrix.tier == 'smoke'
+        run: cargo check --workspace --all-targets --verbose --locked
+
+      - name: Release-profile smoke check (all targets)
+        run: cargo check --workspace --all-targets --release --verbose --locked
 
       - name: Check formatting
+        if: matrix.tier == 'full'
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --all -- -D warnings
+      - name: Run clippy (all targets)
+        if: matrix.tier == 'full'
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   release:
     needs: build

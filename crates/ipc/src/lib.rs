@@ -3,12 +3,91 @@
 //! Shared types for daemon-CLI communication over Windows named pipes.
 
 use serde::{Deserialize, Serialize};
+use std::env;
 
-/// Named pipe path for IPC communication.
+/// Legacy named pipe path for IPC communication.
+///
+/// Keep this stable for backward compatibility with older binaries.
 pub const PIPE_NAME: &str = r"\\.\pipe\openniri";
+
+/// Maximum length used for the user segment in user-scoped pipe names.
+pub const PIPE_USER_SEGMENT_MAX_LEN: usize = 48;
+
+/// Fallback user segment used when no local user identity can be derived.
+pub const PIPE_USER_SEGMENT_FALLBACK: &str = "default";
 
 /// Maximum IPC message size (64 KiB). Messages larger than this are rejected.
 pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024;
+
+/// Current protocol version emitted by this crate.
+pub const IPC_PROTOCOL_VERSION: u16 = 1;
+
+/// Oldest protocol version accepted by this crate.
+pub const IPC_MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 1;
+
+/// Stable protocol family identifier for compatibility logging/handshakes.
+pub const IPC_PROTOCOL_FAMILY: &str = "openniri-json-ipc";
+
+/// Build a user-scoped named pipe from an arbitrary user identifier.
+pub fn scoped_pipe_name_for_user(user: &str) -> String {
+    format!(r"{}-{}", PIPE_NAME, sanitize_pipe_segment(user))
+}
+
+/// Build the preferred user-scoped pipe name for the current process user.
+pub fn preferred_pipe_name() -> String {
+    scoped_pipe_name_for_user(&local_user_name())
+}
+
+/// Return pipe names in preferred connection order.
+///
+/// Order is: user-scoped first, legacy second for backward compatibility.
+pub fn pipe_name_candidates_for_user(user: &str) -> Vec<String> {
+    vec![scoped_pipe_name_for_user(user), PIPE_NAME.to_string()]
+}
+
+/// Return pipe names in preferred connection order for the current user.
+pub fn pipe_name_candidates() -> Vec<String> {
+    pipe_name_candidates_for_user(&local_user_name())
+}
+
+/// Human-readable protocol identifier (`<family>-v<version>`).
+pub fn protocol_id() -> String {
+    format!("{IPC_PROTOCOL_FAMILY}-v{IPC_PROTOCOL_VERSION}")
+}
+
+/// Whether a peer protocol version is compatible with this crate.
+pub fn is_protocol_version_compatible(peer_version: u16) -> bool {
+    (IPC_MIN_SUPPORTED_PROTOCOL_VERSION..=IPC_PROTOCOL_VERSION).contains(&peer_version)
+}
+
+fn local_user_name() -> String {
+    env::var("USERNAME")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_default()
+}
+
+fn sanitize_pipe_segment(raw: &str) -> String {
+    let mut output = String::with_capacity(PIPE_USER_SEGMENT_MAX_LEN);
+
+    for ch in raw.chars() {
+        if output.len() >= PIPE_USER_SEGMENT_MAX_LEN {
+            break;
+        }
+
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+
+    if output.is_empty() {
+        output.push_str(PIPE_USER_SEGMENT_FALLBACK);
+    }
+
+    output
+}
 
 /// Rectangle for IPC serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,7 +100,12 @@ pub struct IpcRect {
 
 impl IpcRect {
     pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -341,9 +425,7 @@ mod tests {
                     is_focused: true,
                 }],
             },
-            IpcResponse::WindowList {
-                windows: vec![],
-            },
+            IpcResponse::WindowList { windows: vec![] },
             IpcResponse::FocusedWindowInfo {
                 window: Some(WindowInfo {
                     window_id: 42,
@@ -359,9 +441,7 @@ mod tests {
                     is_focused: true,
                 }),
             },
-            IpcResponse::FocusedWindowInfo {
-                window: None,
-            },
+            IpcResponse::FocusedWindowInfo { window: None },
             IpcResponse::StatusInfo {
                 version: "0.1.0".to_string(),
                 monitors: 2,
@@ -473,9 +553,72 @@ mod tests {
 
     #[test]
     fn test_pipe_name_format() {
-        // Verify pipe name follows Windows named pipe convention
+        // Legacy pipe name must remain stable for backward compatibility.
         assert!(PIPE_NAME.starts_with(r"\\.\pipe\"));
         assert_eq!(PIPE_NAME, r"\\.\pipe\openniri");
+    }
+
+    #[test]
+    fn test_scoped_pipe_name_for_user() {
+        assert_eq!(
+            scoped_pipe_name_for_user("Alice"),
+            r"\\.\pipe\openniri-alice"
+        );
+        assert_eq!(
+            scoped_pipe_name_for_user("Domain\\User Name"),
+            r"\\.\pipe\openniri-domain_user_name"
+        );
+    }
+
+    #[test]
+    fn test_scoped_pipe_name_fallback_for_empty_user() {
+        assert_eq!(scoped_pipe_name_for_user(""), r"\\.\pipe\openniri-default");
+    }
+
+    #[test]
+    fn test_scoped_pipe_name_segment_length_cap() {
+        let long_name = "a".repeat(PIPE_USER_SEGMENT_MAX_LEN + 16);
+        let scoped = scoped_pipe_name_for_user(&long_name);
+        let suffix = scoped
+            .strip_prefix(r"\\.\pipe\openniri-")
+            .expect("expected scoped pipe prefix");
+        assert_eq!(suffix.len(), PIPE_USER_SEGMENT_MAX_LEN);
+    }
+
+    #[test]
+    fn test_pipe_name_candidates_include_legacy_fallback() {
+        let candidates = pipe_name_candidates_for_user("Alice");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], r"\\.\pipe\openniri-alice");
+        assert_eq!(candidates[1], PIPE_NAME);
+    }
+
+    #[test]
+    fn test_preferred_pipe_name_and_candidates_shape() {
+        let preferred = preferred_pipe_name();
+        assert!(preferred.starts_with(r"\\.\pipe\openniri-"));
+
+        let candidates = pipe_name_candidates();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].starts_with(r"\\.\pipe\openniri-"));
+        assert_eq!(candidates[1], PIPE_NAME);
+    }
+
+    #[test]
+    fn test_protocol_signaling_constants() {
+        assert_eq!(IPC_PROTOCOL_VERSION, 1);
+        assert_eq!(IPC_MIN_SUPPORTED_PROTOCOL_VERSION, 1);
+        assert_eq!(IPC_PROTOCOL_FAMILY, "openniri-json-ipc");
+        assert_eq!(protocol_id(), "openniri-json-ipc-v1");
+    }
+
+    #[test]
+    fn test_protocol_version_compatibility() {
+        assert!(is_protocol_version_compatible(IPC_PROTOCOL_VERSION));
+        assert!(is_protocol_version_compatible(
+            IPC_MIN_SUPPORTED_PROTOCOL_VERSION
+        ));
+        assert!(!is_protocol_version_compatible(IPC_PROTOCOL_VERSION + 1));
     }
 
     #[test]
