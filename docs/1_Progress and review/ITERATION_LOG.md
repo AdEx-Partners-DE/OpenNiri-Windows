@@ -2,7 +2,7 @@
 
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
-> **Last Updated**: 2026-02-09 (Iteration 65 — Strict Automation QA Gate Rerun + Double QA Loop)
+> **Last Updated**: 2026-02-13 (Iteration 67 — Host Pre-UAT Failure Evidence Capture + Tracker Sync)
 
 ---
 
@@ -112,10 +112,111 @@ OpenNiri-Windows/
 | 63 | 2026-02-09 | Strict automation QA gate + double QA loop | 540 | 542 | Closed high CI tag-trigger bypass (`tags: ['**']`), completed two consecutive post-fix review waves with zero new Critical/High findings, executed full QA suite twice, and refreshed all incident trackers/evidence |
 | 64 | 2026-02-09 | Strict automation QA gate rerun + double QA loop | 542 | 542 | Re-ran full strict gate from current state, found zero new Critical/High findings in both loops, passed full QA suite twice, and refreshed required tracking artifacts |
 | 65 | 2026-02-09 | Strict automation QA gate rerun + double QA loop | 542 | 542 | Re-ran strict gate with independent parallel review lanes and benchmark sanity check, found zero new Critical/High findings in both loops, passed full QA suite twice, and refreshed required tracking artifacts |
+| 66 | 2026-02-09 | Strict automation QA gate rerun + double QA loop | 542 | 542 | Re-ran strict gate with parallel sub-agent reviewers plus pre-UAT checklist audit, found zero new code-level Critical/High findings in both loops, passed full QA suite twice, and confirmed release remains blocked on host-manual closure evidence |
+| 67 | 2026-02-13 | Host pre-UAT failure evidence capture + tracker sync | 542 | 542 | Logged failed host pre-UAT run/recovery evidence (daemon confirmed stopped, Explorer reset attempted, in-session terminal focus still impaired), updated incident/tracker docs, and kept release gate blocked |
 
 ---
 
 ## Detailed Iteration Logs
+
+### Iteration 67: Host Pre-UAT Failure Evidence Capture + Tracker Sync
+
+**Date**: 2026-02-13  
+**Status**: COMPLETED (documentation/tracker sync only), host incident remains open and release-blocking  
+**Previous Context**: Iteration 66 (strict automation QA gate rerun + double QA loop)
+
+#### 67.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Capture and preserve exact host pre-UAT failure/recovery evidence from field run | Critical | DONE |
+| 2 | Synchronize incident/tracker artifacts with latest host evidence | High | DONE |
+| 3 | Keep release gate state explicit (blocked until host closure evidence passes) | Critical | DONE |
+
+#### 67.2 Changes Made
+
+- Incident evidence update added:
+  - `docs/1_Progress and review/INCIDENT_2026-02-07_DESKTOP_LOCKOUT.md`
+  - Captured 2026-02-13 host run details: scenario flow led to non-focusable terminals; recovery outputs for `emergency-uncloak`, `stop`, `status`; Explorer reset attempted; in-session usability still impaired.
+- Tracker synchronization:
+  - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` advanced to Review 38 with host evidence update.
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json` updated `last_updated`, `review_id`, and evidence/status for `INC-49-1`, `INC-49-4`, `INC-49-T1`.
+  - `docs/1_Progress and review/OPEN_ITEMS.md` updated with Iteration 67 host-run failure note.
+- Pre-UAT tooling docs/script remained in-progress and unclosed:
+  - `tools/inc49/run-preuat-evidence.ps1`
+  - `docs/1_Progress and review/INC49_PRE_UAT_ONE_SHOT_CHECKLIST.md`
+
+#### 67.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| Script parse check | PowerShell parser on `tools/inc49/run-preuat-evidence.ps1` | PASSED |
+| Runtime QA suite | Not re-run in Iteration 67 | NOT RUN (documentation/tracker update iteration) |
+
+#### 67.4 Impact Statement
+
+- Code-level strict automation gate result from Iteration 66 remains unchanged (no new Critical/High code findings introduced in Iteration 67).
+- Host closure evidence remains failed/incomplete:
+  - `INC-49-1`: still in progress
+  - `INC-49-4`: still in progress
+  - `INC-49-T1`: moved to in-progress with failed host evidence captured
+- Release/tag/publish remains blocked pending successful post-reboot host rerun evidence.
+
+### Iteration 66: Strict Automation QA Gate Rerun + Double QA Loop
+
+**Date**: 2026-02-09  
+**Status**: COMPLETED (code-level Critical/High gate passed), host incident-closure evidence still pending  
+**Previous Context**: Iteration 65 (strict automation QA gate rerun + double QA loop)
+
+#### 66.1 Objectives
+
+| # | Objective | Priority | Status |
+|---|-----------|----------|--------|
+| 1 | Re-run strict automation gate from current tree state with parallel review lanes before host-manual testing | Critical | DONE |
+| 2 | Confirm two consecutive zero-new-Critical/High loops with full QA suites | Critical | DONE |
+| 3 | Execute pre-live/pre-UAT checklist audit and isolate host-manual blockers | High | DONE |
+
+#### 66.2 Changes Made
+
+- No runtime/code changes were required in this rerun (zero new code-level Critical/High findings).
+- Parallel review execution:
+  - Spawned four explorer reviewers for runtime safety, IPC/CLI robustness, Win32 focus/recovery, and pre-UAT checklist/tracker consistency.
+  - Runtime, IPC/CLI, and Win32 reviewers reported no new code-level Critical/High findings.
+  - Checklist reviewer confirmed release remains blocked by pending host evidence tasks (`INC-49-1`, `INC-49-4`, `INC-49-T1`).
+- Pre-UAT checklist audit completed against:
+  - `docs/1_Progress and review/CLAUDE_FINALIZATION_CHECKLIST.md`
+  - `docs/PUBLIC_READINESS_CHECKLIST.md`
+  - `docs/TESTING_GUIDE.md` (sections 15-18 host recovery scenarios)
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`
+- Tracker synchronization:
+  - `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` — advanced to Review 37 with loop-level zero-finding evidence.
+  - `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json` — advanced review id/evidence strings to Iteration 66 loop evidence.
+  - `docs/1_Progress and review/OPEN_ITEMS.md` — updated iteration/evidence references to Iteration 66.
+
+#### 66.3 Test Results
+
+| Item | Command | Result |
+|------|---------|--------|
+| QA Loop 1: Formatting | `cargo fmt --all -- --check` | PASSED |
+| QA Loop 1: Clippy (strict) | `cargo clippy --all -- -D warnings` | PASSED |
+| QA Loop 1: Clippy (all-targets/all-features) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASSED |
+| QA Loop 1: Workspace tests | `cargo test --all --verbose` | PASSED: 546 test-binary total (542 passed, 4 ignored) + doc-test compile checks |
+| QA Loop 1: Ignored tests | `cargo test --workspace -- --ignored` | PASSED: 4 ignored tests executed |
+| QA Loop 1: Release build | `cargo build --release --all` | PASSED |
+| QA Loop 1: Audit | `cargo audit` | PASSED with 9 allowed warnings (GTK3/glib/proc-macro chain via `tray-icon`) |
+| QA Loop 1: Target scope check | `cargo tree --target x86_64-pc-windows-gnu -i gtk` + `-i glib` | PASSED (`nothing to print`, not in Windows target tree) |
+| QA Loop 2: Full gate rerun | `cargo fmt --all -- --check && cargo clippy --all -- -D warnings && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --all --verbose && cargo test --workspace -- --ignored && cargo build --release --all` | PASSED |
+
+#### 66.4 Impact Statement
+
+- Strict automation gate rerun criteria are satisfied again from current repo state:
+  - two consecutive loops with zero new code-level Critical/High findings;
+  - full required QA suite passed in both loops.
+- Pre-live/pre-UAT blocker status is unchanged and non-code:
+  - `INC-49-1` host reproduction/recovery closure evidence pending.
+  - `INC-49-4` host acceptance run evidence pending.
+  - `INC-49-T1` manual host focus-recovery test evidence pending.
+- Release remains blocked until host-manual evidence is captured and linked in incident/tracker docs.
 
 ### Iteration 65: Strict Automation QA Gate Rerun + Double QA Loop
 

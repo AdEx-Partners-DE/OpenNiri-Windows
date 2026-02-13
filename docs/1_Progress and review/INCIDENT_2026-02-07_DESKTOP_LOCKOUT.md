@@ -93,6 +93,25 @@ An attempted shell-level recovery sequence later included an Explorer restart, w
 2. Recovery key sequence (`Win+Ctrl+Shift+B`, `Alt+Esc`, `Win+Tab`) produced UI response but did not restore sustainable terminal control in-session.
 3. Report confirms that host-level closure evidence is still outstanding; incident remains open and release-blocking.
 
+## Additional Field Evidence Update (2026-02-13, Host Pre-UAT Script Run)
+
+1. Host run of `pwsh -NoProfile -File tools/inc49/run-preuat-evidence.ps1` progressed through initial prompts, then entered a window-management state where multiple terminal windows became inaccessible (visible as thumbnails but not focusable in practice).
+2. Recovery evidence captured from administrator shell:
+   - `openniri-cli emergency-uncloak` returned:
+     - `[openniri] Emergency uncloak of all windows complete`
+     - `Executed local emergency visibility restore (best-effort).`
+     - `Recovery trigger: explicit emergency-uncloak request`
+   - `openniri-cli stop` returned:
+     - `[openniri] Emergency uncloak of all windows complete`
+     - `Executed local emergency visibility restore (best-effort).`
+     - `Recovery trigger: stop requested while daemon not running`
+     - `Daemon not running.`
+   - `openniri-cli status` returned:
+     - `Error: Daemon is not running. Start it with \`openniri-cli run\`.`
+3. Explorer shell reset was attempted (`Stop-Process -Name explorer -Force` + `Start-Process explorer.exe`), but practical access to previously affected terminals remained unresolved in-session.
+4. Current operator plan is to wait for unrelated running processes to finish, then reboot host as final Windows-shell recovery step.
+5. Incident status remains **Open** and **release-blocking**. Host closure evidence for `INC-49-1`, `INC-49-4`, and `INC-49-T1` is still pending.
+
 ## Additional Mitigations Landed (2026-02-08, Iteration 59)
 
 1. Daemon pause/resume toggle now rolls back to paused state if resume-time layout apply fails, preventing false "resumed" status after failed re-apply.

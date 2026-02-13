@@ -1,6 +1,6 @@
 {
   "plan_id": "codex_fix_plan_review_32_incident_49",
-  "last_updated": "2026-02-09",
+  "last_updated": "2026-02-13",
   "status": "in_progress",
   "owner": {
     "implementation": "Claude",
@@ -8,7 +8,7 @@
   },
   "source_review": {
     "file": "docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md",
-    "review_id": 36
+    "review_id": 38
   },
   "scope": {
     "in_scope": [
@@ -62,7 +62,7 @@
         "docs/1_Progress and review/INCIDENT_2026-02-07_DESKTOP_LOCKOUT.md"
       ],
       "status": "in_progress",
-      "evidence": "Root-cause hardening remains in place through Iteration 65 strict-gate rerun (two consecutive loops, zero new Critical/High findings, full QA suite passed twice). Host-side reproduction/closure run is still pending."
+      "evidence": "Host pre-UAT run (2026-02-13) reproduced focus/access failure during scenario flow: terminals became non-focusable in-session. Recovery commands captured (`emergency-uncloak`, `stop`, `status`) with daemon confirmed not running; Explorer reset attempted; practical recovery still pending reboot."
     },
     {
       "id": "INC-49-2",
@@ -94,7 +94,7 @@
         "docs/TESTING_GUIDE.md"
       ],
       "status": "in_progress",
-      "evidence": "Added explicit host lockout + long-running-file-operation acceptance scenarios and pass/fail criteria; execution evidence pending"
+      "evidence": "Host acceptance execution attempted on 2026-02-13 via `tools/inc49/run-preuat-evidence.ps1`; run did not reach closure due in-session terminal focus/access lockout. Recovery evidence logged in incident report; acceptance remains open."
     },
     {
       "id": "INC-49-5",
@@ -133,7 +133,8 @@
       "targets": [
         "docs/TESTING_GUIDE.md"
       ],
-      "status": "open"
+      "status": "in_progress",
+      "evidence": "2026-02-13 host run result: FAIL (user could not practically refocus existing terminal windows after scenario flow). Emergency-uncloak/stop/status and Explorer reset evidence captured; closure pending post-reboot rerun."
     },
     {
       "id": "INC-49-T2",
@@ -151,37 +152,37 @@
       "id": "V1",
       "command": "cargo test --all --verbose",
       "status": "done",
-      "evidence": "546 test-binary total: 542 passed, 4 ignored (+doc-test compile checks) in both Iteration 65 QA loops"
+      "evidence": "546 test-binary total: 542 passed, 4 ignored (+doc-test compile checks) in both Iteration 66 QA loops"
     },
     {
       "id": "V2",
       "command": "cargo test --workspace -- --ignored",
       "status": "done",
-      "evidence": "4 ignored tests executed successfully in both Iteration 65 QA loops"
+      "evidence": "4 ignored tests executed successfully in both Iteration 66 QA loops"
     },
     {
       "id": "V3",
       "command": "cargo clippy --all -- -D warnings",
       "status": "done",
-      "evidence": "Passed in both Iteration 65 QA loops"
+      "evidence": "Passed in both Iteration 66 QA loops"
     },
     {
       "id": "V4",
       "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
       "status": "done",
-      "evidence": "Passed in both Iteration 65 QA loops (--all-targets --all-features)"
+      "evidence": "Passed in both Iteration 66 QA loops (--all-targets --all-features)"
     },
     {
       "id": "V5",
       "command": "cargo fmt --all -- --check",
       "status": "done",
-      "evidence": "Passed in both Iteration 65 QA loops"
+      "evidence": "Passed in both Iteration 66 QA loops"
     },
     {
       "id": "V6",
       "command": "cargo build --release --all",
       "status": "done",
-      "evidence": "Passed in both Iteration 65 QA loops"
+      "evidence": "Passed in both Iteration 66 QA loops"
     }
   ],
   "lifecycle_rules": {
