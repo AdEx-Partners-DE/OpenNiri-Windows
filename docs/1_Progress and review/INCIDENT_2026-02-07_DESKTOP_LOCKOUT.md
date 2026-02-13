@@ -112,6 +112,42 @@ An attempted shell-level recovery sequence later included an Explorer restart, w
 4. Current operator plan is to wait for unrelated running processes to finish, then reboot host as final Windows-shell recovery step.
 5. Incident status remains **Open** and **release-blocking**. Host closure evidence for `INC-49-1`, `INC-49-4`, and `INC-49-T1` is still pending.
 
+## Technical Root-Cause Signals (2026-02-13 Log Correlation)
+
+Evidence gathered from local OpenNiri artifacts and Windows event logs indicates a partial-apply/partial-recovery failure mode with concurrent shell/graphics instability:
+
+1. Scenario flow reached and executed (not an early script abort):
+   - `docs/1_Progress and review/evidence/inc49/20260213-114332/commands/10-s16-run.*`
+   - `docs/1_Progress and review/evidence/inc49/20260213-114332/commands/11-s16-apply.*`
+   - `docs/1_Progress and review/evidence/inc49/20260213-114332/commands/12-s16-panic-revert.*`
+   - `docs/1_Progress and review/evidence/inc49/20260213-114332/commands/13-s16-status-after-panic.*`
+2. `apply` returned non-success with high-volume Win32 side-effect failures:
+   - `11-s16-apply.stderr.log` shows `apply_placements completed with side-effect failures` and repeated:
+     - `DwmSetWindowAttribute(CLOAK=0/1) failed`
+     - `SetWindowPos ... Access is denied (0x80070005)`
+3. Safe-mode rerun still reproduced the same class of failures:
+   - `14-s16-safe-run.stderr.log` repeats large batches of `DwmSetWindowAttribute` failures and off-screen move access-denied errors.
+4. Daemon lifecycle behaved as expected (process-level recovery did occur):
+   - `12-s16-panic-revert.stdout.log` => `OK`
+   - `13-s16-status-after-panic.stderr.log` => daemon not running
+   - `15-s16-safe-stop.stdout.log` => `OK`
+   - `16-s16-safe-status-after-stop.stderr.log` => daemon not running
+5. Daemon runtime log confirms same failure pattern at timestamp level:
+   - `C:\Users\stark\AppData\Local\Temp\openniri-daemon.log`
+   - At `2026-02-13T10:44:04Z`: many `Failed to uncloak window ... DwmSetWindowAttribute(CLOAK=0) failed`
+   - At `2026-02-13T10:44:04Z`: multiple `Failed to move off-screen window ... Access is denied. (0x80070005)`
+   - At shutdown (`~10:44:08Z`): repeated uncloak failures persisted.
+6. Windows Error Reporting correlation shows shell/graphics distress in the same window:
+   - Application log, provider `Windows Error Reporting`, event `1001`:
+     - `Event Name: WindowsBlackScreenDiagnosticsV1`
+     - Signatures include `P1: DWM`, `P4: Hotkey`; `P4: Hotkey_Explorer`; and `P1: RDP`
+   - Observed around `2026-02-13 11:59` and `2026-02-13 12:12` during/after recovery attempts.
+
+Interpretation:
+1. This was not a simple daemon crash. The daemon hit broad Win32 operation failures, attempted emergency restore, then exited cleanly.
+2. The remaining user-visible lockout aligns with an in-session Windows shell/graphics state problem after partial window operation failures.
+3. Incident remains open until post-reboot rerun produces successful host-closure evidence (`INC-49-1`, `INC-49-4`, `INC-49-T1`).
+
 ## Additional Mitigations Landed (2026-02-08, Iteration 59)
 
 1. Daemon pause/resume toggle now rolls back to paused state if resume-time layout apply fails, preventing false "resumed" status after failed re-apply.
