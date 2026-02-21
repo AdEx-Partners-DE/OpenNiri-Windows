@@ -1,5 +1,5 @@
 # Codex Fix Plan Snapshot (Non-Canonical)
-Date: 2026-02-07
+Date: 2026-02-13
 Owner: Claude (implementation), Codex (review)
 Status: Active - implementation complete; host closure evidence pending
 
@@ -22,12 +22,12 @@ Status: Active - implementation complete; host closure evidence pending
 - [x] `INC-49-3`
 - [x] `INC-49-5`
 - [x] `INC-49-T2`
-- [x] `V1` `cargo test --all --verbose` - 540 test-binary total, 536 passed, 4 ignored (+1 doc-test compile check)
+- [x] `V1` `cargo test --all --verbose` - 546 test-binary total, 542 passed, 4 ignored (+doc-test compile checks)
 - [x] `V2` `cargo test --workspace -- --ignored`
-- [x] `V3` `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `V3` `cargo clippy --all -- -D warnings`
 - [x] `V4` `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [x] `V5` `cargo fmt --all -- --check`
-- [x] `V6` `cargo build --release`
+- [x] `V6` `cargo build --release --all`
 
 ### Still Open / In Progress
 - [ ] `INC-49-1` Host-level reproduction/recovery evidence capture for desktop lockout/focus-trap case
