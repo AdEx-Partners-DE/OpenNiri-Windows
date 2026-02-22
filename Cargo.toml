@@ -50,7 +50,7 @@ anyhow = "1"
 
 # Configuration
 toml = "1.0"
-directories = "5"
+directories = "6"
 
 [profile.release]
 lto = true
