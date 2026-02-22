@@ -111,7 +111,7 @@ jobs:
           Write-Host "Tag commit matches origin/main HEAD."
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -249,7 +249,7 @@ jobs:
           Write-Host "Tag commit matches origin/main HEAD."
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
