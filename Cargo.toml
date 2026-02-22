@@ -49,7 +49,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Configuration
-toml = "0.8"
+toml = "1.0"
 directories = "5"
 
 [profile.release]
