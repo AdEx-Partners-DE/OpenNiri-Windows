@@ -15,7 +15,8 @@ use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
 use std::sync::mpsc;
 use thiserror::Error;
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED,
 };
