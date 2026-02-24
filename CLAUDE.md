@@ -1,29 +1,5 @@
-# CLAUDE.md
+# CLAUDE.md (Minimal)
 
-This file is a thin wrapper. The canonical instructions for this repo are in `AGENTS.md`.
+Use `AGENTS.md` as the canonical context for this repo. Keep this file intentionally small to reduce context cost.
 
-## How to Work Here
-- Read `AGENTS.md` first and follow it as the source of truth.
-- Review `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md` for feedback and open items.
-- Use `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json` as machine-readable task state.
-- Keep `docs/1_Progress and review/OPEN_ITEMS.md` in sync with completed/open status.
-- Follow `docs/1_Progress and review/REVIEW_HOUSEKEEPING.md` for archiving superseded docs.
-- For non-trivial changes, produce a short plan before editing.
-- Run the relevant checks listed in `AGENTS.md` before finishing.
-- Prefer reuse before adding new code.
-- If `tasks/lessons.md` exists, update it after corrections.
-
-## Commands
-- Build: `cargo build --release`
-- Test: `cargo test --all`
-
-## Notes
-*None*
-
-<!-- PORTFOLIO_BASELINE_START -->
-## Portfolio Baseline (Revertability)
-- Leave the repo in a clean git state, or document outstanding changes in HANDOFF.md.
-- For risky operations, ensure a rollback path (backup, version history, or scripted revert).
-- Keep changes small and scoped.
-<!-- PORTFOLIO_BASELINE_END -->
-
+The role of this file is to describe common mistakes and confusion points. If you ever encounter something in this project that surprises you, or if you get stuck, please alert the developer and indicate that this is the case in this agent.md file to help prevent future agents from having the same issue.
