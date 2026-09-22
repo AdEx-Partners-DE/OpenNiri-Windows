@@ -1,11 +1,12 @@
 # Codex Fix Plan Snapshot (Non-Canonical)
-Date: 2026-02-13
+Date: 2026-09-22 (CI update; incident evidence below remains dated February)
 Owner: Claude (implementation), Codex (review)
 Status: Active - implementation complete; host closure evidence pending
 
 > This Markdown file is a human-readable snapshot only. Canonical tracker state is `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`.
 
 ## Canonical Tracking Files
+- September CI hardening adds main-push/manual validation, immutable action pins and locked Cargo resolution. Its exact-head/default delivery receipts are separate from the unchanged INC-49 host gate; no release or host test was performed by this change.
 - Canonical machine-readable plan: `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`
 - Active queue: `docs/1_Progress and review/OPEN_ITEMS.md`
 - Latest findings: `docs/1_Progress and review/CODEX_REVIEW_CONSOLIDATED.md`

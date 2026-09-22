@@ -1,6 +1,13 @@
 {
   "plan_id": "codex_fix_plan_review_32_incident_49",
-  "last_updated": "2026-02-13",
+  "last_updated": "2026-09-22",
+  "ci_delivery_update": {
+    "date": "2026-09-22",
+    "scope": "Main push/manual CI, full action pins, read-only default token, non-persisted checkout credentials, locked Cargo resolution, workflow contract tests",
+    "local_validation": "156 layout/IPC tests passed before workflow edits; contract tests are executed by CI",
+    "delivery_evidence": "Exact PR-head and post-merge main run identities must be recorded separately; this source entry is not deployment or host-acceptance proof",
+    "incident_state": "Unchanged: INC-49-1, INC-49-4 and INC-49-T1 remain in_progress; no tag or release authorized"
+  },
   "status": "in_progress",
   "owner": {
     "implementation": "Claude",

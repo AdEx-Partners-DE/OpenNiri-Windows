@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [main]
     tags: ['**']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,12 +20,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate CI delivery contract
+        run: python tools/ci/test_workflow_contract.py
 
       - name: Install MinGW (GNU linker)
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           update: true
           install: mingw-w64-x86_64-gcc
@@ -31,7 +40,7 @@ jobs:
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install Rust GNU toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable-x86_64-pc-windows-gnu
           components: rustfmt, clippy
@@ -111,7 +120,7 @@ jobs:
           Write-Host "Tag commit matches origin/main HEAD."
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -122,26 +131,26 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --all --verbose
+        run: cargo build --locked --all --verbose
 
       - name: Run tests
-        run: cargo test --all --verbose
+        run: cargo test --locked --all --verbose
 
       - name: Run all-features tests
-        run: cargo test --workspace --all-features --verbose
+        run: cargo test --locked --workspace --all-features --verbose
 
       - name: Run ignored tests
-        run: cargo test --workspace -- --ignored
+        run: cargo test --locked --workspace -- --ignored
 
       - name: Run release-profile tests (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
-        run: cargo test --all --release --verbose
+        run: cargo test --locked --all --release --verbose
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all -- -D warnings
+        run: cargo clippy --locked --all -- -D warnings
 
       - name: Audit dependencies
         run: |
@@ -157,12 +166,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install MinGW (GNU linker)
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           update: true
           install: mingw-w64-x86_64-gcc
@@ -173,7 +183,7 @@ jobs:
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install Rust GNU toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable-x86_64-pc-windows-gnu
 
@@ -249,7 +259,7 @@ jobs:
           Write-Host "Tag commit matches origin/main HEAD."
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -260,7 +270,7 @@ jobs:
             ${{ runner.os }}-cargo-release-
 
       - name: Build release binaries
-        run: cargo build --release --all
+        run: cargo build --locked --release --all
 
       - name: Create release archive
         run: |
@@ -301,7 +311,7 @@ jobs:
         shell: pwsh
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             openniri-windows-${{ github.ref_name }}.zip
