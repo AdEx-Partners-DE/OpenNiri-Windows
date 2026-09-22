@@ -1,4 +1,10 @@
 # Codex Consolidated Review (Latest: Review 38)
+
+## Scoped CI review update — 2026-09-22
+
+Confirmed delivery gap: CI only triggered for PRs/tags, leaving merged `main` untested. The scoped fix adds main-push and manual triggers, pins all external actions to verified commits, removes persisted checkout credentials, limits default permissions and locks dependency resolution. A dependency-free regression contract runs before the Rust build. Local baseline: 137 layout plus 19 IPC tests passed. Full workspace execution belongs on the isolated CI runner. Exact-head/default results must be read back separately. The open desktop-lockout incident and both release-blocking checks remain intact; no host acceptance or release readiness is claimed.
+
+## Historical runtime review
 Date: 2026-02-13
 Reviewer: Codex
 Scope: Strict automation QA gate rerun (Critical/High only), code-level exhaustion before host-manual testing.

@@ -1,5 +1,13 @@
 # OpenNiri-Windows Development Iteration Log
 
+## Portfolio delivery iteration — 2026-09-22
+
+- Scope: close missing post-merge `main` CI; add manual validation, immutable action pins, least-privilege checkout and locked Cargo commands.
+- Baseline: 156 layout/IPC tests passed locally; no desktop-control or recovery scenario executed on the operator machine.
+- Regression guard: `python tools/ci/test_workflow_contract.py` runs in CI before the build, including negative cases for removed main coverage, moving pins, persisted credentials and weakened incident gating.
+- Delivery boundary: exact-head CI, then merge identity and separate main CI readback; neither source changes nor local tests claim that those remote steps have already completed.
+- INC-49 remains open. No tags, releases, daemon launch or host-acceptance changes are part of this iteration.
+
 > **Purpose**: This document tracks all development iterations, providing evidence and links for meaningful review and verification.
 > **Maintainer**: Claude (Anthropic AI Assistant)
 > **Last Updated**: 2026-02-13 (Iteration 68 — Technical Log Correlation for Host Lockout)
