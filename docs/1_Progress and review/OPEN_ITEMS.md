@@ -1,8 +1,9 @@
 # Open Items Dashboard
-Last Updated: 2026-02-13 (Iteration 67 host pre-UAT run failure evidence logged; release remains blocked)
+Last Updated: 2026-09-22 (CI delivery hardening; host acceptance and release remain blocked)
 Source of truth: `docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json`
 
 ## Active Work (Open)
+- [ ] Delivery closeout: record exact-head and post-merge `main` CI receipts for the September workflow hardening and each subsequent dependency PR. Workflow implementation alone is not delivery proof.
 - [ ] `INC-49-1` Critical incident closure validation: run and record host reproduction/recovery evidence for desktop lockout/focus-trap scenario after `openniri-cli apply`.
 - [ ] `INC-49-4` Acceptance gate: host-level manual recovery scenario passes on real desktop workload before any release/tagging.
 - [ ] `INC-49-T1` Required host test evidence: apply + recovery path does not leave user unable to focus terminal/editor windows.
