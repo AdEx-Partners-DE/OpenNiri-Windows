@@ -29,7 +29,7 @@ jobs:
         run: python tools/ci/test_workflow_contract.py
 
       - name: Install MinGW (GNU linker)
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           update: true
           install: mingw-w64-x86_64-gcc
@@ -172,7 +172,7 @@ jobs:
           persist-credentials: false
 
       - name: Install MinGW (GNU linker)
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           update: true
           install: mingw-w64-x86_64-gcc
