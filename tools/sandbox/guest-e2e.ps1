@@ -205,6 +205,9 @@ try {
     Check 'A-default: windows are tiled at startup (full height, no overlap)' ($tileProblems.Count -eq 0) ($tileProblems -join '; ')
     $offscreen = @($tiled | Where-Object { -not (Test-OnScreen $_) -or $_.Cloaked -ne 0 })
     Check 'A-default: strip extends beyond the viewport (some windows hidden)' ($offscreen.Count -ge 1) ("hidden={0}" -f $offscreen.Count)
+    $cloakedHidden = @($tiled | Where-Object { $_.Cloaked -ne 0 })
+    $parked = @($tiled | Where-Object { $_.X -le -29000 -and $_.Y -le -29000 })
+    Check 'A-default: hidden windows are cloaked by the shell, not parked off-screen' ($cloakedHidden.Count -ge 1 -and $parked.Count -eq 0) ("cloaked={0} parked={1}" -f $cloakedHidden.Count, $parked.Count)
 
     # Hotkeys: walk left to the first column, then right through all columns.
     for ($i = 0; $i -lt ($script:titles.Count + 1); $i++) { [E2E]::Chord($VK_ALT, $VK_H); Start-Sleep -Milliseconds 350 }
@@ -289,6 +292,27 @@ try {
     Start-Sleep -Seconds 1
     Check 'C-crash: emergency-uncloak succeeds after hard kill' ($recover.Code -eq 0) ("exit={0}" -f $recover.Code)
     Test-AllRecovered 'kill + emergency-uncloak'
+
+    # ------------------------------------------------------------------
+    # Phase D: hard kill while windows are cloaked, then just start the daemon again
+    # ------------------------------------------------------------------
+    $script:phase = 'D-restart'
+    $daemonProcess = Start-Daemon
+    for ($i = 0; $i -lt 4; $i++) {
+        [E2E]::Chord($VK_ALT, 0x32); Start-Sleep -Milliseconds 400
+        [E2E]::Chord($VK_ALT, $VK_L); Start-Sleep -Milliseconds 500
+    }
+    $hidden = @(Snap 'before-kill' | Where-Object { $_.Cloaked -ne 0 })
+    Check 'D-restart: windows are cloaked when the daemon is killed (precondition)' ($hidden.Count -ge 1) ("cloaked={0}" -f $hidden.Count)
+    Stop-Process -Id $daemonProcess.Id -Force
+    Start-Sleep -Seconds 1
+    $daemonProcess = Start-Daemon
+    $managed = Invoke-Cli @('query', 'all')
+    $managedCount = ($managed.Output -split 'E2E-').Count - 1
+    Check 'D-restart: restarted daemon recovers and manages every window' ($managedCount -ge $script:titles.Count) ("managed={0}" -f $managedCount)
+    Stop-Daemon $daemonProcess
+    Start-Sleep -Seconds 1
+    Test-AllRecovered 'restart + stop'
 }
 catch {
     Check 'guest script completed without exception' $false ($_ | Out-String)

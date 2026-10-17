@@ -1406,8 +1406,12 @@ impl AppState {
                     // Tiled windows
                     for (col_idx, column) in workspace.columns().iter().enumerate() {
                         for (win_idx, &window_id) in column.windows().iter().enumerate() {
-                            let (title, class_name, process_id) =
-                                win_info_map.get(&window_id).cloned().unwrap_or_else(|| {
+                            // Enumeration skips cloaked windows; read those directly.
+                            let (title, class_name, process_id) = win_info_map
+                                .get(&window_id)
+                                .cloned()
+                                .or_else(|| openniri_platform_win32::describe_window(window_id))
+                                .unwrap_or_else(|| {
                                     ("Unknown".to_string(), "Unknown".to_string(), 0)
                                 });
 
@@ -1452,6 +1456,7 @@ impl AppState {
                         let (title, class_name, process_id) = win_info_map
                             .get(&floating.id)
                             .cloned()
+                            .or_else(|| openniri_platform_win32::describe_window(floating.id))
                             .unwrap_or_else(|| ("Unknown".to_string(), "Unknown".to_string(), 0));
 
                         let executable = get_process_executable(process_id).unwrap_or_default();
@@ -2798,6 +2803,16 @@ async fn main() -> Result<()> {
         config.clone(),
         monitors,
     )));
+
+    // Windows a crashed or killed earlier run left cloaked would be skipped by
+    // enumeration (it ignores cloaked windows), so bring them back first.
+    let recovered = openniri_platform_win32::restore_journaled_cloaked_windows();
+    if recovered > 0 {
+        info!(
+            "Recovered {} window(s) left cloaked by an earlier run",
+            recovered
+        );
+    }
 
     // Enumerate existing windows
     info!("Enumerating windows...");

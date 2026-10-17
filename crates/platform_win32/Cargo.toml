@@ -10,6 +10,7 @@ description = "Windows platform integration for OpenNiri (HWND manipulation, DWM
 [dependencies]
 openniri-core-layout = { path = "../core_layout" }
 windows = { workspace = true }
+windows-core = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

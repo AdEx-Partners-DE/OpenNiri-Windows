@@ -185,7 +185,7 @@ If applying the layout fails 5 times in a row, OpenNiri pauses tiling on its own
 
 ### Repeated `DwmSetWindowAttribute(CLOAK=0) failed` messages
 
-With cloaking enabled, if DWM denies cloaking (E_ACCESSDENIED, common for other apps' windows), OpenNiri falls back to moving those windows off-screen instead of failing. It also no longer calls uncloak on windows that are not cloaked, which removes the repeated `DwmSetWindowAttribute(CLOAK=0) failed` log spam. If you still see it, update to the current build.
+OpenNiri cloaks other apps' windows through the Windows shell (`IApplicationView::SetCloak`); DWM's own cloak call is denied (E_ACCESSDENIED) for windows of other processes. If the shell cannot cloak a window either, OpenNiri moves it off-screen instead of failing. It also no longer calls uncloak on windows that are not cloaked, which removes the repeated `DwmSetWindowAttribute(CLOAK=0) failed` log spam. If you still see it, update to the current build.
 
 ### Second daemon won't start
 
@@ -327,7 +327,7 @@ OpenNiri is designed to degrade gracefully. Here's what happens when operations 
 | Situation | What happens | Log message |
 |-----------|-------------|-------------|
 | `SetWindowPos` fails | Warning logged, window stays at previous position | `"Failed to apply layout..."` |
-| DWM denies cloaking (E_ACCESSDENIED) | Window is moved off-screen instead; uncloak is skipped for windows that are not cloaked | `"Failed to cloak/uncloak..."` |
+| Shell and DWM cannot cloak a window | Window is moved off-screen instead; uncloak is skipped for windows that are not cloaked | `"Failed to cloak/uncloak..."` |
 | Access denied (elevated window) | Window is not tiled | `"Not managing window..."` |
 | Layout application fails 5 times in a row | Tiling pauses itself, animations stop, window visibility is restored; resume with `openniri-cli toggle-pause` | `"Failed to apply layout..."` |
 | Hotkey registration fails | Registered hotkeys are kept; each failure is logged by name and the tray tooltip shows registered/requested | `"Failed to register hotkey..."` |
