@@ -5,6 +5,8 @@
 - In this workstation's PowerShell, use `cargo.exe` if the `cargo` wrapper intercepts short flags such as `-p`.
 - Unit tests: `cargo test --workspace`. CI also runs `cargo clippy -- -D warnings` and `cargo fmt --check`.
 - Desktop behaviour (tiling, hiding, focus, recovery) is only verified by the Windows Sandbox end-to-end test: `cargo build --release --workspace`, then `tools/sandbox/run-sandbox-e2e.ps1`. Run it for changes to `platform_win32` or the daemon's window handling, and before tagging a release.
+- Sandbox test windows can start slowly under host load. Wait for all expected windows before starting the daemon; a fixed startup sleep can produce a setup failure unrelated to the build.
+- Run the sandbox's Explorer-restart phase last. Failed shell-cloak recovery can leave windows hidden and invalidate later scenarios that assume all test windows are manageable.
 
 ## Rules
 - Never run the daemon on the operator's own desktop to test something; use the sandbox test. A broken build can hide windows or trap focus (see `docs/incidents/2026-02-07-desktop-lockout.md`).

@@ -14,6 +14,7 @@ mod commands;
 mod config;
 mod hotkeys;
 mod ipc_server;
+mod mouse_focus;
 mod recovery;
 mod startup;
 mod state;
@@ -25,7 +26,7 @@ mod window_events;
 use anyhow::Result;
 use clap::Parser;
 use config::Config;
-use hotkeys::{setup_hotkeys, HotkeyState};
+use hotkeys::setup_hotkeys;
 use ipc_server::{check_already_running, run_ipc_server};
 use openniri_core_layout::Rect;
 use openniri_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
@@ -192,10 +193,9 @@ async fn main() -> Result<()> {
     };
 
     // Initialize state with config and monitors
-    let state = Arc::new(Mutex::new(AppState::new_with_config(
-        config.clone(),
-        monitors,
-    )));
+    let mut initial_state = AppState::new_with_config(config.clone(), monitors);
+    initial_state.force_no_cloak = args.skip_cloak();
+    let state = Arc::new(Mutex::new(initial_state));
 
     // Windows a crashed or killed earlier run left cloaked would be skipped by
     // enumeration (it ignores cloaked windows), so bring them back first.
@@ -320,17 +320,8 @@ async fn main() -> Result<()> {
     }
 
     // Register global hotkeys (mutable to support reload)
-    let mut hotkey_state = if args.skip_hotkeys() {
-        info!("Hotkeys disabled by command-line flag");
-        HotkeyState {
-            handle: None,
-            mapping: HashMap::new(),
-            requested_count: 0,
-            registered_count: 0,
-        }
-    } else {
-        setup_hotkeys(&config, event_tx.clone())
-    };
+    let mut hotkey_state = setup_hotkeys(&config, event_tx.clone(), args.skip_hotkeys());
+    let mut applied_config_revision = 0;
 
     // Install mouse hook for focus-follows-mouse (if enabled)
     let mouse_hook_thread = if config.behavior.focus_follows_mouse {
@@ -520,8 +511,7 @@ async fn main() -> Result<()> {
     // Snap hint timer handle - cancels pending hide operation when new hint is shown
     let mut snap_hint_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Focus-follows-mouse timer handle - debounces rapid mouse movements
-    let mut focus_follows_mouse_timer: Option<tokio::task::JoinHandle<()>> = None;
+    let mut mouse_focus_delay = mouse_focus::MouseFocusDelay::default();
 
     // Helper function to start animation timer if not already running
     fn start_animation_timer(
@@ -546,11 +536,18 @@ async fn main() -> Result<()> {
 
     // Main event loop
     loop {
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => break,
+        let event = tokio::select! {
+            // Process queued mouse transitions before an expired focus request.
+            biased;
+            event = event_rx.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            window_id = mouse_focus_delay.wait() => DaemonEvent::FocusFollowsMouse { window_id },
         };
 
+        // Reply only after any committed config has updated runtime resources.
+        let mut pending_response = None;
         match event {
             DaemonEvent::IpcCommand { cmd, responder } => {
                 if let Some(mode) = shutdown_mode_for_command(&cmd) {
@@ -569,7 +566,6 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                let is_reload = matches!(&cmd, IpcCommand::Reload);
                 let is_resize = matches!(&cmd, IpcCommand::Resize { .. });
                 let is_toggle_pause = matches!(&cmd, IpcCommand::TogglePause);
 
@@ -589,24 +585,7 @@ async fn main() -> Result<()> {
                     (response, animating, rect, duration)
                 };
 
-                // If config was reloaded successfully, also reload hotkeys
-                if is_reload && matches!(response, IpcResponse::Ok) {
-                    // Drop old hotkey handle to unregister existing hotkeys
-                    hotkey_state.handle = None;
-
-                    // Re-register with new config
-                    let new_config = {
-                        let state = state.lock().await;
-                        state.config.clone()
-                    };
-                    hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
-                    info!("Hotkeys reloaded after config reload");
-                }
-
-                // Log if client disconnected before receiving response
-                if responder.send(response).is_err() {
-                    debug!("Client disconnected before receiving IPC response");
-                }
+                pending_response = Some((responder, response));
 
                 if is_toggle_pause {
                     let state = state.lock().await;
@@ -665,21 +644,7 @@ async fn main() -> Result<()> {
                     };
 
                     if enabled {
-                        // Cancel any pending focus timer
-                        if let Some(handle) = focus_follows_mouse_timer.take() {
-                            handle.abort();
-                        }
-
-                        // Schedule focus after delay (debouncing)
-                        let focus_tx = event_tx.clone();
-                        let delay = delay_ms;
-                        focus_follows_mouse_timer = Some(tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay as u64))
-                                .await;
-                            let _ = focus_tx
-                                .send(DaemonEvent::FocusFollowsMouse { window_id: hwnd })
-                                .await;
-                        }));
+                        mouse_focus_delay.schedule(hwnd, Duration::from_millis(delay_ms as u64));
                     }
                 } else {
                     let mut state = state.lock().await;
@@ -833,16 +798,7 @@ async fn main() -> Result<()> {
                             state.handle_command(IpcCommand::Reload)
                         };
 
-                        // If config was reloaded successfully, also reload hotkeys
-                        if matches!(response, IpcResponse::Ok) {
-                            hotkey_state.handle = None;
-                            let new_config = {
-                                let state = state.lock().await;
-                                state.config.clone()
-                            };
-                            hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
-                            info!("Hotkeys reloaded after tray config reload");
-                        } else if let IpcResponse::Error { message } = response {
+                        if let IpcResponse::Error { message } = response {
                             warn!("Reload failed: {}", message);
                         }
                     }
@@ -925,7 +881,10 @@ async fn main() -> Result<()> {
                     if !state.config.behavior.focus_follows_mouse {
                         false
                     } else {
-                        let applied = state.apply_focus_follows_mouse(window_id);
+                        let applied = state.apply_focus_follows_mouse(
+                            window_id,
+                            openniri_platform_win32::window_under_cursor(),
+                        );
                         if applied {
                             state.is_animating()
                         } else {
@@ -948,6 +907,39 @@ async fn main() -> Result<()> {
                 break;
             }
         }
+
+        // Every reload source (IPC, tray, hotkey, gesture) uses this path. A
+        // placement error does not undo the committed config, so refresh even
+        // when Reload returned an error after applying it.
+        let reloaded_config = {
+            let state = state.lock().await;
+            if state.config_revision != applied_config_revision {
+                applied_config_revision = state.config_revision;
+                Some(state.config.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(config) = reloaded_config {
+            mouse_focus_delay.clear();
+            hotkey_state.handle = None;
+            hotkey_state = setup_hotkeys(&config, event_tx.clone(), args.skip_hotkeys());
+            info!("Hotkeys updated after config reload");
+            if let Some(ref mgr) = tray_manager {
+                let state = state.lock().await;
+                mgr.update_tooltip(
+                    state.all_managed_window_ids().len(),
+                    state.monitors.len(),
+                    state.paused,
+                    Some((hotkey_state.registered_count, hotkey_state.requested_count)),
+                );
+            }
+        }
+        if let Some((responder, response)) = pending_response {
+            if responder.send(response).is_err() {
+                debug!("Client disconnected before receiving IPC response");
+            }
+        }
     }
 
     // Clean up timers if running
@@ -955,9 +947,6 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     if let Some(handle) = snap_hint_timer_handle {
-        handle.abort();
-    }
-    if let Some(handle) = focus_follows_mouse_timer {
         handle.abort();
     }
 

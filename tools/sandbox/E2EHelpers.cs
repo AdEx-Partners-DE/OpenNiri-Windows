@@ -49,6 +49,8 @@ public static class E2E
     [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] static extern uint SendInput(uint n, INPUT[] inputs, int size);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint key);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool UnregisterHotKey(IntPtr hwnd, int id);
     [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
 
@@ -163,6 +165,39 @@ public static class E2E
         return -1;
     }
 
+    public class HoverResult
+    {
+        public long Before, AfterDelay, Later, UnderCursor;
+        public bool CursorArrived;
+        public int CursorX, CursorY;
+    }
+
+    /// Hover without clicking, optionally leave for an unmanaged point before
+    /// the daemon's 100 ms delay, then observe focus with the cursor stationary.
+    public static HoverResult ObserveHover(int x, int y, bool leave, int leaveX, int leaveY)
+    {
+        var result = new HoverResult();
+        result.Before = Foreground();
+        result.CursorArrived = CursorLatencyMs(x, y, 2000) >= 0;
+        if (leave)
+        {
+            Thread.Sleep(20);
+            result.CursorArrived &= CursorLatencyMs(leaveX, leaveY, 2000) >= 0;
+        }
+        Thread.Sleep(400);
+        result.AfterDelay = Foreground();
+        Thread.Sleep(1500);
+        result.Later = Foreground();
+        POINT p;
+        if (GetCursorPos(out p))
+        {
+            result.CursorX = p.X;
+            result.CursorY = p.Y;
+            result.UnderCursor = WindowAt(p.X, p.Y);
+        }
+        return result;
+    }
+
     /// Press modifier+key chords, e.g. Chord(0x12, 0x4C) for Alt+L.
     public static void Chord(params ushort[] vks)
     {
@@ -170,6 +205,21 @@ public static class E2E
         foreach (var vk in vks) { var i = new INPUT(); i.type = INPUT_KEYBOARD; i.ki.wVk = vk; inputs.Add(i); }
         for (int k = vks.Length - 1; k >= 0; k--) { var i = new INPUT(); i.type = INPUT_KEYBOARD; i.ki.wVk = vks[k]; i.ki.dwFlags = KEYEVENTF_KEYUP; inputs.Add(i); }
         SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    /// Probe actual OS registration without sending a shortcut to an application.
+    public static bool HotkeyAvailable(uint modifiers, uint key)
+    {
+        const int probeId = 0x5A11;
+        if (!RegisterHotKey(IntPtr.Zero, probeId, modifiers, key))
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 1409 /* ERROR_HOTKEY_ALREADY_REGISTERED */) return false;
+            throw new System.ComponentModel.Win32Exception(error);
+        }
+        if (!UnregisterHotKey(IntPtr.Zero, probeId))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return true;
     }
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
