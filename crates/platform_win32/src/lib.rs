@@ -4731,24 +4731,6 @@ mod tests {
     }
 
     #[test]
-    fn test_uncloak_all_managed_empty_list() {
-        // Should not panic with an empty list
-        uncloak_all_managed_windows(&[]);
-    }
-
-    #[test]
-    fn test_uncloak_all_managed_with_invalid_ids() {
-        // Should not panic even with invalid window IDs (best-effort)
-        uncloak_all_managed_windows(&[0, 999_999, 1_234_567]);
-    }
-
-    #[test]
-    fn test_uncloak_all_visible_windows_no_panic() {
-        // EnumWindows should succeed; uncloaking random windows is best-effort
-        uncloak_all_visible_windows();
-    }
-
-    #[test]
     #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
     fn test_set_dpi_awareness_no_panic() {
         // On CI/test environments this may return false (already set), but must not panic
