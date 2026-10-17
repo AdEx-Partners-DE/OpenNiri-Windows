@@ -1,5 +1,7 @@
 # Incident Report: Desktop Lockout During Local Apply Test
 
+> **Status (2026-10-17):** the code-level causes were found and fixed in PRs #58 (hook threads without a message loop, uncloak failures failing every layout pass, focus-stealing rollback, child-window destroy events, elevated windows, all-or-nothing hotkeys), #59 (off-screen parking at -100000 clamped to -32768 and never restored, foreground thread attach) and #60 (shell cloaking with crash journal). They are verified by the Windows Sandbox end-to-end test in `tools/sandbox/`. The tracking files and evidence folders referenced below were removed from the working tree; they remain in the git history.
+
 Date: 2026-02-07  
 Severity: Critical  
 Status: Open (unresolved)  

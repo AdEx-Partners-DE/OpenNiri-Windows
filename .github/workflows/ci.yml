@@ -25,9 +25,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate CI delivery contract
-        run: python tools/ci/test_workflow_contract.py
-
       - name: Install MinGW (GNU linker)
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
@@ -78,34 +75,6 @@ jobs:
           }
 
           Write-Host "Release metadata checks passed for $tag."
-
-      - name: Enforce INC-49 release closure gate
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $planPath = "docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json"
-          if (-not (Test-Path $planPath)) {
-            throw "Missing required incident gate file: $planPath"
-          }
-          $plan = Get-Content -Raw $planPath | ConvertFrom-Json
-          $requiredTaskIds = @("INC-49-1", "INC-49-4")
-          foreach ($taskId in $requiredTaskIds) {
-            $task = $plan.tasks | Where-Object { $_.id -eq $taskId } | Select-Object -First 1
-            if (-not $task) {
-              throw "Missing required task '$taskId' in $planPath"
-            }
-            if ($task.status -ne "done") {
-              throw "Release blocked: task '$taskId' status is '$($task.status)' (expected 'done')."
-            }
-          }
-          $requiredHostTest = $plan.required_tests | Where-Object { $_.id -eq "INC-49-T1" } | Select-Object -First 1
-          if (-not $requiredHostTest) {
-            throw "Missing required host test 'INC-49-T1' in $planPath"
-          }
-          if ($requiredHostTest.status -ne "done") {
-            throw "Release blocked: host test 'INC-49-T1' status is '$($requiredHostTest.status)' (expected 'done')."
-          }
-          Write-Host "INC-49 release closure gate passed."
 
       - name: Enforce tag is main HEAD
         if: startsWith(github.ref, 'refs/tags/v')
@@ -219,33 +188,6 @@ jobs:
           }
 
           Write-Host "Release metadata checks passed for $tag."
-
-      - name: Enforce INC-49 release closure gate
-        shell: pwsh
-        run: |
-          $planPath = "docs/1_Progress and review/CODEX_BLOCKER_FIX_PLAN.json"
-          if (-not (Test-Path $planPath)) {
-            throw "Missing required incident gate file: $planPath"
-          }
-          $plan = Get-Content -Raw $planPath | ConvertFrom-Json
-          $requiredTaskIds = @("INC-49-1", "INC-49-4")
-          foreach ($taskId in $requiredTaskIds) {
-            $task = $plan.tasks | Where-Object { $_.id -eq $taskId } | Select-Object -First 1
-            if (-not $task) {
-              throw "Missing required task '$taskId' in $planPath"
-            }
-            if ($task.status -ne "done") {
-              throw "Release blocked: task '$taskId' status is '$($task.status)' (expected 'done')."
-            }
-          }
-          $requiredHostTest = $plan.required_tests | Where-Object { $_.id -eq "INC-49-T1" } | Select-Object -First 1
-          if (-not $requiredHostTest) {
-            throw "Missing required host test 'INC-49-T1' in $planPath"
-          }
-          if ($requiredHostTest.status -ne "done") {
-            throw "Release blocked: host test 'INC-49-T1' status is '$($requiredHostTest.status)' (expected 'done')."
-          }
-          Write-Host "INC-49 release closure gate passed."
 
       - name: Enforce tag is main HEAD
         shell: pwsh

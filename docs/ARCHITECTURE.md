@@ -203,7 +203,7 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 ---
 
 ## Current Status (Reality Check)
-- `openniri-core-layout` is implemented and unit-tested (127 tests).
+- `openniri-core-layout` is implemented and unit-tested.
 - `openniri-platform-win32` has real Win32 implementations (27 unit tests, 3 hardware-dependent):
   - `enumerate_windows()` - Uses EnumWindows with filtering (including owner-window filtering for dialog windows)
   - `enumerate_monitors()` / `get_primary_monitor()` - Uses EnumDisplayMonitors
@@ -257,7 +257,7 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
 ---
 
 ## Planned vs Implemented (Gap Summary)
-- **Implemented** (validated quality gate: 540 test-binary tests — 536 passed, 4 ignored; plus 1 doc-test compile check):
+- **Implemented**:
   - Core layout engine
   - IPC protocol crate
   - CLI tool

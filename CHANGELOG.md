@@ -184,6 +184,9 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 
 ### Removed
 
+- Agent-process ballast: the tracking files under `docs/1_Progress and review/` (blocker plan JSON, open items, iteration log, review transcripts and templates), the `reviews/` templates, empty handoff/session/task-board files, `GEMINI.md`, old research exports in `docs/0_Research/`, the pre-stable and public-readiness checklists, the superseded manual `sandbox/` setup and `tools/inc49/` script, and the CI script that tested the workflow file. Everything remains in git history. The incident report moved to `docs/incidents/`.
+- The CI release gate that read INC-49 status from the tracking JSON. Before tagging a release, run the sandbox end-to-end test (`tools/sandbox/`).
+
 - Dead HideStrategy::Minimize and HideStrategy::MoveOffScreen variants (iter 9, restored MoveOffScreen in iter 23)
 - Unused buffer_zone field from PlatformConfig (iter 9)
 - Fake WM_POINTER-based gesture implementation replaced with real mouse hook (iter 24)
