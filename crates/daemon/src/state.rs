@@ -289,9 +289,9 @@ impl AppState {
 
     /// Restore workspace state from a saved snapshot.
     ///
-    /// This should be called AFTER windows are enumerated so that scroll offsets
-    /// are not clamped against empty workspaces. Sets the scroll offset directly
-    /// (bypassing clamping) to preserve the saved value.
+    /// This should be called AFTER windows are enumerated: the saved scroll offset
+    /// is clamped against the windows present now, so it never scrolls them all
+    /// off-screen.
     ///
     /// Returns the set of monitor IDs whose scroll offsets were successfully
     /// restored. The caller should skip `ensure_focused_visible()` for these
@@ -309,10 +309,11 @@ impl AppState {
 
             if let Some(id) = monitor_id {
                 // Restore scroll offset from saved workspace
+                let viewport_width = self.monitors[&id].work_area.width;
                 if let Some(workspace) = self.workspaces.get_mut(&id) {
                     let saved_offset = ws_snapshot.workspace.scroll_offset();
                     if saved_offset != 0.0 {
-                        workspace.set_scroll_offset(saved_offset);
+                        workspace.set_scroll_offset(saved_offset, viewport_width);
                     }
                     restored_monitors.insert(id);
                     info!(
@@ -481,8 +482,8 @@ impl AppState {
 
         for (monitor_id, workspace) in &self.workspaces {
             if let Some(monitor) = self.monitors.get(monitor_id) {
-                // Use animated placements to support smooth scrolling
-                let placements = workspace.compute_placements_animated(monitor.work_area);
+                // Placements follow any running scroll animation
+                let placements = workspace.compute_placements(monitor.work_area);
                 debug!(
                     "Monitor {}: {} placements for viewport {}x{} (animating: {})",
                     monitor_id,
@@ -705,7 +706,8 @@ mod tests {
                 .iter()
                 .map(|(name, offset)| {
                     let mut workspace = Workspace::default();
-                    workspace.set_scroll_offset(*offset);
+                    workspace.insert_window(1, Some(10_000)).unwrap();
+                    workspace.set_scroll_offset(*offset, 1920);
                     WorkspaceSnapshot {
                         monitor_device_name: name.to_string(),
                         workspace,
@@ -724,7 +726,7 @@ mod tests {
             ws.insert_window(id, Some(800)).unwrap();
         }
 
-        // Monitor 2 stays empty: its saved offset must not be clamped away.
+        // Monitor 2 stays empty: its saved offset is clamped to 0.
         let saved = snapshot(
             &[("DISPLAY1", 500.0), ("DISPLAY2", 300.0), ("UNKNOWN", 100.0)],
             "DISPLAY2",
@@ -735,7 +737,7 @@ mod tests {
         let restored = state.restore_state(&parsed);
         assert_eq!(restored, HashSet::from([1, 2]));
         assert_eq!(state.workspaces[&1].scroll_offset(), 500.0);
-        assert_eq!(state.workspaces[&2].scroll_offset(), 300.0);
+        assert_eq!(state.workspaces[&2].scroll_offset(), 0.0);
         assert_eq!(state.focused_monitor, 2);
 
         let restored = state.restore_state(&snapshot(&[("UNKNOWN", 100.0)], "UNKNOWN"));

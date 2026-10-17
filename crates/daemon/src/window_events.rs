@@ -4,7 +4,7 @@ use crate::config;
 use crate::recovery::{is_process_more_privileged_than_daemon, log_skipped_privileged_window};
 use crate::state::{AppState, FALLBACK_VIEWPORT_HEIGHT, FALLBACK_VIEWPORT_WIDTH};
 use anyhow::Result;
-use openniri_core_layout::{Rect, Workspace};
+use openniri_core_layout::{default_floating_rect, InsertFocus, Rect, Workspace};
 use openniri_platform_win32::{
     enumerate_monitors, enumerate_windows, find_monitor_for_rect, get_process_executable,
     MonitorId, MonitorInfo, WindowEvent,
@@ -362,7 +362,7 @@ impl AppState {
                     if let Some(workspace) = self.workspaces.get_mut(&monitor_id) {
                         let added = match action {
                             config::WindowAction::Float => {
-                                // Use rule dimensions or default to centered 800x600 window
+                                // Use rule dimensions or default to a centered window
                                 let rect = floating_rect.unwrap_or_else(|| {
                                     let viewport = self
                                         .monitors
@@ -376,12 +376,7 @@ impl AppState {
                                                 FALLBACK_VIEWPORT_HEIGHT,
                                             )
                                         });
-                                    Rect::new(
-                                        viewport.x + (viewport.width - 800) / 2,
-                                        viewport.y + (viewport.height - 600) / 2,
-                                        800,
-                                        600,
-                                    )
+                                    default_floating_rect(viewport)
                                 });
                                 workspace.add_floating(hwnd, rect).is_ok()
                             }
@@ -390,11 +385,14 @@ impl AppState {
                                     self.config.layout.min_column_width,
                                     self.config.layout.max_column_width,
                                 );
-                                if self.config.behavior.focus_new_windows {
-                                    workspace.insert_window(hwnd, Some(width)).is_ok()
+                                let focus = if self.config.behavior.focus_new_windows {
+                                    InsertFocus::Take
                                 } else {
-                                    workspace.insert_window_no_focus(hwnd, Some(width)).is_ok()
-                                }
+                                    InsertFocus::Keep
+                                };
+                                workspace
+                                    .insert_window_with(hwnd, Some(width), focus)
+                                    .is_ok()
                             }
                             config::WindowAction::Ignore => unreachable!(),
                         };
@@ -859,7 +857,6 @@ mod tests {
         }
         ws.focus_window(100).unwrap();
         ws.ensure_focused_visible(1920);
-        ws.stop_animation();
         state
     }
 
@@ -968,7 +965,7 @@ mod tests {
         let viewport = state.focused_viewport();
         let ws = state.focused_workspace().unwrap();
         assert!(
-            !ws.is_fullscreen(),
+            ws.fullscreen_window_id().is_none(),
             "Fullscreen should be cleared when fullscreen window is minimized"
         );
         assert!(
