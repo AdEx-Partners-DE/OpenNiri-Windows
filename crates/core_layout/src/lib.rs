@@ -21,6 +21,11 @@ pub const DEFAULT_OUTER_GAP: i32 = 10;
 /// Default width for new columns in pixels.
 pub const DEFAULT_COLUMN_WIDTH: i32 = 800;
 
+/// Preferred size of a floating window without an explicit rect.
+const DEFAULT_FLOATING_SIZE: (i32, i32) = (800, 600);
+/// Total horizontal/vertical margin kept free around a default floating window.
+const FLOATING_VIEWPORT_MARGIN: i32 = 40;
+
 /// Unique identifier for a window.
 /// On Windows, this will typically be the HWND cast to u64.
 pub type WindowId = u64;
@@ -36,9 +41,6 @@ pub enum LayoutError {
 
     #[error("Window {0} already exists in workspace")]
     DuplicateWindow(WindowId),
-
-    #[error("Window index {0} is out of bounds in column {1} (max: {2})")]
-    WindowIndexOutOfBounds(usize, usize, usize),
 }
 
 /// A rectangle in screen coordinates (pixels).
@@ -64,24 +66,28 @@ impl Rect {
             height: height.max(0),
         }
     }
+}
 
-    /// Check if this rectangle intersects with another.
-    pub fn intersects(&self, other: &Rect) -> bool {
-        self.x < other.x + other.width
-            && self.x + self.width > other.x
-            && self.y < other.y + other.height
-            && self.y + self.height > other.y
-    }
-
-    /// Get the right edge x-coordinate.
-    pub fn right(&self) -> i32 {
-        self.x + self.width
-    }
-
-    /// Get the bottom edge y-coordinate.
-    pub fn bottom(&self) -> i32 {
-        self.y + self.height
-    }
+/// Default rect for a window that starts floating without explicit geometry:
+/// 800x600 (shrunk to leave a margin inside small viewports), centered in `viewport`.
+pub fn default_floating_rect(viewport: Rect) -> Rect {
+    let (preferred_w, preferred_h) = DEFAULT_FLOATING_SIZE;
+    let width = preferred_w
+        .min(viewport.width.saturating_sub(FLOATING_VIEWPORT_MARGIN))
+        .max(0);
+    let height = preferred_h
+        .min(viewport.height.saturating_sub(FLOATING_VIEWPORT_MARGIN))
+        .max(0);
+    Rect::new(
+        viewport
+            .x
+            .saturating_add(viewport.width.saturating_sub(width) / 2),
+        viewport
+            .y
+            .saturating_add(viewport.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
 }
 
 /// Visibility state for layout computation.
@@ -139,23 +145,17 @@ impl Easing {
 pub const DEFAULT_ANIMATION_DURATION_MS: u64 = 200;
 
 /// Animation state for smooth scrolling.
-#[derive(Debug, Clone)]
-pub struct ScrollAnimation {
-    /// Starting scroll offset.
-    pub start_offset: f64,
-    /// Target scroll offset.
-    pub target_offset: f64,
-    /// Animation duration in milliseconds.
-    pub duration_ms: u64,
-    /// Elapsed time in milliseconds.
-    pub elapsed_ms: u64,
-    /// Easing function to use.
-    pub easing: Easing,
+#[derive(Debug, Clone, PartialEq)]
+struct ScrollAnimation {
+    start_offset: f64,
+    target_offset: f64,
+    duration_ms: u64,
+    elapsed_ms: u64,
+    easing: Easing,
 }
 
 impl ScrollAnimation {
-    /// Create a new scroll animation.
-    pub fn new(start: f64, target: f64, duration_ms: u64, easing: Easing) -> Self {
+    fn new(start: f64, target: f64, duration_ms: u64, easing: Easing) -> Self {
         Self {
             start_offset: start,
             target_offset: target,
@@ -165,45 +165,82 @@ impl ScrollAnimation {
         }
     }
 
-    /// Create a new animation with default duration and easing.
-    pub fn with_defaults(start: f64, target: f64) -> Self {
-        Self::new(
-            start,
-            target,
-            DEFAULT_ANIMATION_DURATION_MS,
-            Easing::default(),
-        )
-    }
-
-    /// Check if the animation is complete.
-    pub fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.elapsed_ms >= self.duration_ms
     }
 
-    /// Get the current progress (0.0 to 1.0).
-    pub fn progress(&self) -> f64 {
+    /// Current progress (0.0 to 1.0).
+    fn progress(&self) -> f64 {
         if self.duration_ms == 0 {
             return 1.0;
         }
         (self.elapsed_ms as f64 / self.duration_ms as f64).clamp(0.0, 1.0)
     }
 
-    /// Get the current scroll offset based on animation progress.
-    pub fn current_offset(&self) -> f64 {
+    fn current_offset(&self) -> f64 {
         let eased_progress = self.easing.apply(self.progress());
         self.start_offset + (self.target_offset - self.start_offset) * eased_progress
     }
 
-    /// Advance the animation by the given delta time in milliseconds.
-    /// Returns true if the animation is still running, false if complete.
-    pub fn tick(&mut self, delta_ms: u64) -> bool {
+    /// Advance by `delta_ms`. Returns true while the animation is still running.
+    fn tick(&mut self, delta_ms: u64) -> bool {
         self.elapsed_ms = self.elapsed_ms.saturating_add(delta_ms);
         !self.is_complete()
     }
+}
 
-    /// Get the final target offset.
-    pub fn target(&self) -> f64 {
-        self.target_offset
+/// Horizontal view position over the strip: either resting at an offset or
+/// animating towards one. Every write replaces the whole state, so a direct
+/// scroll can never be overwritten later by a stale animation.
+#[derive(Debug, Clone, PartialEq)]
+enum View {
+    Static(f64),
+    Animating(ScrollAnimation),
+}
+
+impl View {
+    /// Offset currently on screen.
+    fn current(&self) -> f64 {
+        match self {
+            View::Static(offset) => *offset,
+            View::Animating(anim) => anim.current_offset(),
+        }
+    }
+
+    /// Offset the view will rest at once any animation finishes.
+    fn target(&self) -> f64 {
+        match self {
+            View::Static(offset) => *offset,
+            View::Animating(anim) => anim.target_offset,
+        }
+    }
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View::Static(0.0)
+    }
+}
+
+/// Serializes the view as the plain `scroll_offset` number used by earlier
+/// versions (the resting target; animations are transient).
+mod view_serde {
+    use super::View;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(view: &View, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(view.target())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<View, D::Error> {
+        let offset = f64::deserialize(deserializer)?;
+        Ok(View::Static(if offset.is_finite() {
+            offset.max(0.0)
+        } else {
+            0.0
+        }))
     }
 }
 
@@ -229,6 +266,9 @@ pub struct Column {
     width: i32,
     /// Windows in this column (vertically stacked).
     windows: Vec<WindowId>,
+    /// Remembered focused row; `< windows.len()` whenever the column is non-empty.
+    #[serde(default)]
+    focused_row: usize,
 }
 
 impl Column {
@@ -238,6 +278,7 @@ impl Column {
         Self {
             width: width.max(MIN_COLUMN_WIDTH),
             windows: vec![window_id],
+            focused_row: 0,
         }
     }
 
@@ -247,6 +288,7 @@ impl Column {
         Self {
             width: width.max(MIN_COLUMN_WIDTH),
             windows: Vec::new(),
+            focused_row: 0,
         }
     }
 
@@ -267,13 +309,18 @@ impl Column {
 
     /// Remove a window from this column.
     /// Returns the index of the removed window if found, None otherwise.
+    ///
+    /// The remembered focused row stays on the same window when a window above
+    /// it is removed; when the focused window itself is removed, focus moves to
+    /// the next window (or the previous one at the bottom of the stack).
     pub fn remove_window(&mut self, window_id: WindowId) -> Option<usize> {
-        if let Some(pos) = self.windows.iter().position(|&w| w == window_id) {
-            self.windows.remove(pos);
-            Some(pos)
-        } else {
-            None
+        let pos = self.windows.iter().position(|&w| w == window_id)?;
+        self.windows.remove(pos);
+        if pos < self.focused_row {
+            self.focused_row -= 1;
         }
+        self.focused_row = self.focused_row.min(self.windows.len().saturating_sub(1));
+        Some(pos)
     }
 
     /// Get the width of this column.
@@ -314,6 +361,23 @@ pub enum CenteringMode {
     JustInView,
 }
 
+/// Whether a newly inserted tiled window takes keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InsertFocus {
+    /// The new window becomes the focused window.
+    #[default]
+    Take,
+    /// Focus stays where it is (the first window in an empty workspace still gets it).
+    Keep,
+}
+
+/// Horizontal focus direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+}
+
 /// A floating window that is not part of the tiling layout.
 ///
 /// Floating windows are positioned at absolute coordinates and always
@@ -335,21 +399,23 @@ pub struct FloatingWindow {
 ///
 /// 1. **No duplicate windows:** Each `WindowId` appears at most once.
 /// 2. **Valid focus:** If `columns` is empty, `focused_window()` returns `None`.
-///    Otherwise, `focused_column < columns.len()` and
-///    `focused_window_in_column < columns[focused_column].len()`.
+///    Otherwise, `focused_column < columns.len()` and every column's remembered
+///    row is within that column.
 /// 3. **Valid column widths:** All column widths are >= `MIN_COLUMN_WIDTH` (100px).
-/// 4. **Valid scroll range:** `0.0 <= scroll_offset <= max_scroll` where
-///    `max_scroll = (total_width() - viewport_width).max(0)`.
+/// 4. **Fullscreen:** `fullscreen_window`, if set, is the focused tiled window and
+///    is not minimized. Any focus change to another window leaves fullscreen.
+/// 5. **Strip geometry:** Columns without a visible (non-minimized) window take no
+///    width. Offsets written through `scroll_by`/`set_scroll_offset`/`ensure_*`
+///    are clamped to `0..=max(total_width() - viewport_width, 0)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     /// Columns in the workspace, ordered left to right.
     columns: Vec<Column>,
     /// Index of the currently focused column.
     focused_column: usize,
-    /// Index of the focused window within the focused column.
-    focused_window_in_column: usize,
-    /// Current scroll offset (x position of viewport's left edge on the strip).
-    scroll_offset: f64,
+    /// View position over the strip (x of the viewport's left edge).
+    #[serde(rename = "scroll_offset", with = "view_serde")]
+    view: View,
     /// Gap between columns in pixels (always >= 0).
     gap: i32,
     /// Gap at the edges of the viewport (always >= 0).
@@ -358,9 +424,6 @@ pub struct Workspace {
     default_column_width: i32,
     /// Centering mode for focus changes.
     centering_mode: CenteringMode,
-    /// Active scroll animation, if any.
-    #[serde(skip)]
-    active_animation: Option<ScrollAnimation>,
     /// Floating windows outside the tiling layout.
     #[serde(default)]
     floating_windows: Vec<FloatingWindow>,
@@ -377,13 +440,11 @@ impl Default for Workspace {
         Self {
             columns: Vec::new(),
             focused_column: 0,
-            focused_window_in_column: 0,
-            scroll_offset: 0.0,
+            view: View::default(),
             gap: DEFAULT_GAP,
             outer_gap: DEFAULT_OUTER_GAP,
             default_column_width: DEFAULT_COLUMN_WIDTH,
             centering_mode: CenteringMode::default(),
-            active_animation: None,
             floating_windows: Vec::new(),
             fullscreen_window: None,
             minimized_windows: HashSet::new(),
@@ -454,24 +515,22 @@ impl Workspace {
     ///
     /// Returns true if the window was found and removed, false otherwise.
     pub fn remove_floating(&mut self, window_id: WindowId) -> bool {
-        if let Some(pos) = self.floating_windows.iter().position(|f| f.id == window_id) {
-            self.floating_windows.remove(pos);
-            if self.fullscreen_window == Some(window_id) {
-                self.fullscreen_window = None;
-            }
-            true
-        } else {
-            false
-        }
+        let before = self.floating_windows.len();
+        self.floating_windows.retain(|f| f.id != window_id);
+        self.floating_windows.len() != before
     }
 
-    /// Update the position/size of a floating window.
+    /// Record a new position/size for a floating window (e.g. after the user
+    /// moved or resized it), so later placements keep it there.
+    ///
+    /// Returns false if `window_id` is not a floating window of this workspace.
     pub fn update_floating(&mut self, window_id: WindowId, rect: Rect) -> bool {
-        if let Some(floating) = self.floating_windows.iter_mut().find(|f| f.id == window_id) {
-            floating.rect = rect;
-            true
-        } else {
-            false
+        match self.floating_windows.iter_mut().find(|f| f.id == window_id) {
+            Some(floating) => {
+                floating.rect = rect;
+                true
+            }
+            None => false,
         }
     }
 
@@ -480,33 +539,72 @@ impl Workspace {
         &self.floating_windows
     }
 
-    /// Get the total width of the strip (sum of all column widths + gaps).
-    ///
-    /// Note: Negative gaps are treated as zero for calculation purposes.
-    pub fn total_width(&self) -> i32 {
-        if self.columns.is_empty() {
-            return 0;
-        }
-
-        // Defensively clamp gaps to >= 0 in case fields were set directly
-        let gap = self.gap.max(0);
-        let outer_gap = self.outer_gap.max(0);
-
-        let column_widths: i32 = self
-            .columns
-            .iter()
-            .map(|c| c.width)
-            .fold(0i32, |acc, w| acc.saturating_add(w));
-        let gaps = gap.saturating_mul(self.columns.len().saturating_sub(1) as i32);
-        let outer_gaps = outer_gap.saturating_mul(2);
-
-        column_widths
-            .saturating_add(gaps)
-            .saturating_add(outer_gaps)
+    /// Gap and outer gap, defensively clamped to >= 0 (fields may come from
+    /// deserialized state).
+    fn gaps(&self) -> (i32, i32) {
+        (self.gap.max(0), self.outer_gap.max(0))
     }
 
-    /// Insert a new window as a new column to the right of the focused column.
-    /// Column width is clamped to MIN_COLUMN_WIDTH (100px) minimum.
+    /// Whether a column has at least one non-minimized window. Columns without
+    /// one take no space on the strip.
+    fn column_is_visible(&self, column: &Column) -> bool {
+        column
+            .windows
+            .iter()
+            .any(|w| !self.minimized_windows.contains(w))
+    }
+
+    /// First non-minimized row of column `col`, searching down from `from`
+    /// (inclusive) and then up.
+    fn nearest_visible(&self, col: usize, from: usize) -> Option<usize> {
+        let windows = &self.columns.get(col)?.windows;
+        let visible = |i: &usize| !self.minimized_windows.contains(&windows[*i]);
+        (from..windows.len())
+            .find(visible)
+            .or_else(|| (0..from.min(windows.len())).rev().find(visible))
+    }
+
+    /// Get the total width of the strip (visible column widths + gaps).
+    pub fn total_width(&self) -> i32 {
+        let (gap, outer_gap) = self.gaps();
+        let (count, widths) = self
+            .columns
+            .iter()
+            .filter(|c| self.column_is_visible(c))
+            .fold((0i32, 0i32), |(n, sum), c| {
+                (n.saturating_add(1), sum.saturating_add(c.width))
+            });
+        if count == 0 {
+            return 0;
+        }
+        widths
+            .saturating_add(gap.saturating_mul(count - 1))
+            .saturating_add(outer_gap.saturating_mul(2))
+    }
+
+    /// Largest valid scroll offset for a viewport of `viewport_width`.
+    fn max_scroll(&self, viewport_width: i32) -> f64 {
+        f64::from(self.total_width().saturating_sub(viewport_width).max(0))
+    }
+
+    /// Clamp a finite offset into the valid scroll range.
+    fn clamp_offset(&self, offset: f64, viewport_width: i32) -> f64 {
+        offset.clamp(0.0, self.max_scroll(viewport_width))
+    }
+
+    /// Commit focus to `(col, row)`. This is the only place tiled focus moves;
+    /// fullscreen ends when focus lands on a different window.
+    fn set_focus_to(&mut self, col: usize, row: usize) {
+        self.focused_column = col;
+        self.columns[col].focused_row = row;
+        if self.fullscreen_window.is_some() && self.fullscreen_window != self.focused_window() {
+            self.fullscreen_window = None;
+        }
+    }
+
+    /// Insert a new window as a new column to the right of the focused column;
+    /// the new window takes focus. Shorthand for
+    /// `insert_window_with(window_id, width, InsertFocus::Take)`.
     ///
     /// # Errors
     ///
@@ -516,341 +614,141 @@ impl Workspace {
         window_id: WindowId,
         width: Option<i32>,
     ) -> Result<(), LayoutError> {
-        if self.contains_window(window_id) {
-            return Err(LayoutError::DuplicateWindow(window_id));
-        }
-
-        let column_width = width
-            .unwrap_or(self.default_column_width)
-            .max(MIN_COLUMN_WIDTH);
-        let new_column = Column::new(window_id, column_width);
-
-        if self.columns.is_empty() {
-            self.columns.push(new_column);
-            self.focused_column = 0;
-        } else {
-            // Insert to the right of the focused column
-            let insert_pos = self.focused_column + 1;
-            self.columns.insert(insert_pos, new_column);
-            self.focused_column = insert_pos;
-        }
-        self.focused_window_in_column = 0;
-
-        debug_assert!(
-            self.focused_column < self.columns.len(),
-            "Invariant violation: focused_column out of bounds after insert"
-        );
-
-        Ok(())
+        self.insert_window_with(window_id, width, InsertFocus::Take)
     }
 
-    /// Insert a window without changing the current focus.
-    ///
-    /// Same as `insert_window`, but preserves `focused_column` and
-    /// `focused_window_in_column` so that the user's keyboard position
-    /// is not stolen by the new window. Used when `focus_new_windows=false`.
+    /// Insert a new window as a new column to the right of the focused column.
+    /// Column width defaults to `default_column_width` and is clamped to
+    /// MIN_COLUMN_WIDTH (100px) minimum. `focus` decides whether the new window
+    /// takes focus (it always does in an empty workspace).
     ///
     /// # Errors
     ///
     /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
-    pub fn insert_window_no_focus(
+    pub fn insert_window_with(
         &mut self,
         window_id: WindowId,
         width: Option<i32>,
-    ) -> Result<(), LayoutError> {
-        let saved_col = self.focused_column;
-        let saved_win = self.focused_window_in_column;
-
-        self.insert_window(window_id, width)?;
-
-        // insert_window inserts at saved_col + 1 (or 0 if was empty).
-        // If the workspace was empty, there's nothing to restore.
-        if saved_col < self.columns.len() && self.columns.len() > 1 {
-            // The new column was inserted at saved_col + 1, which shifted
-            // nothing before it, so saved_col is still valid.
-            self.focused_column = saved_col;
-            self.focused_window_in_column = saved_win;
-        }
-
-        Ok(())
-    }
-
-    /// Insert a window into an existing column (stacking).
-    ///
-    /// # Errors
-    ///
-    /// Returns `LayoutError::ColumnOutOfBounds` if the column index is invalid.
-    /// Returns `LayoutError::DuplicateWindow` if the window ID already exists.
-    pub fn insert_window_in_column(
-        &mut self,
-        window_id: WindowId,
-        column_index: usize,
+        focus: InsertFocus,
     ) -> Result<(), LayoutError> {
         if self.contains_window(window_id) {
             return Err(LayoutError::DuplicateWindow(window_id));
         }
 
-        if column_index >= self.columns.len() {
-            return Err(LayoutError::ColumnOutOfBounds(
-                column_index,
-                self.columns.len().saturating_sub(1),
-            ));
-        }
+        let column_width = width.unwrap_or(self.default_column_width);
+        let insert_pos = if self.columns.is_empty() {
+            0
+        } else {
+            self.focused_column + 1
+        };
+        self.columns
+            .insert(insert_pos, Column::new(window_id, column_width));
 
-        self.columns[column_index].add_window(window_id);
+        if focus == InsertFocus::Take || self.columns.len() == 1 {
+            self.set_focus_to(insert_pos, 0);
+        }
         Ok(())
     }
 
     /// Remove a window from the workspace.
     /// If removing the last window from a column, the column is removed.
-    /// If removing the last column, the workspace becomes empty.
+    /// If removing the last column, the workspace becomes empty and the view resets.
     ///
     /// # Focus Policy
     ///
-    /// When removing a window from a stacked column:
-    /// - If removed window was before the focused window, focus index decrements to stay on same window
-    /// - If removed window was the focused window, focus moves to next window (or previous if at end)
-    /// - If removed window was after the focused window, focus index stays the same
+    /// Every column remembers its focused row (see [`Column::remove_window`]).
+    /// When the focused column disappears, focus moves to the column that slid
+    /// into its place (or the new last column).
     pub fn remove_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
-        for (col_idx, column) in self.columns.iter_mut().enumerate() {
-            if let Some(removed_idx) = column.remove_window(window_id) {
-                // Also clear from minimized set
-                self.minimized_windows.remove(&window_id);
-                if self.fullscreen_window == Some(window_id) {
-                    self.fullscreen_window = None;
-                }
+        let (col_idx, _) = self
+            .find_window_location(window_id)
+            .ok_or(LayoutError::WindowNotFound(window_id))?;
 
-                // If column is now empty, remove it
-                if column.is_empty() {
-                    self.columns.remove(col_idx);
-                    if self.columns.is_empty() {
-                        // Workspace is now empty - reset all state
-                        self.focused_column = 0;
-                        self.focused_window_in_column = 0;
-                        self.scroll_offset = 0.0;
-                    } else if self.focused_column >= self.columns.len() {
-                        self.focused_column = self.columns.len() - 1;
-                    } else if self.focused_column > col_idx {
-                        self.focused_column -= 1;
-                    }
-                } else {
-                    // Adjust focused window in column if this is the focused column
-                    if col_idx == self.focused_column {
-                        let col_len = self.columns[self.focused_column].len();
-                        if removed_idx < self.focused_window_in_column {
-                            // Removed window was before focused - decrement to stay on same window
-                            self.focused_window_in_column -= 1;
-                        } else if removed_idx == self.focused_window_in_column {
-                            // Removed the focused window - move to next (or previous if at end)
-                            if self.focused_window_in_column >= col_len {
-                                self.focused_window_in_column = col_len.saturating_sub(1);
-                            }
-                            // If focus index is still valid, it now points to the "next" window
-                            // (which slid into this position), which is the expected behavior
-                        }
-                        // If removed_idx > focused_window_in_column, no adjustment needed
-                    }
-                }
+        self.minimized_windows.remove(&window_id);
+        self.clear_fullscreen_if_window(window_id);
 
-                self.clamp_focus_indices();
-
-                debug_assert!(
-                    self.columns.is_empty() || self.focused_column < self.columns.len(),
-                    "Invariant violation: focused_column out of bounds after remove"
-                );
-                debug_assert!(
-                    self.columns.is_empty()
-                        || self.focused_window_in_column < self.columns[self.focused_column].len(),
-                    "Invariant violation: focused_window_in_column out of bounds after remove"
-                );
-
-                return Ok(());
+        let column = &mut self.columns[col_idx];
+        column.remove_window(window_id);
+        if column.is_empty() {
+            self.columns.remove(col_idx);
+            if self.columns.is_empty() {
+                self.focused_column = 0;
+                self.view = View::default();
+            } else if self.focused_column >= self.columns.len() {
+                self.focused_column = self.columns.len() - 1;
+            } else if self.focused_column > col_idx {
+                self.focused_column -= 1;
             }
         }
-        Err(LayoutError::WindowNotFound(window_id))
+        Ok(())
     }
 
-    /// Move focus to the column on the left, skipping columns where all
-    /// windows are minimized. Within the target column, adjusts the
-    /// focused window index to a non-minimized window.
+    /// Move focus to the nearest column on the left that has a visible window.
     pub fn focus_left(&mut self) {
-        let start = self.focused_column;
-        while self.focused_column > 0 {
-            self.focused_column -= 1;
-            // Clamp focused window in column
-            let col_len = self.columns[self.focused_column].len();
-            if self.focused_window_in_column >= col_len {
-                self.focused_window_in_column = col_len.saturating_sub(1);
-            }
-            // Skip columns where every window is minimized
-            if self.has_visible_window_in_column(self.focused_column) {
-                self.adjust_focus_to_visible_in_column();
-                break;
-            }
-        }
-        // If we didn't find a visible column, stay at original
-        if !self.has_visible_window_in_column(self.focused_column) {
-            self.focused_column = start;
-            if let Some(col) = self.columns.get(self.focused_column) {
-                if self.focused_window_in_column >= col.len() {
-                    self.focused_window_in_column = col.len().saturating_sub(1);
-                }
-            }
-        }
-
-        self.clamp_focus_indices();
-        if self.has_visible_window_in_column(self.focused_column) {
-            self.adjust_focus_to_visible_in_column();
-        }
-
-        debug_assert!(
-            self.columns.is_empty()
-                || (self.focused_column < self.columns.len()
-                    && self.focused_window_in_column < self.columns[self.focused_column].len()),
-            "Invariant violation: focus indices out of bounds after focus_left"
-        );
+        self.focus_horizontal(Direction::Left);
     }
 
-    /// Move focus to the column on the right, skipping columns where all
-    /// windows are minimized. Within the target column, adjusts the
-    /// focused window index to a non-minimized window.
+    /// Move focus to the nearest column on the right that has a visible window.
     pub fn focus_right(&mut self) {
-        let start = self.focused_column;
-        while self.focused_column + 1 < self.columns.len() {
-            self.focused_column += 1;
-            // Clamp focused window in column
-            let col_len = self.columns[self.focused_column].len();
-            if self.focused_window_in_column >= col_len {
-                self.focused_window_in_column = col_len.saturating_sub(1);
-            }
-            // Skip columns where every window is minimized
-            if self.has_visible_window_in_column(self.focused_column) {
-                self.adjust_focus_to_visible_in_column();
-                break;
-            }
-        }
-        // If we didn't find a visible column, stay at original
-        if !self.has_visible_window_in_column(self.focused_column) {
-            self.focused_column = start;
-            if let Some(col) = self.columns.get(self.focused_column) {
-                if self.focused_window_in_column >= col.len() {
-                    self.focused_window_in_column = col.len().saturating_sub(1);
-                }
-            }
-        }
+        self.focus_horizontal(Direction::Right);
+    }
 
-        self.clamp_focus_indices();
-        if self.has_visible_window_in_column(self.focused_column) {
-            self.adjust_focus_to_visible_in_column();
+    /// Move focus to the nearest column in `dir` that has a visible window,
+    /// landing on its remembered row (or the nearest visible one). Fully
+    /// minimized columns are skipped. Without such a column focus stays in the
+    /// current column, stepping off a minimized row if needed. Nothing is
+    /// mutated until the target is known.
+    fn focus_horizontal(&mut self, dir: Direction) {
+        let current = self.focused_column;
+        let is_target = |c: &usize| self.column_is_visible(&self.columns[*c]);
+        let target = match dir {
+            Direction::Left => (0..current).rev().find(is_target),
+            Direction::Right => (current + 1..self.columns.len()).find(is_target),
         }
+        .unwrap_or(current);
 
-        debug_assert!(
-            self.columns.is_empty()
-                || (self.focused_column < self.columns.len()
-                    && self.focused_window_in_column < self.columns[self.focused_column].len()),
-            "Invariant violation: focus indices out of bounds after focus_right"
-        );
+        let Some(column) = self.columns.get(target) else {
+            return;
+        };
+        if let Some(row) = self.nearest_visible(target, column.focused_row) {
+            self.set_focus_to(target, row);
+        }
     }
 
     /// Move focus to the window above in the current column, skipping
     /// minimized windows.
     pub fn focus_up(&mut self) {
-        if let Some(column) = self.columns.get(self.focused_column) {
-            let mut target = self.focused_window_in_column;
-            while target > 0 {
-                target -= 1;
-                if !self.minimized_windows.contains(&column.windows[target]) {
-                    self.focused_window_in_column = target;
-                    return;
-                }
-            }
+        let col = self.focused_column;
+        let Some(column) = self.columns.get(col) else {
+            return;
+        };
+        let target = (0..column.focused_row)
+            .rev()
+            .find(|&r| !self.minimized_windows.contains(&column.windows[r]));
+        if let Some(row) = target {
+            self.set_focus_to(col, row);
         }
     }
 
     /// Move focus to the window below in the current column, skipping
     /// minimized windows.
     pub fn focus_down(&mut self) {
-        if let Some(column) = self.columns.get(self.focused_column) {
-            let mut target = self.focused_window_in_column;
-            while target + 1 < column.len() {
-                target += 1;
-                if !self.minimized_windows.contains(&column.windows[target]) {
-                    self.focused_window_in_column = target;
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Clamp focus indices to valid column/window bounds.
-    fn clamp_focus_indices(&mut self) {
-        if self.columns.is_empty() {
-            self.focused_column = 0;
-            self.focused_window_in_column = 0;
+        let col = self.focused_column;
+        let Some(column) = self.columns.get(col) else {
             return;
-        }
-
-        if self.focused_column >= self.columns.len() {
-            self.focused_column = self.columns.len() - 1;
-        }
-
-        let col_len = self.columns[self.focused_column].len();
-        if col_len == 0 {
-            self.focused_window_in_column = 0;
-            return;
-        }
-
-        if self.focused_window_in_column >= col_len {
-            self.focused_window_in_column = col_len - 1;
-        }
-    }
-
-    /// Check if a column has at least one non-minimized window.
-    fn has_visible_window_in_column(&self, col_idx: usize) -> bool {
-        self.columns.get(col_idx).is_some_and(|col| {
-            col.windows
-                .iter()
-                .any(|w| !self.minimized_windows.contains(w))
-        })
-    }
-
-    /// If the current `focused_window_in_column` points to a minimized window,
-    /// shift it to the nearest non-minimized window in the same column.
-    /// Searches downward first, then upward.
-    fn adjust_focus_to_visible_in_column(&mut self) {
-        let col = match self.columns.get(self.focused_column) {
-            Some(c) => c,
-            None => return,
         };
-        let cur = self.focused_window_in_column;
-        // Already pointing at a visible window — nothing to do
-        if cur < col.len() && !self.minimized_windows.contains(&col.windows[cur]) {
-            return;
+        let target = (column.focused_row + 1..column.len())
+            .find(|&r| !self.minimized_windows.contains(&column.windows[r]));
+        if let Some(row) = target {
+            self.set_focus_to(col, row);
         }
-        // Search downward from current index
-        for i in cur..col.len() {
-            if !self.minimized_windows.contains(&col.windows[i]) {
-                self.focused_window_in_column = i;
-                return;
-            }
-        }
-        // Search upward from current index
-        for i in (0..cur).rev() {
-            if !self.minimized_windows.contains(&col.windows[i]) {
-                self.focused_window_in_column = i;
-                return;
-            }
-        }
-        // All minimized — leave index as is (has_visible_window_in_column
-        // should have prevented us from landing here).
     }
 
     /// Get the currently focused window ID.
     pub fn focused_window(&self) -> Option<WindowId> {
         self.columns
             .get(self.focused_column)
-            .and_then(|col| col.windows.get(self.focused_window_in_column))
-            .copied()
+            .and_then(|col| col.get(col.focused_row))
     }
 
     /// Get the focused window ID, but only if it is not minimized.
@@ -858,27 +756,8 @@ impl Workspace {
     /// Returns `None` if the workspace is empty or every window is minimized.
     pub fn focused_visible_window(&self) -> Option<WindowId> {
         let col = self.columns.get(self.focused_column)?;
-        let cur = self.focused_window_in_column;
-
-        // Check the exact focused index first
-        if let Some(&wid) = col.windows.get(cur) {
-            if !self.minimized_windows.contains(&wid) {
-                return Some(wid);
-            }
-        }
-
-        // Search downward then upward for a visible window
-        for i in cur..col.len() {
-            if !self.minimized_windows.contains(&col.windows[i]) {
-                return Some(col.windows[i]);
-            }
-        }
-        for i in (0..cur).rev() {
-            if !self.minimized_windows.contains(&col.windows[i]) {
-                return Some(col.windows[i]);
-            }
-        }
-        None
+        let row = self.nearest_visible(self.focused_column, col.focused_row)?;
+        col.get(row)
     }
 
     /// Get the index of the currently focused column.
@@ -888,12 +767,14 @@ impl Workspace {
 
     /// Get the index of the focused window within the focused column.
     pub fn focused_window_index_in_column(&self) -> usize {
-        self.focused_window_in_column
+        self.columns
+            .get(self.focused_column)
+            .map_or(0, |col| col.focused_row)
     }
 
-    /// Get the current scroll offset.
+    /// Get the scroll offset currently on screen (mid-animation if one is running).
     pub fn scroll_offset(&self) -> f64 {
-        self.scroll_offset
+        self.view.current()
     }
 
     /// Get a slice of all columns.
@@ -906,15 +787,18 @@ impl Workspace {
         self.columns.get(index)
     }
 
-    /// Find a window's location in the workspace.
-    /// Returns (column_index, window_index_in_column) if found.
-    pub fn find_window_location(&self, window_id: WindowId) -> Option<(usize, usize)> {
-        for (col_idx, column) in self.columns.iter().enumerate() {
-            if let Some(win_idx) = column.windows.iter().position(|&w| w == window_id) {
-                return Some((col_idx, win_idx));
-            }
-        }
-        None
+    /// Find a window's tiled location as `(column_index, window_index_in_column)`.
+    fn find_window_location(&self, window_id: WindowId) -> Option<(usize, usize)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .find_map(|(col_idx, column)| {
+                column
+                    .windows
+                    .iter()
+                    .position(|&w| w == window_id)
+                    .map(|win_idx| (col_idx, win_idx))
+            })
     }
 
     /// Get total window count across all columns.
@@ -978,169 +862,173 @@ impl Workspace {
         self.centering_mode = mode;
     }
 
-    /// Set focus to a specific column and window index with validation.
+    /// Focus a tiled window by its ID.
     ///
     /// # Errors
     ///
-    /// Returns `LayoutError::ColumnOutOfBounds` if the column index is invalid.
-    /// Returns `LayoutError::WindowIndexOutOfBounds` if the window index is invalid.
-    pub fn set_focus(&mut self, column: usize, window_in_column: usize) -> Result<(), LayoutError> {
-        if column >= self.columns.len() {
-            return Err(LayoutError::ColumnOutOfBounds(
-                column,
-                self.columns.len().saturating_sub(1),
-            ));
-        }
-
-        let col_len = self.columns[column].len();
-        if window_in_column >= col_len {
-            return Err(LayoutError::WindowIndexOutOfBounds(
-                window_in_column,
-                column,
-                col_len.saturating_sub(1),
-            ));
-        }
-
-        self.focused_column = column;
-        self.focused_window_in_column = window_in_column;
+    /// Returns `LayoutError::WindowNotFound` if the window is not tiled in the workspace.
+    pub fn focus_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
+        let (col, row) = self
+            .find_window_location(window_id)
+            .ok_or(LayoutError::WindowNotFound(window_id))?;
+        self.set_focus_to(col, row);
         Ok(())
     }
 
-    /// Focus a window by its ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns `LayoutError::WindowNotFound` if the window is not in the workspace.
-    pub fn focus_window(&mut self, window_id: WindowId) -> Result<(), LayoutError> {
-        for (col_idx, column) in self.columns.iter().enumerate() {
-            if let Some(win_idx) = column.windows.iter().position(|&w| w == window_id) {
-                self.focused_column = col_idx;
-                self.focused_window_in_column = win_idx;
-                return Ok(());
-            }
-        }
-        Err(LayoutError::WindowNotFound(window_id))
-    }
-
-    /// Calculate the x-coordinate of a column's left edge on the strip.
-    ///
-    /// Note: Negative gaps are treated as zero for calculation purposes.
+    /// Strip x-coordinate of a column's left edge. Columns without a visible
+    /// window before it take no space.
     fn column_x(&self, column_index: usize) -> i32 {
-        // Defensively clamp gaps to >= 0
-        let gap = self.gap.max(0);
-        let outer_gap = self.outer_gap.max(0);
-
-        let mut x = outer_gap;
-        for (i, col) in self.columns.iter().enumerate() {
-            if i == column_index {
-                return x;
-            }
-            x = x.saturating_add(col.width).saturating_add(gap);
-        }
-        x
+        let (gap, outer_gap) = self.gaps();
+        self.columns[..column_index.min(self.columns.len())]
+            .iter()
+            .filter(|c| self.column_is_visible(c))
+            .fold(outer_gap, |x, c| {
+                x.saturating_add(c.width).saturating_add(gap)
+            })
     }
 
-    /// Get the x-coordinate and width of the focused column.
-    fn focused_column_bounds(&self) -> Option<(i32, i32)> {
-        self.columns.get(self.focused_column).map(|col| {
-            let x = self.column_x(self.focused_column);
-            (x, col.width)
-        })
-    }
-
-    /// Ensure the focused column is visible in the viewport.
-    /// Adjusts scroll_offset according to the centering mode.
-    ///
-    /// Note: Negative gaps are treated as zero for calculation purposes.
-    pub fn ensure_focused_visible(&mut self, viewport_width: i32) {
-        if self.columns.is_empty() {
-            return;
-        }
-
-        let Some((col_x, col_width)) = self.focused_column_bounds() else {
-            return;
+    /// Scroll offset that brings the focused column into view according to the
+    /// centering mode. Returns the current target when no scroll is needed or
+    /// the focused column has no visible window. The result is not clamped.
+    fn focus_target_offset(&self, viewport_width: i32) -> f64 {
+        let current = self.view.target();
+        let Some(column) = self
+            .columns
+            .get(self.focused_column)
+            .filter(|c| self.column_is_visible(c))
+        else {
+            return current;
         };
 
-        // Defensively clamp outer_gap to >= 0
-        let outer_gap = self.outer_gap.max(0);
+        let (_, outer_gap) = self.gaps();
+        let col_x = self.column_x(self.focused_column);
+        let col_width = column.width;
+
+        // A column that cannot fit is left-aligned in every mode (like niri):
+        // centering would cut off its left edge, and fitting it from either side
+        // would flip between two targets on every focus.
+        if col_width.saturating_add(outer_gap.saturating_mul(2)) >= viewport_width {
+            return f64::from(col_x.saturating_sub(outer_gap));
+        }
 
         match self.centering_mode {
             CenteringMode::Center => {
-                // Center the focused column in the viewport
                 let col_center = col_x.saturating_add(col_width / 2);
-                self.scroll_offset = (col_center.saturating_sub(viewport_width / 2)) as f64;
+                f64::from(col_center.saturating_sub(viewport_width / 2))
             }
             CenteringMode::JustInView => {
-                // Only scroll if the focused column is outside the viewport
-                // Use rounding instead of truncation for consistent behavior
-                let viewport_left = self.scroll_offset.round() as i32;
+                let viewport_left = current.round() as i32;
                 let viewport_right = viewport_left.saturating_add(viewport_width);
                 let col_right = col_x.saturating_add(col_width);
-
                 if col_x < viewport_left {
-                    // Column is to the left of viewport, scroll left
-                    self.scroll_offset = col_x.saturating_sub(outer_gap) as f64;
+                    f64::from(col_x.saturating_sub(outer_gap))
                 } else if col_right > viewport_right {
-                    // Column is to the right of viewport, scroll right
-                    self.scroll_offset = col_right
-                        .saturating_add(outer_gap)
-                        .saturating_sub(viewport_width)
-                        as f64;
+                    f64::from(
+                        col_right
+                            .saturating_add(outer_gap)
+                            .saturating_sub(viewport_width),
+                    )
+                } else {
+                    current
                 }
             }
         }
-
-        // Clamp scroll offset to valid range
-        let max_scroll = (self.total_width() - viewport_width).max(0);
-        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
     }
 
-    /// Compute placements for all windows given a viewport.
+    /// Ensure the focused column is visible in the viewport, jumping there
+    /// immediately (any running animation is replaced). The offset is clamped
+    /// to the valid range.
+    pub fn ensure_focused_visible(&mut self, viewport_width: i32) {
+        let target = self.focus_target_offset(viewport_width);
+        self.view = View::Static(self.clamp_offset(target, viewport_width));
+    }
+
+    /// Ensure the focused column is visible, animating the scroll. An animation
+    /// already heading to the same target keeps running.
+    pub fn ensure_focused_visible_animated(&mut self, viewport_width: i32) {
+        let target = self.focus_target_offset(viewport_width);
+        self.animate_to(
+            target,
+            viewport_width,
+            DEFAULT_ANIMATION_DURATION_MS,
+            Easing::default(),
+        );
+    }
+
+    /// Compute placements for all windows at the offset currently on screen
+    /// (following any running scroll animation).
     ///
-    /// Returns a list of WindowPlacement structs indicating where each window
-    /// should be positioned and whether it's visible or off-screen.
-    ///
-    /// Note: Negative gaps are treated as zero for calculation purposes.
+    /// Tiled windows come first in column order, then floating windows
+    /// (`column_index == usize::MAX`). Minimized windows are omitted. While a
+    /// window is fullscreen it covers the viewport and every other window is
+    /// reported off-screen with an empty rect.
     pub fn compute_placements(&self, viewport: Rect) -> Vec<WindowPlacement> {
-        // Use rounding instead of truncation to prevent sub-pixel jitter
-        let viewport_left = self.scroll_offset.round() as i32;
+        let mut placements = self.strip_placements(viewport);
+        placements.extend(
+            self.floating_windows
+                .iter()
+                .map(|floating| WindowPlacement {
+                    window_id: floating.id,
+                    rect: floating.rect,
+                    visibility: Visibility::Visible,
+                    column_index: usize::MAX, // Sentinel for floating windows
+                }),
+        );
 
-        // Fullscreen mode: one window covers the entire viewport, others are off-screen
         if let Some(fs_wid) = self.fullscreen_window {
-            return self.compute_fullscreen_placements(fs_wid, viewport, viewport_left);
+            for placement in &mut placements {
+                if placement.window_id == fs_wid {
+                    placement.rect = viewport;
+                    placement.visibility = Visibility::Visible;
+                } else {
+                    placement.rect = Rect::new(0, 0, 0, 0);
+                    placement.visibility = Visibility::OffScreenLeft;
+                }
+            }
         }
-
-        self.compute_non_fullscreen_placements(viewport, viewport_left)
+        placements
     }
 
-    /// Compute non-fullscreen placements for a specific viewport-left offset.
-    /// Used by both static and animated placement paths.
-    fn compute_non_fullscreen_placements(
-        &self,
-        viewport: Rect,
-        viewport_left: i32,
-    ) -> Vec<WindowPlacement> {
+    /// Placements of the tiled (non-minimized) windows on the strip.
+    fn strip_placements(&self, viewport: Rect) -> Vec<WindowPlacement> {
         let mut placements = Vec::new();
+        let (gap, outer_gap) = self.gaps();
 
-        // Defensively clamp gaps to >= 0 in case fields were set directly
-        let gap = self.gap.max(0);
-        let outer_gap = self.outer_gap.max(0);
-
+        // Use rounding instead of truncation to prevent sub-pixel jitter
+        let viewport_left = self.view.current().round() as i32;
         let viewport_right = viewport_left.saturating_add(viewport.width);
+
+        // Clamp usable_height to >= 0 to handle tight viewports
+        let usable_height = viewport
+            .height
+            .saturating_sub(outer_gap.saturating_mul(2))
+            .max(0);
+        let top = viewport.y.saturating_add(outer_gap);
+        let bottom = viewport
+            .y
+            .saturating_add(viewport.height)
+            .saturating_sub(outer_gap);
 
         let mut current_x = outer_gap;
 
         for (col_idx, column) in self.columns.iter().enumerate() {
-            // Calculate column position in strip coordinates
+            let visible_windows: Vec<WindowId> = column
+                .windows()
+                .iter()
+                .copied()
+                .filter(|w| !self.minimized_windows.contains(w))
+                .collect();
+            // Fully minimized columns take no space on the strip.
+            if visible_windows.is_empty() {
+                continue;
+            }
+
             let col_strip_x = current_x;
             let col_strip_right = col_strip_x.saturating_add(column.width);
-
-            // Transform to screen coordinates (relative to viewport)
             let col_screen_x = col_strip_x
                 .saturating_sub(viewport_left)
                 .saturating_add(viewport.x);
 
-            // Determine visibility
             let visibility = if col_strip_right <= viewport_left {
                 Visibility::OffScreenLeft
             } else if col_strip_x >= viewport_right {
@@ -1149,41 +1037,15 @@ impl Workspace {
                 Visibility::Visible
             };
 
-            // Filter out minimized windows for height calculation
-            let visible_windows: Vec<WindowId> = column
-                .windows()
-                .iter()
-                .copied()
-                .filter(|w| !self.minimized_windows.contains(w))
-                .collect();
+            // Equal split for stacked windows; the last one absorbs rounding.
+            let window_count = i32::try_from(visible_windows.len()).unwrap_or(i32::MAX);
+            let window_gaps = gap.saturating_mul(window_count - 1);
+            let window_height = usable_height.saturating_sub(window_gaps).max(0) / window_count;
 
-            // Calculate window heights (equal split for stacked windows)
-            // Clamp usable_height to >= 0 to handle tight viewports
-            // Use saturating arithmetic to prevent overflow
-            let usable_height = viewport
-                .height
-                .saturating_sub(outer_gap.saturating_mul(2))
-                .max(0);
-            let window_count = visible_windows.len() as i32;
-            let window_gaps = if window_count > 1 {
-                gap.saturating_mul(window_count - 1)
-            } else {
-                0
-            };
-            // Clamp window_height to >= 0 to prevent negative dimensions
-            let window_height = if window_count > 0 {
-                ((usable_height - window_gaps).max(0)) / window_count
-            } else {
-                0
-            };
-
-            let mut current_y = viewport.y + outer_gap;
-
+            let mut current_y = top;
             for (win_idx, &window_id) in visible_windows.iter().enumerate() {
-                // Adjust height for last visible window to handle rounding
-                // Clamp to >= 0 to prevent negative dimensions
                 let height = if win_idx == visible_windows.len() - 1 {
-                    (viewport.y + viewport.height - outer_gap - current_y).max(0)
+                    bottom.saturating_sub(current_y).max(0)
                 } else {
                     window_height
                 };
@@ -1201,24 +1063,13 @@ impl Workspace {
             current_x = current_x.saturating_add(column.width).saturating_add(gap);
         }
 
-        // Add floating windows (always visible, at their absolute positions)
-        for floating in &self.floating_windows {
-            placements.push(WindowPlacement {
-                window_id: floating.id,
-                rect: floating.rect,
-                visibility: Visibility::Visible,
-                column_index: usize::MAX, // Sentinel for floating windows
-            });
-        }
-
         placements
     }
 
     /// Resize the focused column by a delta amount.
     pub fn resize_focused_column(&mut self, delta: i32) {
         if let Some(column) = self.columns.get_mut(self.focused_column) {
-            let new_width = column.width.saturating_add(delta).max(MIN_COLUMN_WIDTH);
-            column.width = new_width;
+            column.set_width(column.width.saturating_add(delta));
         }
     }
 
@@ -1240,15 +1091,26 @@ impl Workspace {
         }
     }
 
-    /// Scroll the viewport by a pixel delta.
+    /// Scroll the viewport by a pixel delta from the offset currently on screen.
+    /// Cancels any running animation; the result is clamped to the valid range.
     ///
-    /// Special float values (NaN, Infinity) are treated as zero for safety.
+    /// Non-finite deltas (NaN, Infinity) are ignored.
     pub fn scroll_by(&mut self, delta: f64, viewport_width: i32) {
-        // Treat NaN and Infinity as zero for safety
-        let safe_delta = if delta.is_finite() { delta } else { 0.0 };
-        self.scroll_offset += safe_delta;
-        let max_scroll = (self.total_width() - viewport_width).max(0);
-        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+        if !delta.is_finite() {
+            return;
+        }
+        let offset = self.view.current() + delta;
+        self.view = View::Static(self.clamp_offset(offset, viewport_width));
+    }
+
+    /// Set the scroll offset directly, e.g. when restoring saved state.
+    /// Cancels any running animation and clamps to the valid range for the
+    /// current windows. Non-finite offsets are ignored.
+    pub fn set_scroll_offset(&mut self, offset: f64, viewport_width: i32) {
+        if !offset.is_finite() {
+            return;
+        }
+        self.view = View::Static(self.clamp_offset(offset, viewport_width));
     }
 
     // ========================================================================
@@ -1257,199 +1119,44 @@ impl Workspace {
 
     /// Check if a scroll animation is currently active.
     pub fn is_animating(&self) -> bool {
-        self.active_animation.is_some()
+        matches!(self.view, View::Animating(_))
     }
 
-    /// Get the current effective scroll offset.
-    /// Returns the animated offset if an animation is active, otherwise the base offset.
-    pub fn effective_scroll_offset(&self) -> f64 {
-        match &self.active_animation {
-            Some(anim) => anim.current_offset(),
-            None => self.scroll_offset,
-        }
-    }
-
-    /// Start an animated scroll to a target offset.
-    /// If an animation is already active, it will be cancelled and a new one started.
-    pub fn start_scroll_animation(
-        &mut self,
-        target: f64,
-        viewport_width: i32,
-        duration_ms: Option<u64>,
-        easing: Option<Easing>,
-    ) {
-        // Clamp target to valid range
-        let max_scroll = (self.total_width() - viewport_width).max(0);
-        let clamped_target = target.clamp(0.0, max_scroll as f64);
-
-        // Use current effective position as start (handles interrupting animations)
-        let start = self.effective_scroll_offset();
-
-        // If already at target, no animation needed
-        if (start - clamped_target).abs() < 0.5 {
-            self.scroll_offset = clamped_target;
-            self.active_animation = None;
+    /// Animate from the offset currently on screen to `target` (clamped).
+    /// An animation already heading to the same target keeps running; a
+    /// zero-duration or zero-distance move completes immediately.
+    fn animate_to(&mut self, target: f64, viewport_width: i32, duration_ms: u64, easing: Easing) {
+        if !target.is_finite() {
             return;
         }
-
-        let duration = duration_ms.unwrap_or(DEFAULT_ANIMATION_DURATION_MS);
-        let ease = easing.unwrap_or_default();
-
-        self.active_animation = Some(ScrollAnimation::new(start, clamped_target, duration, ease));
+        let target = self.clamp_offset(target, viewport_width);
+        if self.is_animating() && (self.view.target() - target).abs() < 0.5 {
+            return;
+        }
+        let start = self.view.current();
+        self.view = if duration_ms == 0 || (start - target).abs() < 0.5 {
+            View::Static(target)
+        } else {
+            View::Animating(ScrollAnimation::new(start, target, duration_ms, easing))
+        };
     }
 
     /// Advance the active animation by the given delta time in milliseconds.
     /// Returns true if an animation is still active, false if complete or no animation.
     pub fn tick_animation(&mut self, delta_ms: u64) -> bool {
-        let Some(anim) = &mut self.active_animation else {
+        let View::Animating(anim) = &mut self.view else {
             return false;
         };
-
-        let still_running = anim.tick(delta_ms);
-
-        if !still_running {
-            // Animation complete - finalize scroll offset and clear animation
-            self.scroll_offset = anim.target();
-            self.active_animation = None;
-            false
-        } else {
-            true
+        if anim.tick(delta_ms) {
+            return true;
         }
-    }
-
-    /// Stop the current animation and snap to the target position.
-    pub fn stop_animation(&mut self) {
-        if let Some(anim) = self.active_animation.take() {
-            self.scroll_offset = anim.target();
-        }
+        self.view = View::Static(anim.target_offset);
+        false
     }
 
     /// Cancel the current animation and stay at the current position.
     pub fn cancel_animation(&mut self) {
-        if let Some(anim) = self.active_animation.take() {
-            self.scroll_offset = anim.current_offset();
-        }
-    }
-
-    /// Ensure the focused column is visible with animation.
-    /// Like `ensure_focused_visible` but animates the scroll instead of jumping.
-    pub fn ensure_focused_visible_animated(&mut self, viewport_width: i32) {
-        if self.columns.is_empty() {
-            return;
-        }
-
-        let Some((col_x, col_width)) = self.focused_column_bounds() else {
-            return;
-        };
-
-        // Defensively clamp outer_gap to >= 0
-        let outer_gap = self.outer_gap.max(0);
-
-        let target_offset = match self.centering_mode {
-            CenteringMode::Center => {
-                // Center the focused column in the viewport
-                let col_center = col_x.saturating_add(col_width / 2);
-                (col_center.saturating_sub(viewport_width / 2)) as f64
-            }
-            CenteringMode::JustInView => {
-                // Only scroll if the focused column is outside the viewport
-                let current = self.effective_scroll_offset();
-                let viewport_left = current.round() as i32;
-                let viewport_right = viewport_left.saturating_add(viewport_width);
-                let col_right = col_x.saturating_add(col_width);
-
-                if col_x < viewport_left {
-                    // Column is to the left of viewport, scroll left
-                    col_x.saturating_sub(outer_gap) as f64
-                } else if col_right > viewport_right {
-                    // Column is to the right of viewport, scroll right
-                    col_right
-                        .saturating_add(outer_gap)
-                        .saturating_sub(viewport_width) as f64
-                } else {
-                    // Already in view, no scroll needed
-                    return;
-                }
-            }
-        };
-
-        self.start_scroll_animation(target_offset, viewport_width, None, None);
-    }
-
-    /// Compute placements for all windows, using animated scroll offset if active.
-    ///
-    /// This is similar to `compute_placements` but uses `effective_scroll_offset()`
-    /// to support smooth scrolling animations.
-    pub fn compute_placements_animated(&self, viewport: Rect) -> Vec<WindowPlacement> {
-        // Use animated scroll offset
-        let viewport_left = self.effective_scroll_offset().round() as i32;
-
-        // Fullscreen mode: one window covers the entire viewport, others are off-screen
-        if let Some(fs_wid) = self.fullscreen_window {
-            return self.compute_fullscreen_placements(fs_wid, viewport, viewport_left);
-        }
-
-        self.compute_non_fullscreen_placements(viewport, viewport_left)
-    }
-
-    /// Compute placements when a window is fullscreen.
-    /// The fullscreen window gets the full viewport; all others are marked off-screen.
-    fn compute_fullscreen_placements(
-        &self,
-        fs_wid: WindowId,
-        viewport: Rect,
-        viewport_left: i32,
-    ) -> Vec<WindowPlacement> {
-        // Stale or minimized fullscreen target: fall back to normal placements.
-        if !self.contains_window(fs_wid) || self.minimized_windows.contains(&fs_wid) {
-            return self.compute_non_fullscreen_placements(viewport, viewport_left);
-        }
-
-        let mut placements = Vec::new();
-
-        for (col_idx, column) in self.columns.iter().enumerate() {
-            for &window_id in column.windows() {
-                if self.minimized_windows.contains(&window_id) {
-                    continue;
-                }
-                if window_id == fs_wid {
-                    placements.push(WindowPlacement {
-                        window_id,
-                        rect: viewport,
-                        visibility: Visibility::Visible,
-                        column_index: col_idx,
-                    });
-                } else {
-                    placements.push(WindowPlacement {
-                        window_id,
-                        rect: Rect::new(0, 0, 0, 0),
-                        visibility: Visibility::OffScreenLeft,
-                        column_index: col_idx,
-                    });
-                }
-            }
-        }
-
-        // Floating windows are also hidden during fullscreen
-        for floating in &self.floating_windows {
-            if floating.id == fs_wid {
-                placements.push(WindowPlacement {
-                    window_id: floating.id,
-                    rect: viewport,
-                    visibility: Visibility::Visible,
-                    column_index: usize::MAX,
-                });
-            } else {
-                placements.push(WindowPlacement {
-                    window_id: floating.id,
-                    rect: Rect::new(0, 0, 0, 0),
-                    visibility: Visibility::OffScreenLeft,
-                    column_index: usize::MAX,
-                });
-            }
-        }
-
-        placements
+        self.view = View::Static(self.view.current());
     }
 
     // ========================================================================
@@ -1466,15 +1173,11 @@ impl Workspace {
     /// Returns `false` if the window is not in this workspace or is floating.
     pub fn mark_minimized(&mut self, window_id: WindowId) -> bool {
         // Only mark tiled windows as minimized (not floating)
-        if self.find_window_location(window_id).is_some() {
-            // If the fullscreen window is being minimized, exit fullscreen
-            if self.fullscreen_window == Some(window_id) {
-                self.fullscreen_window = None;
-            }
-            self.minimized_windows.insert(window_id)
-        } else {
-            false
+        if self.find_window_location(window_id).is_none() {
+            return false;
         }
+        self.clear_fullscreen_if_window(window_id);
+        self.minimized_windows.insert(window_id)
     }
 
     /// Mark a window as restored (no longer minimized).
@@ -1489,19 +1192,9 @@ impl Workspace {
         self.minimized_windows.contains(&window_id)
     }
 
-    /// Get the number of currently minimized windows.
-    pub fn minimized_count(&self) -> usize {
-        self.minimized_windows.len()
-    }
-
     // ========================================================================
     // Fullscreen Methods
     // ========================================================================
-
-    /// Check if a window is currently fullscreen.
-    pub fn is_fullscreen(&self) -> bool {
-        self.fullscreen_window.is_some()
-    }
 
     /// Get the fullscreen window ID, if any.
     pub fn fullscreen_window_id(&self) -> Option<WindowId> {
@@ -1520,69 +1213,56 @@ impl Workspace {
         }
     }
 
-    /// Toggle fullscreen mode for the focused window.
-    /// Returns true if entering fullscreen, false if exiting.
+    /// Toggle fullscreen mode for the focused window. If the focused row is
+    /// minimized, focus first moves to the nearest visible window in the column.
+    /// Returns true if entering fullscreen, false if exiting (or nothing to show).
     pub fn toggle_fullscreen(&mut self) -> bool {
-        if let Some(fs_wid) = self.fullscreen_window {
-            // If fullscreen points at a removed/minimized window, clear stale state
-            // and treat this invocation as a fresh toggle attempt.
-            if !self.contains_window(fs_wid) || self.minimized_windows.contains(&fs_wid) {
-                self.fullscreen_window = None;
-            } else {
-                self.fullscreen_window = None;
-                return false;
-            }
+        if self.fullscreen_window.take().is_some() {
+            return false;
         }
-
-        if let Some(wid) = self.focused_visible_window() {
-            self.fullscreen_window = Some(wid);
-            true
-        } else {
-            self.fullscreen_window = None;
-            false
-        }
+        let col = self.focused_column;
+        let Some(row) = self
+            .columns
+            .get(col)
+            .and_then(|c| self.nearest_visible(col, c.focused_row))
+        else {
+            return false;
+        };
+        self.set_focus_to(col, row);
+        self.fullscreen_window = self.focused_window();
+        true
     }
 
     // ========================================================================
     // Toggle Floating
     // ========================================================================
 
-    /// Toggle floating state for the focused window.
-    /// If the focused window is tiled, move it to floating with a centered rect.
-    /// If the focused window is floating, this is a no-op (floating windows are not focused via column focus).
+    /// Move the focused tiled window to floating, centered with
+    /// [`default_floating_rect`]. Minimized windows are not floated.
     /// Returns the window ID that was toggled, if any.
     pub fn toggle_floating(&mut self, viewport: Rect) -> Option<WindowId> {
         let wid = self.focused_window()?;
-
-        // Defensive guard: if the focused window is currently fullscreen, clear
-        // fullscreen before moving it to floating state.
-        self.clear_fullscreen_if_window(wid);
-
-        // Check if the focused window is tiled (it always is since focus tracks tiled columns)
-        // Remove from columns
-        let _ = self.remove_window(wid);
-
-        // Center a floating window of 800x600 or clamped to viewport
-        let float_w = 800.min(viewport.width - 40);
-        let float_h = 600.min(viewport.height - 40);
-        let float_x = viewport.x + (viewport.width - float_w) / 2;
-        let float_y = viewport.y + (viewport.height - float_h) / 2;
-        let rect = Rect::new(float_x, float_y, float_w, float_h);
-
-        let _ = self.add_floating(wid, rect);
+        if self.is_minimized(wid) {
+            return None;
+        }
+        // Clears fullscreen if `wid` was the fullscreen window.
+        self.remove_window(wid).ok()?;
+        self.floating_windows.push(FloatingWindow {
+            id: wid,
+            rect: default_floating_rect(viewport),
+        });
         Some(wid)
     }
 
     /// Move a floating window back to the tiling layout.
     /// Returns true if the window was unfloated.
     pub fn unfloat_window(&mut self, window_id: WindowId) -> bool {
-        if self.remove_floating(window_id) {
-            // Insert as a new column
-            let _ = self.insert_window(window_id, None);
-            true
-        } else {
-            false
+        if !self.remove_floating(window_id) {
+            return false;
         }
+        // Cannot fail: the id was just removed and ids are unique.
+        let _ = self.insert_window(window_id, None);
+        true
     }
 
     // ========================================================================
@@ -1590,48 +1270,83 @@ impl Workspace {
     // ========================================================================
 
     /// Set the focused column's width as a fraction of the viewport width.
-    /// Fraction should be between 0.1 and 1.0.
+    /// Fraction is clamped to 0.1..=1.0. Gaps are accounted for so that N
+    /// columns of `1/N` (plus gaps) fill the viewport exactly up to rounding
+    /// down: `width = (usable + gap) * fraction - gap`, `usable = viewport - 2 * outer_gap`.
     pub fn set_focused_column_width_fraction(&mut self, fraction: f64, viewport_width: i32) {
+        if !fraction.is_finite() {
+            return;
+        }
         let fraction = fraction.clamp(0.1, 1.0);
-        let outer_gap = self.outer_gap.max(0);
-        let usable_width = viewport_width.saturating_sub(outer_gap * 2);
-        let new_width = (usable_width as f64 * fraction).round() as i32;
+        let (gap, outer_gap) = self.gaps();
+        let usable_width = viewport_width.saturating_sub(outer_gap.saturating_mul(2));
+        let share = (f64::from(usable_width.saturating_add(gap)) * fraction).floor() as i32;
 
         if let Some(column) = self.columns.get_mut(self.focused_column) {
-            column.set_width(new_width);
+            column.set_width(share.saturating_sub(gap));
         }
     }
 
-    /// Equalize all column widths to share the viewport equally.
+    /// Equalize the widths of all visible columns so they share the viewport
+    /// equally. Fully minimized columns take no width and keep their own.
     pub fn equalize_column_widths(&mut self, viewport_width: i32) {
-        if self.columns.is_empty() {
+        let visible: Vec<bool> = self
+            .columns
+            .iter()
+            .map(|c| self.column_is_visible(c))
+            .collect();
+        let count = visible.iter().filter(|&&v| v).count();
+        if count == 0 {
             return;
         }
 
-        let outer_gap = self.outer_gap.max(0);
-        let gap = self.gap.max(0);
-        let n = self.columns.len() as i32;
-        let total_gaps = gap * (n - 1) + outer_gap * 2;
-        let per_column = ((viewport_width - total_gaps).max(MIN_COLUMN_WIDTH * n)) / n;
+        let (gap, outer_gap) = self.gaps();
+        let n = i32::try_from(count).unwrap_or(i32::MAX);
+        let total_gaps = gap
+            .saturating_mul(n - 1)
+            .saturating_add(outer_gap.saturating_mul(2));
+        let per_column = viewport_width
+            .saturating_sub(total_gaps)
+            .max(MIN_COLUMN_WIDTH.saturating_mul(n))
+            / n;
 
-        for col in &mut self.columns {
+        for (col, _) in self.columns.iter_mut().zip(visible).filter(|(_, v)| *v) {
             col.set_width(per_column);
         }
     }
-
-    /// Set scroll offset directly (bypasses clamping).
-    pub fn set_scroll_offset(&mut self, offset: f64) {
-        self.scroll_offset = offset;
-    }
 }
 
-// Test-only helper methods for direct state manipulation
+// Test-only helpers for direct state manipulation and inspection.
 #[cfg(test)]
 impl Workspace {
     /// Set focus state directly without validation (test helper).
     pub fn test_set_focus_unchecked(&mut self, column: usize, win: usize) {
         self.focused_column = column;
-        self.focused_window_in_column = win;
+        if let Some(col) = self.columns.get_mut(column) {
+            col.focused_row = win;
+        }
+    }
+
+    /// Stack a window at the bottom of an existing column.
+    fn insert_window_in_column(
+        &mut self,
+        window_id: WindowId,
+        column_index: usize,
+    ) -> Result<(), LayoutError> {
+        if self.contains_window(window_id) {
+            return Err(LayoutError::DuplicateWindow(window_id));
+        }
+        let max = self.columns.len().saturating_sub(1);
+        self.columns
+            .get_mut(column_index)
+            .ok_or(LayoutError::ColumnOutOfBounds(column_index, max))?
+            .add_window(window_id);
+        Ok(())
+    }
+
+    /// Stop the current animation and snap to its target.
+    fn stop_animation(&mut self) {
+        self.view = View::Static(self.view.target());
     }
 }
 
@@ -1668,21 +1383,21 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn rect_clamps_negative_size_and_reports_edges() {
+    fn rect_clamps_negative_size() {
         let r = Rect::new(10, 20, -100, -50);
         assert_eq!((r.x, r.y, r.width, r.height), (10, 20, 0, 0));
-
-        let r = Rect::new(-50, -30, 100, 80);
-        assert_eq!((r.right(), r.bottom()), (50, 50));
     }
 
     #[test]
-    fn rect_intersects_is_symmetric() {
-        let a = Rect::new(0, 0, 100, 100);
-        let b = Rect::new(50, 50, 100, 100);
-        let c = Rect::new(200, 200, 50, 50);
-        assert!(a.intersects(&b) && b.intersects(&a));
-        assert!(!a.intersects(&c) && !c.intersects(&a));
+    fn default_floating_rect_centers_and_fits_small_viewports() {
+        for (viewport, expected) in [
+            (Rect::new(0, 0, 1920, 1080), Rect::new(560, 240, 800, 600)),
+            // Smaller than 800x600 + margin: shrink to leave 20px on each side.
+            (Rect::new(100, 50, 600, 400), Rect::new(120, 70, 560, 360)),
+            (Rect::new(0, 0, 10, 10), Rect::new(5, 5, 0, 0)),
+        ] {
+            assert_eq!(default_floating_rect(viewport), expected, "{viewport:?}");
+        }
     }
 
     #[test]
@@ -1772,15 +1487,17 @@ mod tests {
     }
 
     #[test]
-    fn insert_window_no_focus_preserves_focus() {
+    fn insert_window_keep_focus_preserves_focus() {
         let mut ws = Workspace::new();
         // Into an empty workspace the first window must still take focus.
-        ws.insert_window_no_focus(1, Some(400)).unwrap();
+        ws.insert_window_with(1, Some(400), InsertFocus::Keep)
+            .unwrap();
         assert_eq!(ws.focused_window(), Some(1));
 
         ws.insert_window(2, Some(400)).unwrap();
         ws.insert_window(3, Some(400)).unwrap();
-        ws.insert_window_no_focus(4, Some(400)).unwrap();
+        ws.insert_window_with(4, Some(400), InsertFocus::Keep)
+            .unwrap();
         assert_eq!(ws.focused_window(), Some(3));
         assert_eq!(ws.window_count(), 4);
         assert_eq!(ws.find_window_location(4), Some((3, 0)));
@@ -1798,7 +1515,7 @@ mod tests {
                 matches!(ws.insert_window(id, Some(400)), Err(LayoutError::DuplicateWindow(d)) if d == id)
             );
             assert!(
-                matches!(ws.insert_window_no_focus(id, Some(400)), Err(LayoutError::DuplicateWindow(d)) if d == id)
+                matches!(ws.insert_window_with(id, Some(400), InsertFocus::Keep), Err(LayoutError::DuplicateWindow(d)) if d == id)
             );
             assert!(
                 matches!(ws.insert_window_in_column(id, 0), Err(LayoutError::DuplicateWindow(d)) if d == id)
@@ -1863,16 +1580,27 @@ mod tests {
 
     #[test]
     fn remove_last_window_resets_workspace_state() {
-        let mut ws = ws_with_columns(10, 10, &[400, 400]);
-        ws.set_scroll_offset(200.0);
-        ws.remove_window(1).unwrap();
-        ws.remove_window(2).unwrap();
+        // Static view, and (regression #9) a view that is mid-animation.
+        for animating in [false, true] {
+            let mut ws = ws_with_columns(10, 10, &[400, 400]);
+            if animating {
+                ws.animate_to(300.0, 500, 100, Easing::Linear);
+                ws.tick_animation(50);
+                assert!(ws.is_animating());
+            } else {
+                ws.set_scroll_offset(200.0, 500);
+            }
+            ws.remove_window(1).unwrap();
+            ws.remove_window(2).unwrap();
 
-        assert!(ws.is_empty());
-        assert_eq!(ws.focused_window(), None);
-        assert_eq!(ws.focused_column_index(), 0);
-        assert_eq!(ws.focused_window_index_in_column(), 0);
-        assert_eq!(ws.scroll_offset(), 0.0);
+            assert!(ws.is_empty());
+            assert_eq!(ws.focused_window(), None);
+            assert_eq!(ws.focused_column_index(), 0);
+            assert_eq!(ws.focused_window_index_in_column(), 0);
+            assert!(!ws.is_animating(), "animating={animating}");
+            assert!(!ws.tick_animation(100), "animating={animating}");
+            assert_eq!(ws.scroll_offset(), 0.0, "animating={animating}");
+        }
     }
 
     #[test]
@@ -1885,12 +1613,13 @@ mod tests {
     }
 
     #[test]
-    fn remove_window_clamps_stale_window_index_after_column_removal() {
+    fn removing_focused_column_lands_on_neighbours_remembered_row() {
         let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
         ws.insert_window_in_column(4, 2).unwrap();
         ws.insert_window_in_column(5, 2).unwrap(); // col 2: [3, 4, 5]
+        ws.focus_window(5).unwrap(); // col 2 remembers row 2
 
-        ws.test_set_focus_unchecked(1, 99);
+        ws.focus_window(2).unwrap();
         ws.remove_window(2).unwrap(); // col 1 removed, focus lands on old col 2
 
         assert_eq!(ws.focused_column_index(), 1);
@@ -1997,27 +1726,53 @@ mod tests {
     }
 
     #[test]
-    fn set_focus_and_column_insert_validate_indices() {
+    fn failed_horizontal_focus_keeps_focused_row() {
+        // Regression #6: the scan used to clamp the row while probing columns and
+        // did not restore it on fallback. Layout: the focused stack [10, 11, 12]
+        // with row 2 focused, next to a fully minimized single-window column.
+        for (stack_col, dir) in [(1, Direction::Left), (0, Direction::Right)] {
+            let mut ws = Workspace::new();
+            let lone = 1;
+            if stack_col == 1 {
+                ws.insert_window(lone, Some(400)).unwrap();
+            }
+            ws.insert_window(10, Some(400)).unwrap();
+            for id in [11, 12] {
+                ws.insert_window_in_column(id, stack_col).unwrap();
+            }
+            if stack_col == 0 {
+                ws.insert_window_with(lone, Some(400), InsertFocus::Keep)
+                    .unwrap();
+            }
+            ws.mark_minimized(lone);
+            ws.focus_window(12).unwrap();
+
+            ws.focus_horizontal(dir);
+
+            assert_eq!(ws.focused_column_index(), stack_col, "{dir:?}");
+            assert_eq!(ws.focused_window(), Some(12), "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn columns_remember_their_focused_row() {
+        // col 0 = [1, 3, 4] focused on 4; col 1 = [2, 5] focused on 2.
         let mut ws = ws_with_columns(10, 10, &[400, 400]);
-        ws.insert_window_in_column(3, 1).unwrap();
+        ws.insert_window_in_column(3, 0).unwrap();
+        ws.insert_window_in_column(4, 0).unwrap();
+        ws.insert_window_in_column(5, 1).unwrap();
+        ws.focus_window(4).unwrap();
 
-        ws.set_focus(1, 1).unwrap();
-        assert_eq!(ws.focused_column_index(), 1);
-        assert_eq!(ws.focused_window_index_in_column(), 1);
+        ws.focus_right();
+        assert_eq!(ws.focused_window(), Some(2));
+        ws.focus_left();
+        assert_eq!(ws.focused_window(), Some(4));
+
+        // A remembered row that became minimized falls back to a visible one.
+        ws.mark_minimized(4);
+        ws.focus_right();
+        ws.focus_left();
         assert_eq!(ws.focused_window(), Some(3));
-
-        assert!(matches!(
-            ws.set_focus(5, 0),
-            Err(LayoutError::ColumnOutOfBounds(5, 1))
-        ));
-        assert!(matches!(
-            ws.set_focus(0, 10),
-            Err(LayoutError::WindowIndexOutOfBounds(10, 0, 0))
-        ));
-        assert!(matches!(
-            ws.insert_window_in_column(9, 5),
-            Err(LayoutError::ColumnOutOfBounds(5, 1))
-        ));
     }
 
     #[test]
@@ -2129,7 +1884,7 @@ mod tests {
         ws.move_column_left();
 
         assert!(ws.focused_column < ws.columns.len());
-        assert!(ws.focused_window_in_column < ws.columns[ws.focused_column].len());
+        assert!(ws.columns.iter().all(|c| c.focused_row < c.len()));
 
         let mut all_windows: Vec<WindowId> = ws
             .columns
@@ -2188,13 +1943,46 @@ mod tests {
     }
 
     #[test]
-    fn column_width_fraction_uses_usable_width_and_clamps() {
-        // usable = 1920 - 2 * outer_gap(10) = 1900; fraction clamped to [0.1, 1.0]
-        for (fraction, expected) in [(0.5, 950), (0.333, 633), (2.0, 1900), (0.0, 190)] {
+    fn column_width_fraction_accounts_for_gaps_and_clamps() {
+        // usable = 1920 - 2 * outer_gap(10) = 1900; width = floor((1900 + gap) * f) - gap;
+        // fraction clamped to [0.1, 1.0]; non-finite fractions are ignored.
+        for (fraction, expected) in [
+            (0.5, 945),
+            (0.333, 626),
+            (2.0, 1900),
+            (0.0, 181),
+            (f64::NAN, 400),
+        ] {
             let mut ws = ws_with_columns(10, 10, &[400]);
             ws.set_focused_column_width_fraction(fraction, 1920);
             assert_eq!(ws.columns()[0].width(), expected, "fraction {fraction}");
         }
+    }
+
+    #[test]
+    fn n_columns_of_one_nth_fit_the_viewport() {
+        // Regression #8: two 0.5 columns used to overflow by the inter-column gap.
+        for (gap, outer_gap) in [(10, 10), (16, 4), (0, 0)] {
+            for n in 1..=4usize {
+                let widths = vec![400; n];
+                let mut ws = ws_with_columns(gap, outer_gap, &widths);
+                for col in 0..n {
+                    ws.test_set_focus_unchecked(col, 0);
+                    ws.set_focused_column_width_fraction(1.0 / n as f64, 1920);
+                }
+                let total = ws.total_width();
+                let case = (gap, outer_gap, n);
+                assert!(total <= 1920, "{case:?}: {total} overflows");
+                assert!(total > 1920 - n as i32, "{case:?}: {total} leaves slack");
+            }
+        }
+        // Halves fit exactly.
+        let mut ws = ws_with_columns(10, 10, &[400, 400]);
+        for col in 0..2 {
+            ws.test_set_focus_unchecked(col, 0);
+            ws.set_focused_column_width_fraction(0.5, 1920);
+        }
+        assert_eq!(ws.total_width(), 1920);
     }
 
     #[test]
@@ -2206,6 +1994,15 @@ mod tests {
 
         ws.equalize_column_widths(200);
         assert!(ws.columns().iter().all(|c| c.width() == MIN_COLUMN_WIDTH));
+
+        // Fully minimized columns are ignored: the two visible ones fill the
+        // viewport ((1920 - gap - 2 * outer_gap) / 2 = 945) and window 2 keeps 600.
+        let mut ws = ws_with_columns(10, 10, &[300, 600, 400]);
+        ws.mark_minimized(2);
+        ws.equalize_column_widths(1920);
+        let widths: Vec<i32> = ws.columns().iter().map(Column::width).collect();
+        assert_eq!(widths, vec![945, 600, 945]);
+        assert_eq!(ws.total_width(), 1920);
     }
 
     // ========================================================================
@@ -2238,9 +2035,22 @@ mod tests {
         // (focused column, start offset, expected offset)
         for (col, start, expected) in [(1, 0.0, 370.0), (0, 500.0, 0.0), (2, 0.0, 740.0)] {
             ws.test_set_focus_unchecked(col, 0);
-            ws.set_scroll_offset(start);
+            ws.set_scroll_offset(start, 500);
             ws.ensure_focused_visible(500);
             assert_eq!(ws.scroll_offset(), expected, "column {col}");
+        }
+
+        // A column at least as wide as the viewport (incl. both outer gaps) is
+        // left-aligned, not centered. Column 1 starts at strip x 420; a trailing
+        // 1000px column keeps the result away from the max-scroll clamp.
+        // (column width, expected offset): 480 + 20 >= 500 -> 420 - 10;
+        // 470 + 20 < 500 -> centered at 420 + 235 - 250.
+        for (width, expected) in [(1000, 410.0), (480, 410.0), (470, 405.0)] {
+            let mut ws = ws_with_columns(10, 10, &[400, width, 1000]);
+            ws.set_centering_mode(CenteringMode::Center);
+            ws.test_set_focus_unchecked(1, 0);
+            ws.ensure_focused_visible(500);
+            assert_eq!(ws.scroll_offset(), expected, "width {width}");
         }
     }
 
@@ -2258,13 +2068,133 @@ mod tests {
         ws.ensure_focused_visible(500);
         assert_eq!(ws.scroll_offset(), 140.0); // right edge 630 + outer 10 - 500
 
-        ws.resize_focused_column(500); // right edge now 1130
+        ws.resize_focused_column(500); // 700 wide: cannot fit, left-aligned at 430 - outer 10
         ws.ensure_focused_visible(500);
-        assert_eq!(ws.scroll_offset(), 640.0);
+        assert_eq!(ws.scroll_offset(), 420.0);
 
         ws.test_set_focus_unchecked(0, 0);
         ws.ensure_focused_visible(500);
         assert_eq!(ws.scroll_offset(), 0.0); // left edge 10 - outer 10
+    }
+
+    #[test]
+    fn just_in_view_wide_column_target_is_stable() {
+        // Regression #2: a column wider than the viewport flipped between its left-
+        // and right-aligned offsets on every focus event. Column 1 (strip x 420,
+        // width 1000) does not fit a 500px viewport; the target is its left edge.
+        let base = || {
+            let mut ws = ws_with_columns(10, 10, &[400, 1000, 400]);
+            ws.set_centering_mode(CenteringMode::JustInView);
+            ws.test_set_focus_unchecked(1, 0);
+            ws
+        };
+        for start in [0.0, 410.0, 600.0, 930.0] {
+            let mut snapped = base();
+            let mut animated = base();
+            snapped.set_scroll_offset(start, 500);
+            animated.set_scroll_offset(start, 500);
+            for round in 0..3 {
+                snapped.ensure_focused_visible(500);
+                assert_eq!(
+                    snapped.scroll_offset(),
+                    410.0,
+                    "start {start} round {round}"
+                );
+
+                animated.ensure_focused_visible_animated(500);
+                animated.stop_animation();
+                assert_eq!(
+                    animated.scroll_offset(),
+                    410.0,
+                    "start {start} round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_scroll_offset_clamps_rejects_non_finite_and_cancels_animation() {
+        // Regression #1: a restored offset from a wider session left every window
+        // off-screen. Single 400px column, viewport 1000 -> max scroll 0.
+        let mut ws = ws_with_columns(10, 10, &[400]);
+        ws.set_scroll_offset(3000.0, 1000);
+        assert_eq!(ws.scroll_offset(), 0.0);
+        let p = ws.compute_placements(Rect::new(0, 0, 1000, 600));
+        assert_eq!(p[0].visibility, Visibility::Visible);
+
+        // total 1240, viewport 500 -> max 740.
+        let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
+        for (offset, expected) in [
+            (300.0, 300.0),
+            (5000.0, 740.0),
+            (-50.0, 0.0),
+            (f64::NAN, 0.0), // ignored
+            (f64::INFINITY, 0.0),
+        ] {
+            ws.set_scroll_offset(offset, 500);
+            assert_eq!(ws.scroll_offset(), expected, "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn direct_view_writes_replace_running_animation() {
+        // Regression #3: a direct write during an animation was overwritten by the
+        // animation's old target on the next tick. Every write must win.
+        type Write = fn(&mut Workspace);
+        let writes: [(&str, Write, f64); 4] = [
+            ("scroll_by", |ws| ws.scroll_by(50.0, 500), 150.0),
+            (
+                "set_scroll_offset",
+                |ws| ws.set_scroll_offset(20.0, 500),
+                20.0,
+            ),
+            (
+                "ensure_focused_visible",
+                |ws| ws.ensure_focused_visible(500),
+                740.0,
+            ),
+            ("cancel_animation", |ws| ws.cancel_animation(), 100.0),
+        ];
+        for (name, write, expected) in writes {
+            let mut ws = ws_with_columns(10, 10, &[400, 400, 400]); // col 2 focused
+            ws.animate_to(200.0, 500, 100, Easing::Linear);
+            ws.tick_animation(50); // on screen: 100
+            write(&mut ws);
+            assert!(!ws.is_animating(), "{name}");
+            assert!(!ws.tick_animation(100), "{name}");
+            assert!(
+                approx(ws.scroll_offset(), expected),
+                "{name}: {}",
+                ws.scroll_offset()
+            );
+        }
+    }
+
+    #[test]
+    fn fully_minimized_columns_take_no_width() {
+        // Regression #7: [400, 400 (minimized), 400] used to leave a 410px hole.
+        let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
+        ws.mark_minimized(2);
+
+        assert_eq!(ws.total_width(), 830);
+        let xs: Vec<(WindowId, i32)> = ws
+            .compute_placements(Rect::new(0, 0, 2000, 600))
+            .iter()
+            .map(|p| (p.window_id, p.rect.x))
+            .collect();
+        assert_eq!(xs, vec![(1, 10), (3, 420)]);
+
+        // Scroll targets use the packed strip: col 2 (400 + 2 * outer >= 400, so
+        // left-aligned) at x 420 -> 410 (it would be 820 with the hole).
+        ws.ensure_focused_visible(400);
+        assert_eq!(ws.scroll_offset(), 410.0);
+
+        // A focused column without a visible window does not scroll the view
+        // (centering it would give 420 + 200 - 100 = 520).
+        ws.set_scroll_offset(100.0, 200);
+        ws.test_set_focus_unchecked(1, 0);
+        ws.ensure_focused_visible(200);
+        assert_eq!(ws.scroll_offset(), 100.0);
     }
 
     // ========================================================================
@@ -2274,17 +2204,17 @@ mod tests {
     #[test]
     fn compute_placements_classifies_visibility_by_scroll_offset() {
         use Visibility::{OffScreenLeft as L, OffScreenRight as R, Visible as V};
-        // Columns span strip x = 10-410, 420-820, 830-1230; viewport is 500 wide.
-        let base = ws_with_columns(10, 10, &[400, 400, 400]);
+        // Columns span strip x = 10-410, 420-820, 830-1230, 1240-1640; viewport is 500 wide.
+        let base = ws_with_columns(10, 10, &[400, 400, 400, 400]);
         let cases = [
-            (0.0, [V, V, R]),
-            (330.0, [V, V, R]), // column left edge == viewport right is off-screen
-            (420.0, [L, V, V]),
-            (820.0, [L, L, V]), // column right edge == viewport left is off-screen
+            (0.0, [V, V, R, R]),
+            (330.0, [V, V, R, R]), // column left edge == viewport right is off-screen
+            (420.0, [L, V, V, R]),
+            (820.0, [L, L, V, V]), // column right edge == viewport left is off-screen
         ];
         for (offset, expected) in cases {
             let mut ws = base.clone();
-            ws.set_scroll_offset(offset);
+            ws.set_scroll_offset(offset, 500);
             let visibility: Vec<Visibility> = ws
                 .compute_placements(Rect::new(0, 0, 500, 600))
                 .iter()
@@ -2297,8 +2227,8 @@ mod tests {
     #[test]
     fn compute_placements_rect_math_with_gaps_and_viewport_origin() {
         let mut ws = ws_with_columns(10, 20, &[400, 300]);
-        ws.set_scroll_offset(100.7); // rounds to 101 (not truncated to 100)
-        let viewport = Rect::new(1920, 50, 1000, 600);
+        ws.set_scroll_offset(100.7, 500); // rounds to 101 (not truncated to 100)
+        let viewport = Rect::new(1920, 50, 500, 600);
         let p = ws.compute_placements(viewport);
 
         // col 0 strip x = outer 20; screen x = 20 - 101 + 1920.
@@ -2321,13 +2251,6 @@ mod tests {
             .collect();
         assert_eq!(rows, vec![(1, 10, 20), (2, 40, 20), (3, 70, 21)]);
         assert!(placements.iter().all(|p| p.column_index == 0));
-
-        let animated: Vec<(WindowId, i32, i32)> = ws
-            .compute_placements_animated(viewport)
-            .iter()
-            .map(|p| (p.window_id, p.rect.y, p.rect.height))
-            .collect();
-        assert_eq!(animated, rows);
     }
 
     #[test]
@@ -2412,8 +2335,6 @@ mod tests {
                 "elapsed {elapsed}"
             );
         }
-        assert!(approx(forward.target(), 100.0));
-
         let instant = ScrollAnimation::new(0.0, 100.0, 0, Easing::Linear);
         assert!(approx(instant.progress(), 1.0));
         assert!(instant.is_complete());
@@ -2451,47 +2372,48 @@ mod tests {
         assert!(!ws.is_animating());
         assert!(!ws.tick_animation(16)); // nothing to tick
 
-        ws.start_scroll_animation(200.0, 500, Some(100), Some(Easing::Linear));
+        ws.animate_to(200.0, 500, 100, Easing::Linear);
         assert!(ws.is_animating());
-        assert!(approx(ws.effective_scroll_offset(), 0.0));
+        assert!(approx(ws.scroll_offset(), 0.0));
 
         assert!(ws.tick_animation(50));
-        assert!(approx(ws.effective_scroll_offset(), 100.0));
-        assert_eq!(ws.scroll_offset(), 0.0); // base offset commits on completion
+        assert!(approx(ws.scroll_offset(), 100.0));
 
         assert!(!ws.tick_animation(50));
         assert!(!ws.is_animating());
         assert_eq!(ws.scroll_offset(), 200.0);
 
-        // Defaults: DEFAULT_ANIMATION_DURATION_MS.
-        ws.start_scroll_animation(0.0, 500, None, None);
+        ws.animate_to(0.0, 500, DEFAULT_ANIMATION_DURATION_MS, Easing::default());
         assert!(ws.tick_animation(DEFAULT_ANIMATION_DURATION_MS - 1));
         assert!(!ws.tick_animation(1));
         assert_eq!(ws.scroll_offset(), 0.0);
     }
 
     #[test]
-    fn start_scroll_animation_clamps_target() {
+    fn animate_to_clamps_target_and_completes_trivial_moves_immediately() {
         // Content narrower than viewport: any target clamps to the current 0.
         let mut ws = ws_with_columns(10, 10, &[400]);
-        ws.start_scroll_animation(500.0, 1000, None, None);
-        assert!(!ws.is_animating());
-        ws.start_scroll_animation(0.0, 1000, None, None);
+        ws.animate_to(500.0, 1000, 100, Easing::default());
         assert!(!ws.is_animating());
 
         // Over-range target clamps to max scroll.
         let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
-        ws.start_scroll_animation(10_000.0, 500, None, None);
+        ws.animate_to(10_000.0, 500, 100, Easing::default());
         assert!(ws.is_animating());
         ws.stop_animation();
         assert_eq!(ws.scroll_offset(), 740.0);
+
+        // Zero duration jumps straight to the target.
+        ws.animate_to(100.0, 500, 0, Easing::default());
+        assert!(!ws.is_animating());
+        assert_eq!(ws.scroll_offset(), 100.0);
     }
 
     #[test]
     fn stop_snaps_to_target_and_cancel_keeps_current_position() {
         let start_halfway = || {
             let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
-            ws.start_scroll_animation(200.0, 500, Some(100), Some(Easing::Linear));
+            ws.animate_to(200.0, 500, 100, Easing::Linear);
             ws.tick_animation(50);
             ws
         };
@@ -2510,26 +2432,29 @@ mod tests {
     #[test]
     fn new_animation_interrupts_from_current_position() {
         let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
-        ws.start_scroll_animation(200.0, 500, Some(100), Some(Easing::Linear));
+        ws.animate_to(200.0, 500, 100, Easing::Linear);
         ws.tick_animation(50);
 
-        ws.start_scroll_animation(300.0, 500, Some(100), Some(Easing::Linear));
+        // Same target: the running animation keeps its timing.
+        ws.animate_to(200.0, 500, 100, Easing::Linear);
+        assert!(ws.tick_animation(25));
+        assert!(approx(ws.scroll_offset(), 150.0));
+
+        ws.animate_to(300.0, 500, 100, Easing::Linear);
         assert!(ws.is_animating());
-        assert!(approx(ws.effective_scroll_offset(), 100.0));
+        assert!(approx(ws.scroll_offset(), 150.0));
 
         ws.tick_animation(150);
-        assert!(approx(ws.effective_scroll_offset(), 300.0));
+        assert!(approx(ws.scroll_offset(), 300.0));
     }
 
     #[test]
-    fn compute_placements_animated_uses_effective_offset() {
+    fn compute_placements_follow_running_animation() {
         let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
         let viewport = Rect::new(0, 0, 500, 600);
-        ws.start_scroll_animation(200.0, 500, Some(100), Some(Easing::Linear));
-        ws.tick_animation(50); // effective offset 100, base offset still 0
-
-        assert_eq!(ws.compute_placements(viewport)[0].rect.x, 10);
-        assert_eq!(ws.compute_placements_animated(viewport)[0].rect.x, -90);
+        ws.animate_to(200.0, 500, 100, Easing::Linear);
+        ws.tick_animation(50); // on screen: 100
+        assert_eq!(ws.compute_placements(viewport)[0].rect.x, -90);
     }
 
     #[test]
@@ -2575,7 +2500,7 @@ mod tests {
         let mut ws = ws_with_columns(10, 10, &[400, 400]);
         let rect = Rect::new(500, 500, 300, 200);
         ws.add_floating(3, rect).unwrap();
-        ws.set_scroll_offset(300.0); // floating windows ignore scroll
+        ws.set_scroll_offset(300.0, 500); // floating windows ignore scroll
         assert!(!ws.is_floating(1));
 
         let p = ws.compute_placements(Rect::new(0, 0, 1920, 1080));
@@ -2605,6 +2530,11 @@ mod tests {
         assert!(!ws.is_floating(2));
         assert_eq!(ws.column_count(), 2);
         assert_eq!(ws.focused_window(), Some(2));
+
+        // A minimized focused window is not floated.
+        ws.mark_minimized(2);
+        assert_eq!(ws.toggle_floating(viewport), None);
+        assert!(!ws.is_floating(2) && ws.is_minimized(2));
     }
 
     #[test]
@@ -2626,7 +2556,7 @@ mod tests {
     fn toggle_fullscreen_enters_and_exits() {
         let mut ws = Workspace::new();
         assert!(!ws.toggle_fullscreen()); // nothing to fullscreen
-        assert!(!ws.is_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), None);
 
         ws.insert_window(1, Some(400)).unwrap();
         assert!(ws.toggle_fullscreen());
@@ -2636,15 +2566,85 @@ mod tests {
     }
 
     #[test]
-    fn toggle_fullscreen_targets_visible_window_when_focus_is_minimized() {
+    fn toggle_fullscreen_targets_and_focuses_visible_window_when_focus_is_minimized() {
         let mut ws = ws_with_stack(10, 10, &[1, 2]);
         ws.mark_minimized(1);
         assert_eq!(ws.focused_window(), Some(1));
 
-        // Stale fullscreen state pointing at a minimized window.
-        ws.fullscreen_window = Some(1);
         assert!(ws.toggle_fullscreen());
         assert_eq!(ws.fullscreen_window_id(), Some(2));
+        assert_eq!(
+            ws.focused_window(),
+            Some(2),
+            "focus follows the fullscreen window"
+        );
+
+        // Everything minimized: nothing to fullscreen.
+        ws.toggle_fullscreen();
+        ws.mark_minimized(2);
+        assert!(!ws.toggle_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), None);
+    }
+
+    #[test]
+    fn focus_change_to_another_window_leaves_fullscreen() {
+        // Regression #5: focusing another window kept fullscreen, so the newly
+        // focused window was off-screen with a zero rect.
+        // Layout: col 0 = [1, 4], col 1 = [2], col 2 = [3]; fullscreen on 2.
+        type Op = fn(&mut Workspace);
+        let cases: [(&str, Op, Option<WindowId>); 9] = [
+            ("focus_left", |ws| ws.focus_left(), None),
+            ("focus_right", |ws| ws.focus_right(), None),
+            ("focus_window other", |ws| ws.focus_window(3).unwrap(), None),
+            (
+                "insert taking focus",
+                |ws| ws.insert_window(9, None).unwrap(),
+                None,
+            ),
+            (
+                "unfloat",
+                |ws| {
+                    ws.add_floating(9, Rect::new(0, 0, 10, 10)).unwrap();
+                    ws.unfloat_window(9);
+                },
+                None,
+            ),
+            (
+                "focus_window same",
+                |ws| ws.focus_window(2).unwrap(),
+                Some(2),
+            ),
+            (
+                "insert keeping focus",
+                |ws| ws.insert_window_with(9, None, InsertFocus::Keep).unwrap(),
+                Some(2),
+            ),
+            ("focus_up at edge", |ws| ws.focus_up(), Some(2)),
+            ("move_column_left", |ws| ws.move_column_left(), Some(2)),
+        ];
+        for (name, op, expected) in cases {
+            let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
+            ws.insert_window_in_column(4, 0).unwrap();
+            ws.focus_window(2).unwrap();
+            assert!(ws.toggle_fullscreen());
+
+            op(&mut ws);
+
+            assert_eq!(ws.fullscreen_window_id(), expected, "{name}");
+            if expected.is_none() {
+                let focused = ws.focused_window().unwrap();
+                let viewport = Rect::new(0, 0, 1920, 1080);
+                let p = ws.compute_placements(viewport);
+                let placed = p.iter().find(|p| p.window_id == focused).unwrap();
+                assert_ne!(placed.rect.width, 0, "{name}: focused window has no rect");
+            }
+        }
+
+        // Vertical focus inside a fullscreen column also leaves fullscreen.
+        let mut ws = ws_with_stack(10, 10, &[1, 2]);
+        ws.toggle_fullscreen();
+        ws.focus_down();
+        assert_eq!(ws.fullscreen_window_id(), None);
     }
 
     #[test]
@@ -2656,31 +2656,15 @@ mod tests {
         assert_eq!(ws.fullscreen_window_id(), Some(2));
 
         let viewport = Rect::new(0, 0, 1920, 1080);
-        for placements in [
-            ws.compute_placements(viewport),
-            ws.compute_placements_animated(viewport),
-        ] {
-            assert_eq!(placements.len(), 4);
-            for p in &placements {
-                if p.window_id == 2 {
-                    assert_eq!((p.rect, p.visibility), (viewport, Visibility::Visible));
-                } else {
-                    assert_eq!(p.visibility, Visibility::OffScreenLeft, "{p:?}");
-                }
+        let placements = ws.compute_placements(viewport);
+        assert_eq!(placements.len(), 4);
+        for p in &placements {
+            if p.window_id == 2 {
+                assert_eq!((p.rect, p.visibility), (viewport, Visibility::Visible));
+            } else {
+                assert_eq!(p.visibility, Visibility::OffScreenLeft, "{p:?}");
             }
         }
-    }
-
-    #[test]
-    fn fullscreen_placements_fall_back_when_target_is_minimized() {
-        let mut ws = ws_with_columns(10, 10, &[400, 400]);
-        ws.mark_minimized(1);
-        ws.fullscreen_window = Some(1); // stale/minimized fullscreen target
-
-        let p = ws.compute_placements(Rect::new(0, 0, 1920, 1080));
-        assert_eq!(p.len(), 1);
-        assert_eq!(p[0].window_id, 2);
-        assert_eq!(p[0].visibility, Visibility::Visible);
     }
 
     #[test]
@@ -2695,20 +2679,12 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].visibility, Visibility::Visible);
 
-        // Floating.
-        let mut ws = Workspace::new();
-        ws.add_floating(10, Rect::new(100, 100, 500, 400)).unwrap();
-        ws.add_floating(11, Rect::new(100, 100, 500, 400)).unwrap();
-        ws.fullscreen_window = Some(10);
-        assert!(ws.remove_floating(10));
-        assert!(!ws.is_fullscreen());
-
         // clear_fullscreen_if_window only clears the matching target.
-        ws.fullscreen_window = Some(11);
+        ws.toggle_fullscreen();
         assert!(!ws.clear_fullscreen_if_window(99));
-        assert!(ws.is_fullscreen());
-        assert!(ws.clear_fullscreen_if_window(11));
-        assert!(!ws.is_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), Some(2));
+        assert!(ws.clear_fullscreen_if_window(2));
+        assert_eq!(ws.fullscreen_window_id(), None);
     }
 
     #[test]
@@ -2732,7 +2708,7 @@ mod tests {
 
         // Restoring does not re-enter fullscreen.
         ws.mark_restored(1);
-        assert!(!ws.is_fullscreen());
+        assert_eq!(ws.fullscreen_window_id(), None);
     }
 
     // ========================================================================
@@ -2751,7 +2727,6 @@ mod tests {
         assert!(!ws.mark_minimized(999)); // unknown
         assert!(ws.is_minimized(1));
         assert!(!ws.is_minimized(3) && !ws.is_minimized(999));
-        assert_eq!(ws.minimized_count(), 1);
 
         // Minimized windows stay managed.
         assert!(ws.contains_window(1));
@@ -2765,7 +2740,7 @@ mod tests {
         ws.mark_minimized(2);
         ws.remove_window(2).unwrap();
         assert!(!ws.is_minimized(2));
-        assert_eq!(ws.minimized_count(), 0);
+        assert!(ws.minimized_windows.is_empty());
     }
 
     #[test]
@@ -2775,13 +2750,9 @@ mod tests {
         assert_eq!(ws.compute_placements(viewport).len(), 2);
 
         ws.mark_minimized(1);
-        for p in [
-            ws.compute_placements(viewport),
-            ws.compute_placements_animated(viewport),
-        ] {
-            assert_eq!(p.len(), 1);
-            assert_eq!(p[0].window_id, 2);
-        }
+        let p = ws.compute_placements(viewport);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].window_id, 2);
     }
 
     #[test]
@@ -2800,5 +2771,33 @@ mod tests {
         assert_eq!(heights(&ws), vec![(2, 1000)]);
         ws.mark_minimized(2);
         assert!(heights(&ws).is_empty());
+    }
+
+    // ========================================================================
+    // Serialization
+    // ========================================================================
+
+    #[test]
+    fn workspace_snapshot_format_stays_compatible() {
+        // Snapshot written by the previous version (daemon workspace-state.json).
+        let old = r#"{
+            "columns": [{"width": 800, "windows": [1, 2]}, {"width": 400, "windows": [3]}],
+            "focused_column": 1, "focused_window_in_column": 0, "scroll_offset": 250.0,
+            "gap": 10, "outer_gap": 10, "default_column_width": 800,
+            "centering_mode": "Center"
+        }"#;
+        let ws: Workspace = serde_json::from_str(old).unwrap();
+        assert_eq!(ws.scroll_offset(), 250.0);
+        assert_eq!(ws.focused_window(), Some(3));
+        assert!(!ws.is_animating());
+
+        // A running animation is persisted as its resting target.
+        let mut ws = ws_with_columns(10, 10, &[400, 400, 400]);
+        ws.animate_to(200.0, 500, 100, Easing::Linear);
+        ws.tick_animation(50);
+        let json = serde_json::to_value(&ws).unwrap();
+        assert_eq!(json["scroll_offset"], 200.0);
+        let back: Workspace = serde_json::from_value(json).unwrap();
+        assert_eq!(back.scroll_offset(), 200.0);
     }
 }
