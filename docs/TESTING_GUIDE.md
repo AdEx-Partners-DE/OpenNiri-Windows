@@ -43,6 +43,17 @@ Logs go to `%TEMP%\openniri-daemon.log` when launched via `openniri-cli run`.
 
 ---
 
+## Automated Sandbox Test (run this first)
+
+`tools/sandbox/run-sandbox-e2e.ps1` runs the real daemon against real windows inside a disposable Windows Sandbox. It covers:
+- startup tiling and hotkey navigation
+- click focus (lockout check)
+- the CLI scenario
+- stop recovery, plus a hard kill followed by `emergency-uncloak`
+- cursor latency with the mouse hooks installed, and focus-follows-mouse
+
+It needs Windows 11 24H2+ with the Windows Sandbox feature. See `tools/sandbox/README.md`. The manual scenarios below are still needed for real applications, elevated windows and multiple monitors.
+
 ## Test Scenarios
 
 ### 1. Cold Start

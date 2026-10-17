@@ -107,6 +107,8 @@ const APPLY_LAYOUT_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A failing apply repeats on every animation frame (about 60 per second); left
 /// running it fights the user for window visibility and focus (INC-49).
 const APPLY_FAILURE_BREAKER_THRESHOLD: u32 = 5;
+/// How long after focus-follows-mouse the matching OS focus event is expected.
+const MOUSE_FOCUS_EVENT_WINDOW: Duration = Duration::from_secs(1);
 /// Poll interval for cooperative timed thread joins.
 const JOIN_WITH_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Suppress MovedOrResized events briefly after placements are applied.
@@ -223,6 +225,10 @@ struct AppState {
     layout_apply_timeout: Duration,
     /// Failed layout applications since the last success.
     consecutive_apply_failures: u32,
+    /// Window focused by focus-follows-mouse, and when. The OS focus event that
+    /// follows must not scroll the strip: scrolling would put another window under
+    /// the cursor, which would then take focus in turn.
+    mouse_focus_pending: Option<(u64, std::time::Instant)>,
     /// Daemon start time for uptime reporting.
     start_time: std::time::Instant,
     /// Injected window info for testing. When set, `lookup_window_info()` returns
@@ -312,6 +318,7 @@ impl AppState {
             pending_apply_workers: Vec::new(),
             layout_apply_timeout: APPLY_LAYOUT_TIMEOUT,
             consecutive_apply_failures: 0,
+            mouse_focus_pending: None,
             start_time: std::time::Instant::now(),
             #[cfg(test)]
             injected_window_info: HashMap::new(),
@@ -882,6 +889,11 @@ impl AppState {
         let mut added = 0;
 
         for win_info in windows {
+            // Refresh re-enumerates every window; keep the ones already managed as they are.
+            if self.find_window_workspace(win_info.hwnd).is_some() {
+                continue;
+            }
+
             // Get executable name for rule matching
             let executable = get_process_executable(win_info.process_id).unwrap_or_default();
 
@@ -1769,6 +1781,14 @@ impl AppState {
                             // Floating windows are not in the tiled column list,
                             // so focus_window fails for them — that's expected.
                             debug!("Failed to focus window {}: {}", hwnd, e);
+                        } else if matches!(
+                            self.mouse_focus_pending.take(),
+                            Some((pending, at)) if pending == hwnd && at.elapsed() < MOUSE_FOCUS_EVENT_WINDOW
+                        ) {
+                            debug!(
+                                "Focus changed to window {} by focus-follows-mouse; not scrolling",
+                                hwnd
+                            );
                         } else {
                             debug!("Focus changed to window {} on monitor {}", hwnd, monitor_id);
                             workspace.ensure_focused_visible_animated(viewport_width);
@@ -1937,12 +1957,6 @@ impl AppState {
             // Update focused monitor to match the window's monitor
             self.focused_monitor = monitor_id;
 
-            let viewport_width = self
-                .monitors
-                .get(&monitor_id)
-                .map(|m| m.work_area.width)
-                .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
-
             if let Some(workspace) = self.workspaces.get_mut(&monitor_id) {
                 if workspace.is_floating(hwnd) {
                     // Floating windows are managed but not represented in tiled columns.
@@ -1965,10 +1979,9 @@ impl AppState {
                     "Focus-follows-mouse: focused window {} on monitor {}",
                     hwnd, monitor_id
                 );
-                workspace.ensure_focused_visible_animated(viewport_width);
-                if let Err(e) = self.apply_layout() {
-                    warn!("Failed to apply layout after focus-follows-mouse: {}", e);
-                }
+                // The window under the cursor is already visible. Like niri, do not
+                // scroll for mouse focus (see `mouse_focus_pending`).
+                self.mouse_focus_pending = Some((hwnd, std::time::Instant::now()));
                 self.sync_foreground_window();
                 return true;
             }
@@ -3081,6 +3094,15 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Tile the windows found at startup instead of waiting for the first command.
+    {
+        let mut state = state.lock().await;
+        match state.apply_layout() {
+            Ok(()) => info!("Initial layout applied"),
+            Err(e) => warn!("Initial layout failed: {}", e),
+        }
+    }
+
     info!("Ready. Use openniri-cli to send commands.");
 
     // Animation timer handle - we'll spawn/cancel this as needed
@@ -3538,6 +3560,8 @@ async fn main() -> Result<()> {
     drop(mouse_hook_thread);
     drop(gesture_thread);
     drop(tray_manager);
+    drop(hotkey_state);
+    openniri_platform_win32::clear_display_change_sender();
     drop(event_rx);
 
     // Join forwarding threads with timeout for graceful shutdown
@@ -3951,6 +3975,57 @@ mod tests {
         let resp = state.handle_command(IpcCommand::TogglePause);
         assert_eq!(resp, IpcResponse::Ok);
         assert!(!state.paused, "second toggle_pause should resume tiling");
+    }
+
+    fn state_with_wide_strip() -> AppState {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        // Avoid real Win32 positioning on synthetic test window IDs.
+        state.paused = true;
+        let ws = state.focused_workspace_mut().unwrap();
+        for id in [100, 200, 300, 400, 500] {
+            ws.insert_window(id, Some(800)).unwrap();
+        }
+        ws.focus_window(100).unwrap();
+        ws.ensure_focused_visible(1920);
+        ws.stop_animation();
+        state
+    }
+
+    #[test]
+    fn test_focus_event_scrolls_to_window() {
+        let mut state = state_with_wide_strip();
+        state.handle_window_event(WindowEvent::Focused(500));
+        let ws = state.focused_workspace_mut().unwrap();
+        assert_eq!(ws.focused_window(), Some(500));
+        assert!(
+            ws.is_animating(),
+            "keyboard/click focus should scroll to the window"
+        );
+    }
+
+    #[test]
+    fn test_focus_event_from_mouse_does_not_scroll() {
+        let mut state = state_with_wide_strip();
+        state.mouse_focus_pending = Some((500, std::time::Instant::now()));
+        state.handle_window_event(WindowEvent::Focused(500));
+        assert!(state.mouse_focus_pending.is_none());
+        let ws = state.focused_workspace_mut().unwrap();
+        assert_eq!(ws.focused_window(), Some(500));
+        assert!(
+            !ws.is_animating(),
+            "focus-follows-mouse must not scroll (feedback loop with the cursor)"
+        );
+    }
+
+    #[test]
+    fn test_stale_mouse_focus_marker_does_not_suppress_scroll() {
+        let mut state = state_with_wide_strip();
+        state.mouse_focus_pending = Some((
+            500,
+            std::time::Instant::now() - MOUSE_FOCUS_EVENT_WINDOW - Duration::from_millis(10),
+        ));
+        state.handle_window_event(WindowEvent::Focused(500));
+        assert!(state.focused_workspace_mut().unwrap().is_animating());
     }
 
     #[test]

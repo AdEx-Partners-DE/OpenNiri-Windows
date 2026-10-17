@@ -1,5 +1,19 @@
 # OpenNiri-Windows Development Iteration Log
 
+## Sandbox end-to-end iteration — 2026-10-17
+
+- Scope: run the real daemon against real windows in Windows Sandbox (`tools/sandbox/run-sandbox-e2e.ps1`) and fix what it finds (`INC-49-7`).
+- Found and fixed:
+  - **MoveOffScreen parking was unrecoverable:** windows moved to -100000 are clamped by Windows to -32768, and recovery only looked for coordinates at or below -100000. Windows stayed off-screen after `stop`. This affected `use_cloaking = false`, `--safe-mode`, and the cloak fallback.
+  - No layout was applied at startup.
+  - Focus-follows-mouse scrolled the strip, which moved another window under the cursor.
+  - `set_foreground_window` attached to the target thread instead of the foreground thread, so non-hotkey focus changes were reverted.
+  - Config reload cleared the display-change sender.
+  - Shutdown logged an uncloak error for every window.
+- Confirmed on a real desktop session: DWM returns `E_ACCESSDENIED` for `DWMWA_CLOAK` on other processes' windows, so the off-screen fallback from `INC-49-6` is what actually hides windows today.
+- Validation: unit/integration tests, clippy and fmt pass; the sandbox run results are recorded in the PR.
+- INC-49 host acceptance on the operator's own desktop is still open; the sandbox covers the lockout mechanics but not elevated or real-world applications.
+
 ## Lockout root-cause iteration — 2026-10-17
 
 - Scope: fix the code-level causes of INC-49 and GitHub issue #12 found in a whole-repo review (`INC-49-6`).

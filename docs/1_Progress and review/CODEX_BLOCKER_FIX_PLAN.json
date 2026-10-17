@@ -127,6 +127,19 @@
       ],
       "status": "done",
       "evidence": "WinEvent, mouse and gesture hooks plus the tray icon now run on dedicated message-loop threads (spawn_message_loop_thread); uncloak only targets windows the daemon cloaked or DWM reports app-cloaked, and E_ACCESSDENIED on cloak falls back to moving off-screen; rollback no longer calls SetForegroundWindow; 5 consecutive apply failures pause tiling, cancel animations and run a visibility recovery pass; child-window DESTROY events no longer map to their live top-level window; windows of more privileged processes are not managed; hotkeys register partially with per-key warnings (Alt-based defaults, panic key unchanged); gestures off by default. Unit tests added for each pure part. Host validation still required (INC-49-1/4/T1)."
+    },
+    {
+      "id": "INC-49-7",
+      "priority": "critical",
+      "title": "Automated sandbox end-to-end test of desktop control and fixes for the defects it finds",
+      "targets": [
+        "tools/sandbox/run-sandbox-e2e.ps1",
+        "tools/sandbox/guest-e2e.ps1",
+        "crates/platform_win32/src/lib.rs",
+        "crates/daemon/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "Windows Sandbox run (networking off) of the release build: tiling at startup, Alt-hotkey walk over 10 windows, click activation without focus stealing, CLI scenario, stop recovery, hard kill + emergency-uncloak recovery, cursor latency p95 < 3 ms with mouse hooks. Fixed MoveOffScreen sentinel (-100000 clamped to -32768, never restored), startup layout, focus-follows-mouse scroll loop, foreground attach thread, display sender cleared on reload. INC-49-1/4/T1 still need confirmation on the operator desktop."
     }
   ],
   "required_tests": [
