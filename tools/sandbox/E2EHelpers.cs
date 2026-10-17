@@ -164,6 +164,33 @@ public static class E2E
         SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
     }
 
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern uint GetNamedSecurityInfoW(string name, int objectType, uint securityInfo,
+        IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl, out IntPtr securityDescriptor);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint revision,
+        uint securityInfo, out IntPtr sddl, IntPtr length);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr mem);
+
+    /// Owner and DACL of a named pipe (or file) as SDDL, or "error N".
+    public static string SecuritySddl(string path)
+    {
+        const uint OWNER = 0x1, DACL = 0x4;
+        IntPtr sd;
+        uint err = GetNamedSecurityInfoW(path, 1 /* SE_FILE_OBJECT */, OWNER | DACL, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sd);
+        if (err != 0) return "error " + err;
+        try
+        {
+            IntPtr sddl;
+            if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, OWNER | DACL, out sddl, IntPtr.Zero))
+                return "error " + Marshal.GetLastWin32Error();
+            string text = Marshal.PtrToStringUni(sddl);
+            LocalFree(sddl);
+            return text;
+        }
+        finally { LocalFree(sd); }
+    }
+
     public static void Screenshot(string path)
     {
         var vs = VirtualScreen();

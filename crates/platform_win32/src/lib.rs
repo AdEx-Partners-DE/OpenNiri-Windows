@@ -11,6 +11,7 @@
 
 pub mod overlay;
 mod shell_cloak;
+pub mod pipe_security;
 
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::HashSet;

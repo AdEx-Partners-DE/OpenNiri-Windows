@@ -2279,6 +2279,19 @@ async fn run_ipc_server(event_tx: mpsc::Sender<DaemonEvent>) {
     let pipe_name = preferred_pipe_name();
     // Bound concurrent IPC handlers to avoid local task-exhaustion DoS.
     let connection_limit = Arc::new(Semaphore::new(32));
+    // Only this user and SYSTEM may connect: the pipe accepts commands that move,
+    // hide and close windows.
+    let mut pipe_security =
+        match openniri_platform_win32::pipe_security::PipeSecurityAttributes::current_user_only() {
+            Ok(security) => Some(security),
+            Err(e) => {
+                warn!(
+                    "Could not restrict the IPC pipe to the current user ({}); using the default ACL",
+                    e
+                );
+                None
+            }
+        };
 
     loop {
         let permit = match connection_limit.clone().acquire_owned().await {
@@ -2290,11 +2303,19 @@ async fn run_ipc_server(event_tx: mpsc::Sender<DaemonEvent>) {
         };
 
         // Create a new pipe server instance
-        let server = match ServerOptions::new()
+        let mut options = ServerOptions::new();
+        options
             .first_pipe_instance(is_first_instance)
-            .pipe_mode(PipeMode::Byte)
-            .create(&pipe_name)
-        {
+            .pipe_mode(PipeMode::Byte);
+        let created = match pipe_security.as_mut() {
+            // SAFETY: the pointer refers to SECURITY_ATTRIBUTES owned by
+            // `pipe_security`, which outlives this call.
+            Some(security) => unsafe {
+                options.create_with_security_attributes_raw(&pipe_name, security.as_mut_ptr())
+            },
+            None => options.create(&pipe_name),
+        };
+        let server = match created {
             Ok(s) => {
                 is_first_instance = false; // Subsequent instances don't need this flag
                 s
