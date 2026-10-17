@@ -313,6 +313,31 @@ try {
     Stop-Daemon $daemonProcess
     Start-Sleep -Seconds 1
     Test-AllRecovered 'restart + stop'
+
+    # ------------------------------------------------------------------
+    # Phase E: Explorer restarts while the daemon runs (shell reconnect)
+    # ------------------------------------------------------------------
+    $script:phase = 'E-explorer'
+    $daemonProcess = Start-Daemon
+    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+    $explorerBack = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Get-Process explorer -ErrorAction SilentlyContinue) { $explorerBack = $true; break }
+    }
+    if (-not $explorerBack) { Start-Process explorer.exe; Start-Sleep -Seconds 3 }
+    Start-Sleep -Seconds 4
+    for ($i = 0; $i -lt 4; $i++) {
+        [E2E]::Chord($VK_ALT, 0x32); Start-Sleep -Milliseconds 400
+        [E2E]::Chord($VK_ALT, $VK_L); Start-Sleep -Milliseconds 500
+    }
+    $afterRestart = Snap 'after-explorer-restart'
+    $cloakedNow = @($afterRestart | Where-Object { $_.Cloaked -ne 0 })
+    $parkedNow = @($afterRestart | Where-Object { $_.X -le -29000 -and $_.Y -le -29000 })
+    Check 'E-explorer: windows are still cloaked through the shell after Explorer restarts' ($cloakedNow.Count -ge 1 -and $parkedNow.Count -eq 0) ("explorerRestartedBySystem={0} cloaked={1} parked={2}" -f $explorerBack, $cloakedNow.Count, $parkedNow.Count)
+    Stop-Daemon $daemonProcess
+    Start-Sleep -Seconds 1
+    Test-AllRecovered 'explorer restart + stop'
 }
 catch {
     Check 'guest script completed without exception' $false ($_ | Out-String)
