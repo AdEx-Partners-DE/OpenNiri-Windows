@@ -6,12 +6,14 @@
 //! - Exit daemon
 
 use openniri_platform_win32::{spawn_message_loop_thread, MessageLoopThread, Win32Error};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIcon, TrayIconBuilder,
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 /// Menu item IDs for tray context menu.
@@ -59,6 +61,14 @@ enum TrayCommand {
 pub struct TrayManager {
     thread: MessageLoopThread,
     commands: mpsc::Sender<TrayCommand>,
+    /// Tells the menu-event thread to exit, which closes the tray event channel.
+    menu_thread_stop: Arc<AtomicBool>,
+}
+
+impl Drop for TrayManager {
+    fn drop(&mut self) {
+        self.menu_thread_stop.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Tray objects owned by the tray thread. `MenuItem` is `!Send`.
@@ -85,10 +95,12 @@ impl TrayManager {
     /// The provided sender will receive tray events when menu items are clicked.
     pub fn new(event_sender: mpsc::Sender<TrayEvent>) -> Result<Self, TrayError> {
         let (commands, command_rx) = mpsc::channel::<TrayCommand>();
+        let menu_thread_stop = Arc::new(AtomicBool::new(false));
+        let stop = menu_thread_stop.clone();
         let (thread, ()) = spawn_message_loop_thread(
             "openniri-tray",
             move || {
-                build_tray_ui(event_sender)
+                build_tray_ui(event_sender, stop)
                     .map(|ui| (ui, ()))
                     .map_err(|e| Win32Error::HookInstallFailed(e.to_string()))
             },
@@ -99,7 +111,11 @@ impl TrayManager {
             },
         )
         .map_err(|e| TrayError::Build(e.to_string()))?;
-        Ok(Self { thread, commands })
+        Ok(Self {
+            thread,
+            commands,
+            menu_thread_stop,
+        })
     }
 
     fn send(&self, command: TrayCommand) {
@@ -135,7 +151,10 @@ impl TrayManager {
 }
 
 /// Build the tray icon and menu. Must run on the thread that pumps tray messages.
-fn build_tray_ui(event_sender: mpsc::Sender<TrayEvent>) -> Result<TrayUi, TrayError> {
+fn build_tray_ui(
+    event_sender: mpsc::Sender<TrayEvent>,
+    stop: Arc<AtomicBool>,
+) -> Result<TrayUi, TrayError> {
     // Create context menu
     let menu = Menu::new();
 
@@ -205,9 +224,18 @@ fn build_tray_ui(event_sender: mpsc::Sender<TrayEvent>) -> Result<TrayUi, TrayEr
     info!("System tray icon created");
 
     // Spawn thread to handle menu events and forward them
+    // Icon events (hover, clicks on the icon itself) are unused; without a handler
+    // they accumulate in tray-icon's unbounded global channel.
+    TrayIconEvent::set_event_handler(Some(|_event: TrayIconEvent| {}));
+
     std::thread::spawn(move || {
         let menu_channel = MenuEvent::receiver();
-        while let Ok(event) = menu_channel.recv() {
+        while !stop.load(Ordering::SeqCst) {
+            let event = match menu_channel.recv_timeout(Duration::from_millis(200)) {
+                Ok(event) => event,
+                Err(e) if e.is_timeout() => continue,
+                Err(_) => break,
+            };
             let Some(tray_event) = map_menu_id_to_event(event.id.0.as_str()) else {
                 debug!("Unknown menu item clicked: {}", event.id.0);
                 continue;

@@ -149,7 +149,8 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 - Uncloak is only attempted for windows that are cloaked, and a denied cloak falls back to moving the window off-screen; this ends the repeated `DwmSetWindowAttribute(CLOAK=0) failed` errors and failed layout passes, also with `use_cloaking = false` (#12)
 - A failed layout pass no longer forces the foreground window during rollback, which kept stealing focus during animations (INC-49)
 - Closing a child window (tab, browser pane) no longer removes its still-open top-level window from management
-- Tiled windows snap back when the user finishes dragging or resizing them (`EVENT_SYSTEM_MOVESIZEEND`) instead of on every position change, which fought the drag
+- Tiled windows snap back when the user finishes dragging or resizing them (`EVENT_SYSTEM_MOVESIZEEND`) instead of on every position change, which fought the drag. Maximizing, Win+Arrow snapping or an app moving itself no longer triggers a snap-back; the next layout pass corrects the position
+- New windows are adopted when first shown or uncloaked (`EVENT_OBJECT_SHOW`, `EVENT_OBJECT_UNCLOAKED`), not only when created; most apps create their window hidden
 - Cloak/uncloak errors now include the HRESULT
 
 - Restored scroll offsets no longer overwritten by `ensure_focused_visible()` during startup (iter 38)

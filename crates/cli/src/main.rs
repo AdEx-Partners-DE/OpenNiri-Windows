@@ -1199,7 +1199,7 @@ log_level = "info"
 focus_follows_mouse = false
 
 [hotkeys]
-# Vim-style navigation with Win key
+# Vim-style navigation with Alt (most Win+letter combos are reserved by Windows 11)
 "Alt+H" = "focus_left"
 "Alt+L" = "focus_right"
 "Alt+J" = "focus_down"

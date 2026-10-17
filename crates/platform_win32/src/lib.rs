@@ -51,6 +51,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // WinEvent constants (not all are exposed by windows-rs)
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+/// Most applications create their top-level window hidden and show it afterwards,
+/// so `EVENT_OBJECT_CREATE` alone usually sees an invisible window.
+const EVENT_OBJECT_SHOW: u32 = 0x8002;
+/// UWP frames become visible by being uncloaked rather than shown.
+const EVENT_OBJECT_UNCLOAKED: u32 = 0x8018;
 const EVENT_OBJECT_FOCUS: u32 = 0x8005;
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
@@ -591,7 +596,9 @@ fn should_emit_window_event_for(event: u32, hwnd: HWND) -> bool {
     match event {
         // Creation can happen before title is set; keep manageability checks but
         // allow empty title and cloaked transitional states.
-        EVENT_OBJECT_CREATE => should_emit_window_event_with_policy(hwnd, true, false, false),
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
+            should_emit_window_event_with_policy(hwnd, true, false, false)
+        }
         // Focus must not be blocked by cloaked-state checks or empty titles.
         EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => {
             should_emit_window_event_with_policy(hwnd, true, false, false)
@@ -610,6 +617,8 @@ fn should_filter_window_event_by_manageability(event: u32) -> bool {
     matches!(
         event,
         EVENT_OBJECT_CREATE
+            | EVENT_OBJECT_SHOW
+            | EVENT_OBJECT_UNCLOAKED
             | EVENT_OBJECT_DESTROY
             | EVENT_SYSTEM_FOREGROUND
             | EVENT_SYSTEM_MINIMIZESTART
@@ -624,7 +633,7 @@ fn should_filter_window_event_by_manageability(event: u32) -> bool {
 enum EventTargetPolicy {
     /// Focus-style events: a focused child control means its top-level window has focus.
     NormalizeToRoot,
-    /// Create/move events for child windows (tabs, browser panes) are ignored.
+    /// Create/show/move events for child windows (tabs, browser panes) are ignored.
     TopLevelOnly,
     /// Destroy events keep the original HWND. A destroyed window can no longer be
     /// mapped to its root, and normalizing a destroyed child used to remove its
@@ -634,7 +643,10 @@ enum EventTargetPolicy {
 
 fn event_target_policy(event: u32) -> EventTargetPolicy {
     match event {
-        EVENT_OBJECT_CREATE | EVENT_SYSTEM_MOVESIZEEND => EventTargetPolicy::TopLevelOnly,
+        EVENT_OBJECT_CREATE
+        | EVENT_OBJECT_SHOW
+        | EVENT_OBJECT_UNCLOAKED
+        | EVENT_SYSTEM_MOVESIZEEND => EventTargetPolicy::TopLevelOnly,
         EVENT_OBJECT_DESTROY => EventTargetPolicy::Exact,
         _ => EventTargetPolicy::NormalizeToRoot,
     }
@@ -1185,30 +1197,26 @@ pub fn apply_placements(
         ensure_foreground_window_remains_visible(&visible, &offscreen);
 
     if let Some(window_id) = protected_foreground_window {
-        match config.hide_strategy {
-            HideStrategy::Cloak if needs_uncloak(window_id) => {
-                if let Err(e) = uncloak_window(window_id) {
-                    record_apply_side_effect_failure(
-                        &mut side_effect_failures,
-                        &mut benign_side_effect_races,
-                        "uncloak protected foreground",
-                        window_id,
-                        e,
-                    );
-                }
+        if config.hide_strategy == HideStrategy::Cloak && needs_uncloak(window_id) {
+            if let Err(e) = uncloak_window(window_id) {
+                record_apply_side_effect_failure(
+                    &mut side_effect_failures,
+                    &mut benign_side_effect_races,
+                    "uncloak protected foreground",
+                    window_id,
+                    e,
+                );
             }
-            HideStrategy::Cloak => {}
-            HideStrategy::MoveOffScreen => {
-                if let Err(e) = restore_windows_moved_offscreen(&[window_id]) {
-                    record_apply_side_effect_failure(
-                        &mut side_effect_failures,
-                        &mut benign_side_effect_races,
-                        "restore protected foreground",
-                        window_id,
-                        e,
-                    );
-                }
-            }
+        }
+        // Cloak mode falls back to moving windows off-screen, so restore in both modes.
+        if let Err(e) = restore_windows_moved_offscreen(&[window_id]) {
+            record_apply_side_effect_failure(
+                &mut side_effect_failures,
+                &mut benign_side_effect_races,
+                "restore protected foreground",
+                window_id,
+                e,
+            );
         }
     }
 
@@ -2014,7 +2022,8 @@ impl Drop for EventHookHandle {
 /// Also returns a receiver channel for the events.
 ///
 /// # Events Hooked
-/// - Window creation (EVENT_OBJECT_CREATE)
+/// - Window creation and first show (EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW,
+///   EVENT_OBJECT_UNCLOAKED), all reported as `WindowEvent::Created`
 /// - Window destruction (EVENT_OBJECT_DESTROY)
 /// - Foreground change (EVENT_SYSTEM_FOREGROUND)
 /// - Minimize/restore (EVENT_SYSTEM_MINIMIZESTART/END)
@@ -2030,11 +2039,12 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
 
     // Define events to hook: (min_event, max_event)
     let event_ranges = [
-        (EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY), // Create/Destroy
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW), // Create/Destroy/Show
+        (EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED), // UWP frames appearing
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND), // Foreground
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), // Minimize
         (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND), // User finished move/resize
-        (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS),    // Focus within app
+        (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS), // Focus within app
     ];
 
     unsafe {
@@ -2141,8 +2151,14 @@ fn win_event_callback_inner(
 
     // Map event to our WindowEvent type
     let window_event = match event {
-        EVENT_OBJECT_CREATE => WindowEvent::Created(window_id),
-        EVENT_OBJECT_DESTROY => WindowEvent::Destroyed(window_id),
+        // The daemon ignores Created for windows it already manages.
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
+            WindowEvent::Created(window_id)
+        }
+        EVENT_OBJECT_DESTROY => {
+            track_daemon_cloak(window_id, false);
+            WindowEvent::Destroyed(window_id)
+        }
         EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => WindowEvent::Focused(window_id),
         EVENT_SYSTEM_MINIMIZESTART => WindowEvent::Minimized(window_id),
         EVENT_SYSTEM_MINIMIZEEND => WindowEvent::Restored(window_id),
@@ -2195,11 +2211,22 @@ impl MessageLoopThread {
         let Some(thread) = self.thread.take() else {
             return true;
         };
-        let _ =
-            unsafe { PostThreadMessageW(self.thread_id, WM_OPENNIRI_QUIT, WPARAM(0), LPARAM(0)) };
+        let post_quit = || {
+            let _ = unsafe {
+                PostThreadMessageW(self.thread_id, WM_OPENNIRI_QUIT, WPARAM(0), LPARAM(0))
+            };
+        };
+        post_quit();
         let deadline = std::time::Instant::now() + timeout;
+        let mut next_repost = std::time::Instant::now() + std::time::Duration::from_millis(100);
         while !thread.is_finished() {
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            // Modal loops (an open tray menu) discard thread messages, so repeat the request.
+            if now >= next_repost {
+                post_quit();
+                next_repost = now + std::time::Duration::from_millis(100);
+            }
+            if now >= deadline {
                 tracing::warn!(
                     "{} thread did not exit within {:?}; detaching it",
                     self.name,
@@ -2492,12 +2519,12 @@ pub struct HotkeyHandle {
 }
 
 impl HotkeyHandle {
-    /// Returns the number of successfully registered hotkeys.
     /// Whether the hotkey with this id was registered.
     pub fn is_registered(&self, id: HotkeyId) -> bool {
         self.registered_ids.contains(&id)
     }
 
+    /// Returns the number of successfully registered hotkeys.
     pub fn registered_count(&self) -> usize {
         self.registered_ids.len()
     }
@@ -3698,6 +3725,12 @@ mod tests {
             EVENT_OBJECT_CREATE
         ));
         assert!(should_filter_window_event_by_manageability(
+            EVENT_OBJECT_SHOW
+        ));
+        assert!(should_filter_window_event_by_manageability(
+            EVENT_OBJECT_UNCLOAKED
+        ));
+        assert!(should_filter_window_event_by_manageability(
             EVENT_SYSTEM_MOVESIZEEND
         ));
         assert!(should_filter_window_event_by_manageability(
@@ -3840,6 +3873,14 @@ mod tests {
         );
         assert_eq!(
             event_target_policy(EVENT_OBJECT_CREATE),
+            EventTargetPolicy::TopLevelOnly
+        );
+        assert_eq!(
+            event_target_policy(EVENT_OBJECT_SHOW),
+            EventTargetPolicy::TopLevelOnly
+        );
+        assert_eq!(
+            event_target_policy(EVENT_OBJECT_UNCLOAKED),
             EventTargetPolicy::TopLevelOnly
         );
         assert_eq!(

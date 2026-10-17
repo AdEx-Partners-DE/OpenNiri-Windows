@@ -2098,7 +2098,7 @@ fn is_process_more_privileged_than_daemon(process_id: u32) -> bool {
 
 fn log_skipped_privileged_window(title: &str) {
     info!(
-        "Not managing window '{}': its process runs with higher privileges (for example as administrator), so OpenNiri cannot move it. Run OpenNiri elevated to tile such windows.",
+        "Not managing window '{}': OpenNiri cannot read its process's privilege level or it runs with higher privileges (for example as administrator), so Windows would block moving it",
         title
     );
 }
@@ -3531,11 +3531,14 @@ async fn main() -> Result<()> {
         handle.abort();
     }
 
-    // Unhook first: removing the hooks drops the global senders, which lets the
-    // forwarding threads below see a closed channel and exit.
+    // Unhook first: removing the hooks drops the global senders, and dropping the
+    // tray stops its menu thread, so those forwarding threads see a closed channel.
+    // Dropping the receiver unblocks any forwarder waiting on a full channel.
     drop(hook_thread);
     drop(mouse_hook_thread);
     drop(gesture_thread);
+    drop(tray_manager);
+    drop(event_rx);
 
     // Join forwarding threads with timeout for graceful shutdown
     info!("Waiting for forwarding threads to exit...");
