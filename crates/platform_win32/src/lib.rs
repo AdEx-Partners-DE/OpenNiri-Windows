@@ -41,11 +41,12 @@ pub use focus::{
 };
 pub use hotkeys::{
     clear_display_change_sender, parse_hotkey_string, parse_vk, register_hotkeys,
-    set_display_change_sender, vk, Hotkey, HotkeyEvent, HotkeyHandle, HotkeyId, Modifiers,
+    set_display_change_sender, spawn_display_watcher, vk, Hotkey, HotkeyEvent, HotkeyHandle,
+    HotkeyId, Modifiers,
 };
 pub use input::{
-    install_mouse_hook, register_gestures, spawn_gesture_thread, spawn_mouse_hook_thread,
-    GestureEvent, GestureHandle, MouseHookHandle,
+    install_mouse_hook, register_gestures, spawn_gesture_thread, spawn_input_hook_thread,
+    spawn_mouse_hook_thread, GestureEvent, GestureHandle, MouseHookHandle,
 };
 pub use message_loop::{spawn_message_loop_thread, MessageLoopThread};
 pub use monitors::{
@@ -58,7 +59,7 @@ pub use offscreen::{
     restore_all_windows_moved_offscreen_best_effort, restore_window_moved_offscreen,
     restore_windows_moved_offscreen, MOVE_OFFSCREEN_SENTINEL_COORD,
 };
-pub use placement::{apply_placements, HideStrategy, PlatformConfig};
+pub use placement::{apply_placements, apply_placements_with_focus, HideStrategy, PlatformConfig};
 pub use window::{
     describe_window, enumerate_windows, get_process_executable, is_process_more_privileged,
     is_valid_window, WindowInfo,

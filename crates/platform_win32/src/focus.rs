@@ -5,16 +5,21 @@ use crate::window::window_id_to_hwnd;
 use openniri_core_layout::WindowId;
 use std::ffi::c_void;
 use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow,
-    PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
+    IsWindow, PostMessageW, SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
 };
 
 /// Set the foreground window using Win32 SetForegroundWindow.
 ///
 /// Uses AttachThreadInput trick to reliably set foreground even when
 /// the calling process is not the foreground process.
+///
+/// Never waits for another application: a hung target returns `Ok(false)`
+/// (denied), a minimized target is restored asynchronously, and the input queue
+/// of a hung foreground window is not attached (sharing input state with a hung
+/// thread can block this one).
 pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
     let window_id = hwnd;
     let hwnd = window_id_to_hwnd(window_id)?;
@@ -24,19 +29,21 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
             return Err(Win32Error::WindowNotFound(window_id));
         }
 
+        if IsHungAppWindow(hwnd).as_bool() {
+            tracing::debug!(
+                "Not focusing window {}: its application is not responding",
+                window_id
+            );
+            return Ok(false);
+        }
+
         if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            if IsIconic(hwnd).as_bool() {
-                return Err(Win32Error::SetPositionFailed(format!(
-                    "Failed to restore minimized window {} before setting foreground",
-                    window_id
-                )));
-            }
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         }
 
         let target_thread = GetWindowThreadProcessId(hwnd, None);
         if target_thread == 0 {
-            return Err(Win32Error::SetPositionFailed(format!(
+            return Err(Win32Error::ForegroundFailed(format!(
                 "GetWindowThreadProcessId returned 0 for window {}",
                 window_id
             )));
@@ -54,23 +61,25 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
         // thread does not, because the target is not in the foreground; that is
         // why focus-follows-mouse focus changes were reverted.
         let attach_thread = if foreground_hwnd.0.is_null() {
-            target_thread
+            Some(target_thread)
+        } else if IsHungAppWindow(foreground_hwnd).as_bool() {
+            tracing::debug!(
+                "Foreground window {:?} is not responding; focusing window {} without attaching input",
+                foreground_hwnd,
+                window_id
+            );
+            None
         } else {
             match GetWindowThreadProcessId(foreground_hwnd, None) {
-                0 => target_thread,
-                thread => thread,
+                0 => Some(target_thread),
+                thread => Some(thread),
             }
-        };
+        }
+        .filter(|thread| *thread != current_thread);
 
         let mut attached = false;
-        if attach_thread != current_thread {
-            if windows::Win32::System::Threading::AttachThreadInput(
-                current_thread,
-                attach_thread,
-                true,
-            )
-            .as_bool()
-            {
+        if let Some(attach_thread) = attach_thread {
+            if AttachThreadInput(current_thread, attach_thread, true).as_bool() {
                 attached = true;
             } else {
                 diagnostics.push(format!(
@@ -99,18 +108,13 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
         }
 
         // Detach thread input
-        if attached
-            && !windows::Win32::System::Threading::AttachThreadInput(
-                current_thread,
-                attach_thread,
-                false,
-            )
-            .as_bool()
-        {
-            diagnostics.push(format!(
-                "AttachThreadInput detach failed (current_thread={}, attach_thread={})",
-                current_thread, attach_thread
-            ));
+        if let Some(attach_thread) = attach_thread.filter(|_| attached) {
+            if !AttachThreadInput(current_thread, attach_thread, false).as_bool() {
+                diagnostics.push(format!(
+                    "AttachThreadInput detach failed (current_thread={}, attach_thread={})",
+                    current_thread, attach_thread
+                ));
+            }
         }
 
         if foreground_set {
@@ -129,7 +133,7 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
             return Ok(false);
         }
 
-        Err(Win32Error::SetPositionFailed(format!(
+        Err(Win32Error::ForegroundFailed(format!(
             "Failed to set foreground window {}: {}",
             window_id,
             diagnostics.join("; ")
@@ -150,9 +154,7 @@ pub fn close_window(hwnd: WindowId) -> Result<(), Win32Error> {
             windows::Win32::Foundation::WPARAM(0),
             windows::Win32::Foundation::LPARAM(0),
         )
-        .map_err(|e| {
-            Win32Error::SetPositionFailed(format!("PostMessageW(WM_CLOSE) failed: {}", e))
-        })?;
+        .map_err(|e| Win32Error::CloseFailed(format!("PostMessageW(WM_CLOSE) failed: {}", e)))?;
     }
     Ok(())
 }
@@ -188,7 +190,7 @@ pub fn set_window_border_color(hwnd: WindowId, color: u32) -> Result<bool, Win32
                     return Ok(false);
                 }
 
-                Err(Win32Error::SetPositionFailed(format!(
+                Err(Win32Error::BorderColorFailed(format!(
                     "DwmSetWindowAttribute(DWMWA_BORDER_COLOR) failed for {:?}: {}",
                     hwnd, e
                 )))

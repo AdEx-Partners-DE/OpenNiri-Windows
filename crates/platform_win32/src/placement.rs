@@ -2,12 +2,14 @@
 //! windows, foreground protection and invisible-border compensation.
 
 use crate::cloak::{
-    cloak_access_denied, cloak_window, collect_uncloak_targets, filter_uncloak_targets,
-    needs_uncloak, uncloak_window,
+    cloak_access_denied, cloak_windows, collect_uncloak_targets, filter_uncloak_targets,
+    flush_cloak_journal, needs_uncloak, uncloak_window,
 };
-use crate::error::{combine_operation_failures, is_benign_window_race_error, Win32Error};
+use crate::error::{is_benign_window_race_error, FailureLog, Win32Error};
 use crate::focus::set_foreground_window;
-use crate::offscreen::{move_offscreen_rect_for, restore_windows_moved_offscreen};
+use crate::offscreen::{
+    is_move_offscreen_sentinel_rect, move_offscreen_rect_for, restore_windows_moved_offscreen,
+};
 use crate::window::{normalize_to_root_window, window_id_to_hwnd};
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
@@ -15,7 +17,8 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetForegroundWindow, GetWindowRect,
-    IsIconic, IsWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+    IsHungAppWindow, IsIconic, IsWindow, SetWindowPos, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOZORDER,
 };
 
 /// Strategy for hiding off-screen windows.
@@ -50,6 +53,7 @@ impl Default for PlatformConfig {
 fn ensure_foreground_window_remains_visible(
     visible: &[&WindowPlacement],
     offscreen: &[&WindowPlacement],
+    focused_window: Option<WindowId>,
 ) -> Option<WindowId> {
     if offscreen.is_empty() {
         return None;
@@ -72,7 +76,8 @@ fn ensure_foreground_window_remains_visible(
         return None;
     }
 
-    let fallback_window_id = select_visible_fallback_window(visible, foreground_window_id);
+    let fallback_window_id =
+        select_visible_fallback_window(visible, foreground_window_id, focused_window);
 
     if let Some(window_id) = fallback_window_id {
         match set_foreground_window(window_id) {
@@ -110,10 +115,21 @@ fn offscreen_contains_window(offscreen: &[&WindowPlacement], window_id: WindowId
         .any(|placement| placement.window_id == window_id)
 }
 
+/// Visible window that takes the foreground when the foreground window is hidden.
+///
+/// The layout's focused window is the right choice when it is visible; without
+/// it, the first other visible window is used.
 fn select_visible_fallback_window(
     visible: &[&WindowPlacement],
     foreground_window_id: WindowId,
+    focused_window: Option<WindowId>,
 ) -> Option<WindowId> {
+    let is_visible = |id: WindowId| visible.iter().any(|placement| placement.window_id == id);
+    if let Some(focused) =
+        focused_window.filter(|focused| *focused != foreground_window_id && is_visible(*focused))
+    {
+        return Some(focused);
+    }
     visible
         .iter()
         .find(|placement| placement.window_id != foreground_window_id)
@@ -121,85 +137,51 @@ fn select_visible_fallback_window(
         .map(|placement| placement.window_id)
 }
 
-/// Undo visibility changes made by a failed `apply_placements` call.
+/// Apply window placements from the layout engine.
 ///
-/// This deliberately does not change the foreground window. A failed apply can
-/// repeat on every animation frame, and forcing focus each time locked users out
-/// of their own windows (INC-49).
-fn rollback_apply_visibility_changes(
-    cloaked_window_ids: &[WindowId],
-    moved_offscreen_window_ids: &[WindowId],
-) {
-    for window_id in cloaked_window_ids {
-        if let Err(e) = uncloak_window(*window_id) {
-            tracing::warn!(
-                "Rollback failed while uncloaking window {} after apply error: {}",
-                window_id,
-                e
-            );
-        }
-    }
-
-    if !moved_offscreen_window_ids.is_empty() {
-        if let Err(e) = restore_windows_moved_offscreen(moved_offscreen_window_ids) {
-            tracing::warn!(
-                "Rollback failed while restoring moved-offscreen windows after apply error: {}",
-                e
-            );
-        }
-    }
-}
-
-fn record_apply_side_effect_failure(
-    side_effect_failures: &mut Vec<String>,
-    benign_race_count: &mut usize,
-    operation: &str,
-    window_id: WindowId,
-    error: Win32Error,
-) {
-    if is_benign_window_race_error(&error) {
-        *benign_race_count += 1;
-        tracing::debug!(
-            "Ignoring benign race during {} for window {}: {}",
-            operation,
-            window_id,
-            error
-        );
-    } else {
-        tracing::warn!("Failed to {} window {}: {}", operation, window_id, error);
-        side_effect_failures.push(format!("{} {} failed: {}", operation, window_id, error));
-    }
+/// Same as [`apply_placements_with_focus`] without a focused window.
+pub fn apply_placements(
+    placements: &[WindowPlacement],
+    config: &PlatformConfig,
+) -> Result<(), Win32Error> {
+    apply_placements_with_focus(placements, config, None)
 }
 
 /// Apply window placements from the layout engine.
 ///
 /// This function:
-/// 1. Groups placements by visibility
-/// 2. Uses DeferWindowPos for visible windows (batched move)
-/// 3. Applies cloaking/uncloaking based on visibility changes
-pub fn apply_placements(
+/// 1. Positions visible windows (batched with DeferWindowPos when configured)
+/// 2. Uncloaks windows that become visible
+/// 3. Hides off-screen windows: cloaks them, or moves them off-screen when the
+///    strategy says so or cloaking fails
+///
+/// When the foreground window is about to be hidden, focus first moves to
+/// `focused_window` (the layout's focused window) if it is visible, otherwise
+/// to another visible window. Windows whose application is hung are skipped,
+/// because positioning them blocks until the application responds.
+///
+/// A failure for one window does not stop the others and nothing is rolled
+/// back: every window that should be hidden ends up either cloaked (and
+/// tracked for recovery) or moved off-screen, or stays where it was.
+pub fn apply_placements_with_focus(
     placements: &[WindowPlacement],
     config: &PlatformConfig,
+    focused_window: Option<WindowId>,
 ) -> Result<(), Win32Error> {
     if placements.is_empty() {
         return Ok(());
     }
 
-    // Separate visible and off-screen windows
     let (visible, offscreen): (Vec<_>, Vec<_>) = placements
         .iter()
         .partition(|p| p.visibility == Visibility::Visible);
-    let mut side_effect_failures: Vec<String> = Vec::new();
-    let mut benign_side_effect_races: usize = 0;
-    let mut cloaked_window_ids: Vec<WindowId> = Vec::new();
-    let mut moved_offscreen_window_ids: Vec<WindowId> = Vec::new();
+    let mut failures = FailureLog::default();
 
-    // Apply positions for visible windows
     if !visible.is_empty() {
         if config.use_deferred_positioning {
-            apply_placements_deferred(&visible)?;
+            apply_placements_deferred(&visible, &mut failures);
         } else {
-            apply_placements_immediate(&visible)?;
+            apply_placements_immediate(&visible, &mut failures);
         }
     }
 
@@ -210,89 +192,71 @@ pub fn apply_placements(
     );
     for window_id in uncloak_targets {
         if let Err(e) = uncloak_window(window_id) {
-            record_apply_side_effect_failure(
-                &mut side_effect_failures,
-                &mut benign_side_effect_races,
-                "uncloak",
-                window_id,
-                e,
-            );
+            failures.record("uncloak", window_id, e);
         }
     }
 
     let protected_foreground_window =
-        ensure_foreground_window_remains_visible(&visible, &offscreen);
+        ensure_foreground_window_remains_visible(&visible, &offscreen, focused_window);
 
     if let Some(window_id) = protected_foreground_window {
         if config.hide_strategy == HideStrategy::Cloak && needs_uncloak(window_id) {
             if let Err(e) = uncloak_window(window_id) {
-                record_apply_side_effect_failure(
-                    &mut side_effect_failures,
-                    &mut benign_side_effect_races,
-                    "uncloak protected foreground",
-                    window_id,
-                    e,
-                );
+                failures.record("uncloak protected foreground", window_id, e);
             }
         }
         // Cloak mode falls back to moving windows off-screen, so restore in both modes.
         if let Err(e) = restore_windows_moved_offscreen(&[window_id]) {
-            record_apply_side_effect_failure(
-                &mut side_effect_failures,
-                &mut benign_side_effect_races,
-                "restore protected foreground",
-                window_id,
-                e,
-            );
+            failures.record("restore protected foreground", window_id, e);
         }
     }
 
-    // Hide off-screen windows. Cloak when the strategy allows it; when DWM
-    // rejects the cloak, move the window off-screen instead so one foreign
-    // window cannot fail the whole pass.
-    for placement in &offscreen {
-        if protected_foreground_window == Some(placement.window_id) {
-            tracing::warn!(
-                "Skipping hide for foreground window {} because focus handoff was not confirmed",
-                placement.window_id
-            );
-            continue;
-        }
-        if config.hide_strategy == HideStrategy::Cloak && !cloak_access_denied() {
-            match cloak_window(placement.window_id) {
-                Ok(()) => {
-                    cloaked_window_ids.push(placement.window_id);
-                    continue;
+    let to_hide: Vec<&WindowPlacement> = offscreen
+        .iter()
+        .copied()
+        .filter(|placement| {
+            let protected = protected_foreground_window == Some(placement.window_id);
+            if protected {
+                tracing::warn!(
+                    "Skipping hide for foreground window {} because focus handoff was not confirmed",
+                    placement.window_id
+                );
+            }
+            !protected
+        })
+        .collect();
+
+    // Hide off-screen windows. Cloak when the strategy allows it; when the
+    // cloak fails, move the window off-screen instead so one foreign window
+    // cannot fail the whole pass.
+    let mut move_offscreen: Vec<&WindowPlacement> = Vec::new();
+    if config.hide_strategy == HideStrategy::Cloak && !cloak_access_denied() {
+        let ids: Vec<WindowId> = to_hide.iter().map(|p| p.window_id).collect();
+        for (result, placement) in cloak_windows(&ids).into_iter().zip(&to_hide) {
+            let window_id = placement.window_id;
+            match result {
+                Ok(()) => {}
+                Err(e) if is_benign_window_race_error(&e) => failures.record("cloak", window_id, e),
+                Err(e) => {
+                    tracing::debug!(
+                        "Cloak failed for window {}: {}; moving it off-screen instead",
+                        window_id,
+                        e
+                    );
+                    move_offscreen.push(placement);
                 }
-                Err(e) if is_benign_window_race_error(&e) => {
-                    benign_side_effect_races += 1;
-                    continue;
-                }
-                Err(e) => tracing::debug!(
-                    "Cloak failed for window {}: {}; moving it off-screen instead",
-                    placement.window_id,
-                    e
-                ),
             }
         }
-        let offscreen_placement = WindowPlacement {
-            window_id: placement.window_id,
-            rect: move_offscreen_rect_for(&placement.rect),
-            visibility: Visibility::OffScreenLeft,
-            column_index: placement.column_index,
-        };
-        if let Err(e) = set_window_pos_immediate(&offscreen_placement) {
-            record_apply_side_effect_failure(
-                &mut side_effect_failures,
-                &mut benign_side_effect_races,
-                "move off-screen",
-                placement.window_id,
-                e,
-            );
-        } else {
-            moved_offscreen_window_ids.push(placement.window_id);
+    } else {
+        move_offscreen = to_hide;
+    }
+    for placement in move_offscreen {
+        if let Err(e) = move_window_offscreen(placement) {
+            failures.record("move off-screen", placement.window_id, e);
         }
     }
+
+    flush_cloak_journal();
 
     tracing::debug!(
         "Applied {} visible placements, {} off-screen",
@@ -300,184 +264,134 @@ pub fn apply_placements(
         offscreen.len()
     );
 
-    if !side_effect_failures.is_empty() {
-        rollback_apply_visibility_changes(&cloaked_window_ids, &moved_offscreen_window_ids);
-        return Err(combine_operation_failures(
-            "apply_placements completed with side-effect failures",
-            side_effect_failures,
-        ));
-    }
+    failures.into_result("apply_placements completed with failures")
+}
 
-    if benign_side_effect_races > 0 {
+/// Park a window at the MoveOffScreen sentinel unless it is already there.
+fn move_window_offscreen(placement: &WindowPlacement) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(placement.window_id)?;
+    let mut current = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut current) }.is_ok()
+        && is_move_offscreen_sentinel_rect(&Rect::new(
+            current.left,
+            current.top,
+            current.right - current.left,
+            current.bottom - current.top,
+        ))
+    {
+        return Ok(());
+    }
+    set_window_pos_immediate(&WindowPlacement {
+        window_id: placement.window_id,
+        rect: move_offscreen_rect_for(&placement.rect),
+        visibility: Visibility::OffScreenLeft,
+        column_index: placement.column_index,
+    })
+}
+
+/// Whether a window's application is hung. Positioning such a window blocks
+/// the caller until the application responds (or forever).
+fn is_window_hung(window_id: WindowId, hwnd: HWND) -> bool {
+    let hung = unsafe { IsHungAppWindow(hwnd) }.as_bool();
+    if hung {
         tracing::debug!(
-            "apply_placements ignored {} benign side-effect race(s)",
-            benign_side_effect_races
+            "Skipping placement of window {}: its application is not responding",
+            window_id
         );
     }
-
-    Ok(())
+    hung
 }
 
 /// Apply placements using DeferWindowPos for batched positioning.
 ///
-/// This function uses the Windows DeferWindowPos API to batch multiple
-/// window positioning operations into a single screen update, reducing
-/// flicker and improving performance.
-///
-/// If EndDeferWindowPos fails, falls back to individual SetWindowPos calls
-/// for all windows and returns an error if fallback cannot fully recover.
-/// If individual DeferWindowPos calls fail during the batch, those placements
-/// are tracked and retried individually after the batch; unrecovered failures
-/// are returned as an error.
-fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
+/// Batching moves all windows in a single screen update, reducing flicker. If
+/// the batch cannot be built or committed, every window is positioned
+/// individually instead (a failed `DeferWindowPos` invalidates the batch, so it
+/// must not be committed).
+fn apply_placements_deferred(placements: &[&WindowPlacement], failures: &mut FailureLog) {
+    let mut targets: Vec<(&WindowPlacement, HWND)> = Vec::with_capacity(placements.len());
+    for placement in placements {
+        let hwnd = match window_id_to_hwnd(placement.window_id) {
+            Ok(hwnd) => hwnd,
+            Err(e) => {
+                failures.record("position", placement.window_id, e);
+                continue;
+            }
+        };
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            failures.record(
+                "position",
+                placement.window_id,
+                Win32Error::WindowNotFound(placement.window_id),
+            );
+            continue;
+        }
+        if !is_window_hung(placement.window_id, hwnd) {
+            targets.push((placement, hwnd));
+        }
+    }
+    if targets.is_empty() || commit_deferred_batch(&targets) {
+        return;
+    }
+    for (placement, _) in targets {
+        if let Err(e) = set_window_pos_immediate(placement) {
+            failures.record("position", placement.window_id, e);
+        }
+    }
+}
+
+/// Position all targets in one DeferWindowPos batch. Returns false if the batch
+/// failed and the windows must be positioned individually.
+fn commit_deferred_batch(targets: &[(&WindowPlacement, HWND)]) -> bool {
     unsafe {
-        let hdwp =
-            BeginDeferWindowPos(placements.len().min(i32::MAX as usize) as i32).map_err(|e| {
-                Win32Error::SetPositionFailed(format!("BeginDeferWindowPos failed: {}", e))
-            })?;
-
-        let mut current_hdwp = hdwp;
-        let mut failed_placements: Vec<&WindowPlacement> = Vec::new();
-
-        for placement in placements {
-            let hwnd = match window_id_to_hwnd(placement.window_id) {
-                Ok(h) => h,
-                Err(err) => {
-                    tracing::warn!(
-                        "Skipping deferred placement for invalid window ID {}: {}",
-                        placement.window_id,
-                        err
-                    );
-                    failed_placements.push(placement);
-                    continue;
-                }
-            };
-            let rect = compensate_invisible_border(&placement.rect, invisible_border(hwnd));
-
+        let mut hdwp = match BeginDeferWindowPos(targets.len().min(i32::MAX as usize) as i32) {
+            Ok(hdwp) => hdwp,
+            Err(e) => {
+                tracing::warn!(
+                    "BeginDeferWindowPos failed: {}; positioning individually",
+                    e
+                );
+                return false;
+            }
+        };
+        for (placement, hwnd) in targets {
+            let rect = compensate_invisible_border(&placement.rect, invisible_border(*hwnd));
             match DeferWindowPos(
-                current_hdwp,
-                hwnd,
-                None, // HWND_TOP equivalent - no z-order change with SWP_NOZORDER
+                hdwp,
+                *hwnd,
+                None, // no z-order change with SWP_NOZORDER
                 rect.x,
                 rect.y,
                 rect.width,
                 rect.height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             ) {
-                Ok(new_hdwp) => {
-                    current_hdwp = new_hdwp;
-                }
+                Ok(next) => hdwp = next,
                 Err(e) => {
                     tracing::warn!(
-                        "DeferWindowPos failed for window {}: {}, will retry individually",
+                        "DeferWindowPos failed for window {}: {}; positioning individually",
                         placement.window_id,
                         e
                     );
-                    failed_placements.push(placement);
+                    return false;
                 }
             }
         }
-
-        // Try to commit the batch
-        if let Err(e) = EndDeferWindowPos(current_hdwp) {
-            tracing::warn!(
-                "EndDeferWindowPos failed: {}. Falling back to individual positioning for all windows.",
-                e
-            );
-            // Fall back to individual positioning for ALL windows
-            let mut fallback_failures: Vec<String> = Vec::new();
-            let mut benign_races: usize = 0;
-            for placement in placements {
-                if let Err(fallback_err) = set_window_pos_immediate(placement) {
-                    if is_benign_window_race_error(&fallback_err) {
-                        benign_races += 1;
-                        tracing::debug!(
-                            "Ignoring benign race during deferred fallback for window {}: {}",
-                            placement.window_id,
-                            fallback_err
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Individual SetWindowPos also failed for {}: {}",
-                            placement.window_id,
-                            fallback_err
-                        );
-                        fallback_failures
-                            .push(format!("window {}: {}", placement.window_id, fallback_err));
-                    }
-                }
-            }
-            if !fallback_failures.is_empty() {
-                fallback_failures.insert(0, format!("EndDeferWindowPos failed: {}", e));
-                return Err(combine_operation_failures(
-                    "Deferred positioning fallback could not fully recover",
-                    fallback_failures,
-                ));
-            }
-            if benign_races > 0 {
-                tracing::debug!(
-                    "Deferred fallback ignored {} benign window race(s)",
-                    benign_races
-                );
-            }
-        } else {
-            // Batch succeeded, now handle any that failed during deferral
-            let mut fallback_failures: Vec<String> = Vec::new();
-            let mut benign_races: usize = 0;
-            for placement in failed_placements {
-                if let Err(fallback_err) = set_window_pos_immediate(placement) {
-                    if is_benign_window_race_error(&fallback_err) {
-                        benign_races += 1;
-                        tracing::debug!(
-                            "Ignoring benign race during deferred retry for window {}: {}",
-                            placement.window_id,
-                            fallback_err
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Fallback SetWindowPos failed for {}: {}",
-                            placement.window_id,
-                            fallback_err
-                        );
-                        fallback_failures
-                            .push(format!("window {}: {}", placement.window_id, fallback_err));
-                    }
-                }
-            }
-            if !fallback_failures.is_empty() {
-                return Err(combine_operation_failures(
-                    "Deferred positioning had unrecovered per-window failures",
-                    fallback_failures,
-                ));
-            }
-            if benign_races > 0 {
-                tracing::debug!(
-                    "Deferred retry ignored {} benign window race(s)",
-                    benign_races
-                );
-            }
+        if let Err(e) = EndDeferWindowPos(hdwp) {
+            tracing::warn!("EndDeferWindowPos failed: {}; positioning individually", e);
+            return false;
         }
     }
-
-    Ok(())
+    true
 }
 
 /// Apply placements using immediate SetWindowPos calls.
-fn apply_placements_immediate(placements: &[&WindowPlacement]) -> Result<(), Win32Error> {
+fn apply_placements_immediate(placements: &[&WindowPlacement], failures: &mut FailureLog) {
     for placement in placements {
         if let Err(e) = set_window_pos_immediate(placement) {
-            if is_benign_window_race_error(&e) {
-                tracing::debug!(
-                    "Ignoring benign race during immediate placement for window {}: {}",
-                    placement.window_id,
-                    e
-                );
-                continue;
-            }
-            return Err(e);
+            failures.record("position", placement.window_id, e);
         }
     }
-    Ok(())
 }
 
 /// Invisible frame around a window, per side (left, top, right, bottom).
@@ -545,12 +459,19 @@ fn compensate_invisible_border(rect: &Rect, border: InvisibleBorder) -> Rect {
 }
 
 /// Set window position immediately using SetWindowPos.
+///
+/// Windows of hung applications are skipped. `SWP_ASYNCWINDOWPOS` posts the
+/// request to the window's thread instead of waiting for it, so a slow
+/// application cannot block the placement worker either.
 fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Error> {
     let window_id = placement.window_id;
     let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
             return Err(Win32Error::WindowNotFound(window_id));
+        }
+        if is_window_hung(window_id, hwnd) {
+            return Ok(());
         }
 
         let rect = compensate_invisible_border(&placement.rect, invisible_border(hwnd));
@@ -562,7 +483,7 @@ fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Erro
             rect.y,
             rect.width,
             rect.height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         ) {
             if !IsWindow(Some(hwnd)).as_bool() {
                 return Err(Win32Error::WindowNotFound(window_id));
@@ -588,14 +509,44 @@ mod tests {
             placement(2, Visibility::Visible),
         ];
         let visible_refs: Vec<_> = visible.iter().collect();
-        assert_eq!(select_visible_fallback_window(&visible_refs, 1), Some(2));
-        assert_eq!(select_visible_fallback_window(&visible_refs, 2), Some(1));
-        // Only the foreground window is visible: it is still the fallback.
         assert_eq!(
-            select_visible_fallback_window(&visible_refs[..1], 1),
+            select_visible_fallback_window(&visible_refs, 1, None),
+            Some(2)
+        );
+        assert_eq!(
+            select_visible_fallback_window(&visible_refs, 2, None),
             Some(1)
         );
-        assert_eq!(select_visible_fallback_window(&[], 42), None);
+        // Only the foreground window is visible: it is still the fallback.
+        assert_eq!(
+            select_visible_fallback_window(&visible_refs[..1], 1, None),
+            Some(1)
+        );
+        assert_eq!(select_visible_fallback_window(&[], 42, None), None);
+    }
+
+    #[test]
+    fn test_select_visible_fallback_window_prefers_visible_focused_window() {
+        let visible = [
+            placement(1, Visibility::Visible),
+            placement(2, Visibility::Visible),
+            placement(3, Visibility::Visible),
+        ];
+        let visible_refs: Vec<_> = visible.iter().collect();
+        assert_eq!(
+            select_visible_fallback_window(&visible_refs, 9, Some(3)),
+            Some(3)
+        );
+        // A focused window that is not visible, or is the foreground window
+        // being hidden, falls back to the old choice.
+        assert_eq!(
+            select_visible_fallback_window(&visible_refs, 9, Some(4)),
+            Some(1)
+        );
+        assert_eq!(
+            select_visible_fallback_window(&visible_refs, 3, Some(3)),
+            Some(1)
+        );
     }
 
     #[test]

@@ -2,11 +2,13 @@
 
 use crate::error::Win32Error;
 use std::sync::mpsc;
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG,
-    PM_NOREMOVE, WM_APP,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, TranslateMessage, UnregisterClassW, MSG, PM_NOREMOVE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WNDCLASSW, WNDPROC,
 };
 
 /// Thread message that asks a message-loop thread to run its wake handler.
@@ -142,9 +144,7 @@ where
             }
             drop(state);
         })
-        .map_err(|e| {
-            Win32Error::HookInstallFailed(format!("Failed to spawn {} thread: {}", name, e))
-        })?;
+        .map_err(|e| Win32Error::ThreadFailed(format!("Failed to spawn {} thread: {}", name, e)))?;
 
     match init_rx.recv() {
         Ok(Ok((thread_id, payload))) => Ok((
@@ -161,10 +161,68 @@ where
         }
         Err(_) => {
             let _ = thread.join();
-            Err(Win32Error::HookInstallFailed(format!(
+            Err(Win32Error::ThreadFailed(format!(
                 "{} thread exited during initialization",
                 name
             )))
+        }
+    }
+}
+
+/// A window with its own window class, created and destroyed on one thread.
+///
+/// Create it in the `init` of [`spawn_message_loop_thread`] and keep it in the
+/// thread state, so the window lives exactly as long as the thread pumps its
+/// messages and is destroyed on the thread that owns it.
+pub(crate) struct ThreadWindow {
+    hwnd: HWND,
+    class_name: Vec<u16>,
+}
+
+impl ThreadWindow {
+    pub(crate) fn create(
+        class_name: &str,
+        window_proc: WNDPROC,
+        ex_style: WINDOW_EX_STYLE,
+        style: WINDOW_STYLE,
+        width: i32,
+        height: i32,
+    ) -> Result<Self, Win32Error> {
+        let class_name: Vec<u16> = class_name.encode_utf16().chain(Some(0)).collect();
+        let class = PCWSTR(class_name.as_ptr());
+        let wc = WNDCLASSW {
+            lpfnWndProc: window_proc,
+            lpszClassName: class,
+            ..Default::default()
+        };
+        // Fails harmlessly when another thread already registered the class.
+        unsafe { RegisterClassW(&wc) };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                ex_style, class, None, style, 0, 0, width, height, None, None, None, None,
+            )
+        }
+        .map_err(|e| {
+            Win32Error::WindowCreationFailed(format!(
+                "CreateWindowExW({}) failed: {}",
+                String::from_utf16_lossy(&class_name[..class_name.len() - 1]),
+                e
+            ))
+        })?;
+        Ok(Self { hwnd, class_name })
+    }
+
+    pub(crate) fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+}
+
+impl Drop for ThreadWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+            // Fails while another thread still has a window of this class; harmless.
+            let _ = UnregisterClassW(PCWSTR(self.class_name.as_ptr()), None);
         }
     }
 }

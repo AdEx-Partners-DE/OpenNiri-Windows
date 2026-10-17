@@ -6,9 +6,10 @@
 //!
 //! # Architecture
 //!
-//! The overlay window runs on a dedicated background thread with its own
-//! message loop. This ensures that drawing operations don't block the
-//! main daemon event loop.
+//! The overlay window runs on a dedicated message-loop thread (see
+//! [`spawn_message_loop_thread`]). This ensures that drawing operations don't
+//! block the main daemon event loop, and dropping the overlay waits at most a
+//! bounded time for that thread.
 //!
 //! # Thread Safety
 //!
@@ -17,24 +18,20 @@
 //! which is accessed both from the main thread (for showing/hiding)
 //! and the overlay thread (for painting).
 
+use crate::message_loop::{spawn_message_loop_thread, MessageLoopThread, ThreadWindow};
 use crate::Win32Error;
 use openniri_core_layout::Rect;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    RegisterClassW, SetWindowPos, ShowWindow, UnregisterClassW, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_PAINT, WM_USER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    DefWindowProcW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, HWND_TOPMOST, LWA_ALPHA,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_PAINT, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-
-/// Custom message to quit the overlay thread.
-const WM_QUIT_OVERLAY: u32 = WM_USER + 102;
 
 /// RGBA color for overlay (semi-transparent blue).
 const OVERLAY_COLOR: u32 = 0x00FF8040; // RGB: 0x4080FF (reversed for Windows)
@@ -87,7 +84,7 @@ struct OverlayState {
 /// and the window is destroyed.
 pub struct OverlayWindow {
     hwnd: HWND,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: MessageLoopThread,
 }
 
 impl OverlayWindow {
@@ -105,113 +102,60 @@ impl OverlayWindow {
     ///
     /// # Errors
     ///
-    /// Returns [`Win32Error::HookInstallFailed`](crate::Win32Error::HookInstallFailed)
-    /// if the overlay window or thread cannot be created.
+    /// Returns [`Win32Error::WindowCreationFailed`](crate::Win32Error::WindowCreationFailed)
+    /// if an overlay already exists or the window cannot be created, and
+    /// [`Win32Error::ThreadFailed`](crate::Win32Error::ThreadFailed) if its
+    /// thread cannot be started.
     pub fn new() -> Result<Self, Win32Error> {
         if OVERLAY_ACTIVE.swap(true, Ordering::SeqCst) {
-            return Err(Win32Error::HookInstallFailed(
+            return Err(Win32Error::WindowCreationFailed(
                 "Overlay window already active".to_string(),
             ));
         }
 
-        let (init_tx, init_rx) = mpsc::channel::<Result<isize, Win32Error>>();
-
-        let thread = std::thread::spawn(move || {
-            unsafe {
-                // Register window class
-                let class_name: Vec<u16> = "OpenNiriOverlayClass\0".encode_utf16().collect();
-                let wc = WNDCLASSW {
-                    lpfnWndProc: Some(overlay_window_proc),
-                    lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
-                    ..Default::default()
-                };
-                RegisterClassW(&wc);
-
-                // Create the overlay window
+        let started = spawn_message_loop_thread(
+            "openniri-overlay",
+            || {
                 // WS_EX_LAYERED: Allows transparency
                 // WS_EX_TRANSPARENT: Click-through
                 // WS_EX_TOPMOST: Always on top
                 // WS_EX_TOOLWINDOW: Not in taskbar
                 // WS_EX_NOACTIVATE: Don't steal focus
-                let ex_style = WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT
-                    | WS_EX_TOPMOST
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_NOACTIVATE;
-
-                let hwnd = CreateWindowExW(
-                    ex_style,
-                    windows::core::PCWSTR(class_name.as_ptr()),
-                    None,
+                let window = ThreadWindow::create(
+                    "OpenNiriOverlayClass",
+                    Some(overlay_window_proc),
+                    WS_EX_LAYERED
+                        | WS_EX_TRANSPARENT
+                        | WS_EX_TOPMOST
+                        | WS_EX_TOOLWINDOW
+                        | WS_EX_NOACTIVATE,
                     WS_POPUP,
-                    0,
-                    0,
                     1,
                     1,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-
-                if hwnd.is_err() {
-                    let _ = init_tx.send(Err(Win32Error::HookInstallFailed(
-                        "Failed to create overlay window".to_string(),
-                    )));
-                    return;
-                }
-
-                let hwnd = hwnd.unwrap();
-
+                )?;
                 // Set transparency (alpha = 128, about 50% opacity)
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    SetLayeredWindowAttributes, LWA_ALPHA,
+                let _ = unsafe {
+                    SetLayeredWindowAttributes(window.hwnd(), Default::default(), 128, LWA_ALPHA)
                 };
-                let _ = SetLayeredWindowAttributes(hwnd, Default::default(), 128, LWA_ALPHA);
-
-                let hwnd_raw = hwnd.0 as isize;
-                let _ = init_tx.send(Ok(hwnd_raw));
-
-                // Message loop
-                let mut msg = MSG::default();
-                loop {
-                    let result = GetMessageW(&mut msg, None, 0, 0);
-                    if !result.as_bool() {
-                        break;
-                    }
-                    if msg.message == WM_QUIT_OVERLAY {
-                        break;
-                    }
-                    let _ = DispatchMessageW(&msg);
-                }
-
-                let _ = DestroyWindow(hwnd);
-                let _ = UnregisterClassW(windows::core::PCWSTR(class_name.as_ptr()), None);
-            }
-        });
-
-        // Wait for initialization
-        let hwnd_raw = match init_rx.recv() {
-            Ok(Ok(raw)) => raw,
-            Ok(Err(e)) => {
+                // HWND is not Send; hand back its raw value.
+                let hwnd_raw = window.hwnd().0 as isize;
+                Ok((window, hwnd_raw))
+            },
+            |_| {},
+        );
+        let (thread, hwnd_raw) = match started {
+            Ok(started) => started,
+            Err(e) => {
                 OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
                 return Err(e);
             }
-            Err(_) => {
-                OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
-                return Err(Win32Error::HookInstallFailed(
-                    "Overlay thread init failed".to_string(),
-                ));
-            }
         };
-
-        let hwnd = HWND(hwnd_raw as *mut c_void);
 
         tracing::debug!("Overlay window created");
 
         Ok(Self {
-            hwnd,
-            thread: Some(thread),
+            hwnd: HWND(hwnd_raw as *mut c_void),
+            thread,
         })
     }
 
@@ -333,16 +277,8 @@ impl OverlayWindow {
 
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
-        // Signal thread to quit
-        unsafe {
-            let _ = PostMessageW(Some(self.hwnd), WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0));
-        }
-
-        // Wait for thread to finish
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-
+        // The window is destroyed on its thread; a stuck thread is detached.
+        self.thread.shutdown(std::time::Duration::from_secs(2));
         OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
         tracing::debug!("Overlay window destroyed");
     }

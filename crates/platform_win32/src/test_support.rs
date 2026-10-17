@@ -3,7 +3,8 @@
 use crate::monitors::{MonitorId, MonitorInfo};
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 
-/// Serialises tests that install or clear the global event and hotkey senders.
+/// Serialises tests that use process-wide state: the display-change sender and
+/// the cloak tracking set and journal.
 pub(crate) static GLOBAL_SENDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn monitor(id: MonitorId, x: i32) -> MonitorInfo {
