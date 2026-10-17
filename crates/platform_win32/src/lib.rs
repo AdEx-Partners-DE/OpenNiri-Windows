@@ -55,7 +55,10 @@ const EVENT_OBJECT_FOCUS: u32 = 0x8005;
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
 const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
 const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
-const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+/// End of an interactive move or resize. `EVENT_OBJECT_LOCATIONCHANGE` is not hooked:
+/// it fires continuously while a window is dragged and for every programmatic move,
+/// and snapping back on each one fights the user mid-drag.
+const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
 const OBJID_WINDOW: i32 = 0;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 /// `CHILDID_SELF`: the event is about the object itself, not one of its children.
@@ -598,7 +601,7 @@ fn should_emit_window_event_for(event: u32, hwnd: HWND) -> bool {
         EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND | EVENT_OBJECT_DESTROY => {
             should_emit_window_event_with_policy(hwnd, false, false, false)
         }
-        EVENT_OBJECT_LOCATIONCHANGE => should_emit_window_event_with_policy(hwnd, true, true, true),
+        EVENT_SYSTEM_MOVESIZEEND => should_emit_window_event_with_policy(hwnd, true, true, true),
         _ => false,
     }
 }
@@ -611,7 +614,7 @@ fn should_filter_window_event_by_manageability(event: u32) -> bool {
             | EVENT_SYSTEM_FOREGROUND
             | EVENT_SYSTEM_MINIMIZESTART
             | EVENT_SYSTEM_MINIMIZEEND
-            | EVENT_OBJECT_LOCATIONCHANGE
+            | EVENT_SYSTEM_MOVESIZEEND
             | EVENT_OBJECT_FOCUS
     )
 }
@@ -631,7 +634,7 @@ enum EventTargetPolicy {
 
 fn event_target_policy(event: u32) -> EventTargetPolicy {
     match event {
-        EVENT_OBJECT_CREATE | EVENT_OBJECT_LOCATIONCHANGE => EventTargetPolicy::TopLevelOnly,
+        EVENT_OBJECT_CREATE | EVENT_SYSTEM_MOVESIZEEND => EventTargetPolicy::TopLevelOnly,
         EVENT_OBJECT_DESTROY => EventTargetPolicy::Exact,
         _ => EventTargetPolicy::NormalizeToRoot,
     }
@@ -1945,7 +1948,7 @@ pub enum WindowEvent {
     Minimized(WindowId),
     /// A window was restored from minimized state.
     Restored(WindowId),
-    /// A window was moved or resized by the user.
+    /// The user finished moving or resizing a window.
     MovedOrResized(WindowId),
     /// Display configuration changed (monitors added/removed/rearranged).
     DisplayChange,
@@ -2015,7 +2018,7 @@ impl Drop for EventHookHandle {
 /// - Window destruction (EVENT_OBJECT_DESTROY)
 /// - Foreground change (EVENT_SYSTEM_FOREGROUND)
 /// - Minimize/restore (EVENT_SYSTEM_MINIMIZESTART/END)
-/// - Move/resize (EVENT_OBJECT_LOCATIONCHANGE)
+/// - End of a user move/resize (EVENT_SYSTEM_MOVESIZEEND)
 pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEvent>), Win32Error> {
     // Create channel for events
     let (tx, rx) = mpsc::channel();
@@ -2030,7 +2033,7 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY), // Create/Destroy
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND), // Foreground
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND), // Minimize
-        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE), // Move/Resize
+        (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND), // User finished move/resize
         (EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS),    // Focus within app
     ];
 
@@ -2143,7 +2146,7 @@ fn win_event_callback_inner(
         EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS => WindowEvent::Focused(window_id),
         EVENT_SYSTEM_MINIMIZESTART => WindowEvent::Minimized(window_id),
         EVENT_SYSTEM_MINIMIZEEND => WindowEvent::Restored(window_id),
-        EVENT_OBJECT_LOCATIONCHANGE => WindowEvent::MovedOrResized(window_id),
+        EVENT_SYSTEM_MOVESIZEEND => WindowEvent::MovedOrResized(window_id),
         _ => return,
     };
 
@@ -3695,7 +3698,7 @@ mod tests {
             EVENT_OBJECT_CREATE
         ));
         assert!(should_filter_window_event_by_manageability(
-            EVENT_OBJECT_LOCATIONCHANGE
+            EVENT_SYSTEM_MOVESIZEEND
         ));
         assert!(should_filter_window_event_by_manageability(
             EVENT_SYSTEM_FOREGROUND
@@ -3840,7 +3843,7 @@ mod tests {
             EventTargetPolicy::TopLevelOnly
         );
         assert_eq!(
-            event_target_policy(EVENT_OBJECT_LOCATIONCHANGE),
+            event_target_policy(EVENT_SYSTEM_MOVESIZEEND),
             EventTargetPolicy::TopLevelOnly
         );
         assert_eq!(
