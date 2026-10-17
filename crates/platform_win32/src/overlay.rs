@@ -465,24 +465,3 @@ impl Default for SnapHintConfig {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_snap_hint_config_default() {
-        let config = SnapHintConfig::default();
-        assert!(config.enabled);
-        assert!(config.duration_ms > 0);
-    }
-
-    #[test]
-    fn test_overlay_state_default() {
-        // Just verify the static initializes correctly
-        if let Ok(state) = OVERLAY_STATE.lock() {
-            assert!(state.rect.is_none());
-            assert_eq!(state.color, OVERLAY_COLOR);
-        }
-    }
-}

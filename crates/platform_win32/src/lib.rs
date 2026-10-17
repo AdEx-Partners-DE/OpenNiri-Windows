@@ -3699,6 +3699,29 @@ mod tests {
 
     static GLOBAL_SENDER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn monitor(id: MonitorId, x: i32) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{}", id),
+        }
+    }
+
+    fn placement(window_id: WindowId, visibility: Visibility) -> WindowPlacement {
+        WindowPlacement {
+            window_id,
+            rect: Rect::new(0, 0, 100, 100),
+            visibility,
+            column_index: 0,
+        }
+    }
+
+    // =========================================================================
+    // Global senders and message-loop threads
+    // =========================================================================
+
     #[test]
     fn test_event_sender_can_be_reinstalled_after_clear() {
         let _guard = GLOBAL_SENDER_TEST_LOCK
@@ -3763,16 +3786,16 @@ mod tests {
     }
 
     #[test]
-    fn test_hotkey_window_proc_forwards_hotkey_events() {
+    fn test_hotkey_window_proc_forwards_hotkey_and_display_change_events() {
         let _guard = GLOBAL_SENDER_TEST_LOCK
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
+        let timeout = std::time::Duration::from_millis(100);
 
-        let (tx, rx) = mpsc::channel::<HotkeyEvent>();
-        {
-            let mut sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-            *sender_guard = Some(tx);
-        }
+        let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyEvent>();
+        *HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = Some(hotkey_tx);
+        let (display_tx, display_rx) = mpsc::channel::<WindowEvent>();
+        set_display_change_sender(display_tx).unwrap();
 
         let lresult = hotkey_window_proc_inner(
             HWND(std::ptr::null_mut()),
@@ -3781,24 +3804,10 @@ mod tests {
             windows::Win32::Foundation::LPARAM(0),
         );
         assert_eq!(lresult.0, 0);
-
-        let event = rx
-            .recv_timeout(std::time::Duration::from_millis(100))
+        let event = hotkey_rx
+            .recv_timeout(timeout)
             .expect("hotkey event should be forwarded");
         assert_eq!(event.id, 77);
-
-        let mut sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender_guard = None;
-    }
-
-    #[test]
-    fn test_hotkey_window_proc_forwards_display_change_events() {
-        let _guard = GLOBAL_SENDER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-
-        let (tx, rx) = mpsc::channel::<WindowEvent>();
-        set_display_change_sender(tx).unwrap();
 
         let lresult = hotkey_window_proc_inner(
             HWND(std::ptr::null_mut()),
@@ -3807,16 +3816,13 @@ mod tests {
             windows::Win32::Foundation::LPARAM(0),
         );
         assert_eq!(lresult.0, 0);
-
-        let event = rx
-            .recv_timeout(std::time::Duration::from_millis(100))
+        let event = display_rx
+            .recv_timeout(timeout)
             .expect("display change event should be forwarded");
         assert!(matches!(event, WindowEvent::DisplayChange));
 
-        let mut sender_guard = DISPLAY_CHANGE_SENDER
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        *sender_guard = None;
+        *HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = None;
+        clear_display_change_sender();
     }
 
     #[test]
@@ -3837,382 +3843,6 @@ mod tests {
             registered_ids: Vec::new(),
         });
         assert!(start.elapsed() < std::time::Duration::from_millis(500));
-    }
-
-    #[test]
-    fn test_platform_config_default() {
-        let config = PlatformConfig::default();
-        assert_eq!(config.hide_strategy, HideStrategy::Cloak);
-        assert!(config.use_deferred_positioning);
-    }
-
-    #[test]
-    #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
-    fn test_enumerate_monitors() {
-        let result = enumerate_monitors();
-        if let Ok(monitors) = result {
-            assert!(!monitors.is_empty(), "At least one monitor should exist");
-            for monitor in &monitors {
-                assert!(monitor.rect.width > 0, "Monitor width should be positive");
-                assert!(monitor.rect.height > 0, "Monitor height should be positive");
-                assert!(
-                    monitor.work_area.width > 0,
-                    "Work area width should be positive"
-                );
-                assert!(
-                    monitor.work_area.height > 0,
-                    "Work area height should be positive"
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
-    fn test_get_primary_monitor() {
-        let result = get_primary_monitor();
-        if let Ok(primary) = result {
-            assert!(
-                primary.is_primary,
-                "Primary monitor should be marked as primary"
-            );
-            assert!(primary.rect.width > 0);
-            assert!(primary.work_area.width > 0);
-        }
-    }
-
-    #[test]
-    fn test_monitor_contains_point() {
-        let monitor = MonitorInfo {
-            id: 1,
-            rect: Rect::new(0, 0, 1920, 1080),
-            work_area: Rect::new(0, 0, 1920, 1040),
-            is_primary: true,
-            device_name: "DISPLAY1".to_string(),
-        };
-
-        // Point inside monitor
-        assert!(monitor.contains_point(960, 540));
-        // Point at origin
-        assert!(monitor.contains_point(0, 0));
-        // Point just inside right edge
-        assert!(monitor.contains_point(1919, 540));
-        // Point outside (right edge)
-        assert!(!monitor.contains_point(1920, 540));
-        // Point outside (negative)
-        assert!(!monitor.contains_point(-1, 0));
-    }
-
-    #[test]
-    fn test_monitor_contains_rect_center() {
-        let monitor = MonitorInfo {
-            id: 1,
-            rect: Rect::new(0, 0, 1920, 1080),
-            work_area: Rect::new(0, 0, 1920, 1040),
-            is_primary: true,
-            device_name: "DISPLAY1".to_string(),
-        };
-
-        // Window centered in monitor
-        let window = Rect::new(100, 100, 800, 600);
-        assert!(monitor.contains_rect_center(&window));
-
-        // Window mostly outside but center inside
-        let window2 = Rect::new(-300, 100, 800, 600);
-        assert!(monitor.contains_rect_center(&window2)); // Center at 100, 400
-
-        // Window with center outside
-        let window3 = Rect::new(1800, 100, 800, 600);
-        assert!(!monitor.contains_rect_center(&window3)); // Center at 2200, 400
-    }
-
-    #[test]
-    fn test_find_monitor_for_rect() {
-        let monitors = vec![
-            MonitorInfo {
-                id: 1,
-                rect: Rect::new(0, 0, 1920, 1080),
-                work_area: Rect::new(0, 0, 1920, 1040),
-                is_primary: true,
-                device_name: "DISPLAY1".to_string(),
-            },
-            MonitorInfo {
-                id: 2,
-                rect: Rect::new(1920, 0, 1920, 1080),
-                work_area: Rect::new(1920, 0, 1920, 1080),
-                is_primary: false,
-                device_name: "DISPLAY2".to_string(),
-            },
-        ];
-
-        // Window on first monitor
-        let window1 = Rect::new(100, 100, 800, 600);
-        let found = find_monitor_for_rect(&monitors, &window1);
-        assert_eq!(found.unwrap().id, 1);
-
-        // Window on second monitor
-        let window2 = Rect::new(2000, 100, 800, 600);
-        let found = find_monitor_for_rect(&monitors, &window2);
-        assert_eq!(found.unwrap().id, 2);
-    }
-
-    #[test]
-    fn test_monitors_by_position() {
-        let monitors = vec![
-            MonitorInfo {
-                id: 2,
-                rect: Rect::new(1920, 0, 1920, 1080),
-                work_area: Rect::new(1920, 0, 1920, 1080),
-                is_primary: false,
-                device_name: "DISPLAY2".to_string(),
-            },
-            MonitorInfo {
-                id: 1,
-                rect: Rect::new(0, 0, 1920, 1080),
-                work_area: Rect::new(0, 0, 1920, 1040),
-                is_primary: true,
-                device_name: "DISPLAY1".to_string(),
-            },
-        ];
-
-        let sorted = monitors_by_position(&monitors);
-        assert_eq!(sorted[0].id, 1); // Left monitor first
-        assert_eq!(sorted[1].id, 2); // Right monitor second
-    }
-
-    #[test]
-    fn test_monitor_to_left_right() {
-        let monitors = vec![
-            MonitorInfo {
-                id: 1,
-                rect: Rect::new(0, 0, 1920, 1080),
-                work_area: Rect::new(0, 0, 1920, 1040),
-                is_primary: true,
-                device_name: "DISPLAY1".to_string(),
-            },
-            MonitorInfo {
-                id: 2,
-                rect: Rect::new(1920, 0, 1920, 1080),
-                work_area: Rect::new(1920, 0, 1920, 1080),
-                is_primary: false,
-                device_name: "DISPLAY2".to_string(),
-            },
-        ];
-
-        // From monitor 1, go right
-        let right = monitor_to_right(&monitors, 1);
-        assert_eq!(right.unwrap().id, 2);
-
-        // From monitor 2, go left
-        let left = monitor_to_left(&monitors, 2);
-        assert_eq!(left.unwrap().id, 1);
-
-        // From monitor 1, can't go left (edge)
-        let no_left = monitor_to_left(&monitors, 1);
-        assert!(no_left.is_none());
-
-        // From monitor 2, can't go right (edge)
-        let no_right = monitor_to_right(&monitors, 2);
-        assert!(no_right.is_none());
-    }
-
-    #[test]
-    fn test_parse_vk() {
-        // Letters
-        assert_eq!(parse_vk("H"), Some(vk::H));
-        assert_eq!(parse_vk("h"), Some(vk::H));
-        assert_eq!(parse_vk("L"), Some(vk::L));
-
-        // Numbers
-        assert_eq!(parse_vk("1"), Some(vk::N1));
-        assert_eq!(parse_vk("0"), Some(vk::N0));
-
-        // Function keys
-        assert_eq!(parse_vk("F1"), Some(vk::F1));
-        assert_eq!(parse_vk("F12"), Some(vk::F12));
-        assert_eq!(parse_vk("f5"), Some(vk::F5));
-
-        // Navigation
-        assert_eq!(parse_vk("Left"), Some(vk::LEFT));
-        assert_eq!(parse_vk("RIGHT"), Some(vk::RIGHT));
-
-        // Special keys
-        assert_eq!(parse_vk("Tab"), Some(vk::TAB));
-        assert_eq!(parse_vk("Space"), Some(vk::SPACE));
-        assert_eq!(parse_vk("Enter"), Some(vk::ENTER));
-        assert_eq!(parse_vk("Escape"), Some(vk::ESCAPE));
-
-        // Invalid
-        assert_eq!(parse_vk("Invalid"), None);
-        assert_eq!(parse_vk("F13"), None);
-    }
-
-    #[test]
-    fn test_parse_hotkey_string() {
-        // Win+H
-        let (mods, vk) = parse_hotkey_string("Win+H").unwrap();
-        assert!(mods.win);
-        assert!(!mods.ctrl);
-        assert!(!mods.alt);
-        assert!(!mods.shift);
-        assert_eq!(vk, super::vk::H);
-
-        // Ctrl+Alt+Left
-        let (mods, vk) = parse_hotkey_string("Ctrl+Alt+Left").unwrap();
-        assert!(mods.ctrl);
-        assert!(mods.alt);
-        assert!(!mods.win);
-        assert_eq!(vk, super::vk::LEFT);
-
-        // Win+Shift+L
-        let (mods, vk) = parse_hotkey_string("Win+Shift+L").unwrap();
-        assert!(mods.win);
-        assert!(mods.shift);
-        assert_eq!(vk, super::vk::L);
-
-        // Case insensitive
-        let (mods, _) = parse_hotkey_string("win+shift+h").unwrap();
-        assert!(mods.win);
-        assert!(mods.shift);
-
-        // Invalid modifier
-        assert!(parse_hotkey_string("Foo+H").is_none());
-
-        // Invalid key
-        assert!(parse_hotkey_string("Win+InvalidKey").is_none());
-    }
-
-    #[test]
-    fn test_modifiers_to_win32() {
-        let mods = Modifiers::win();
-        let flags = mods.to_win32();
-        assert!(flags.contains(MOD_WIN));
-        assert!(flags.contains(MOD_NOREPEAT));
-        assert!(!flags.contains(MOD_CONTROL));
-
-        let mods = Modifiers {
-            ctrl: true,
-            alt: true,
-            shift: true,
-            win: false,
-        };
-        let flags = mods.to_win32();
-        assert!(flags.contains(MOD_CONTROL));
-        assert!(flags.contains(MOD_ALT));
-        assert!(flags.contains(MOD_SHIFT));
-        assert!(!flags.contains(MOD_WIN));
-    }
-
-    #[test]
-    fn test_win32_error_display() {
-        // Verify error types have proper Display implementations
-        let set_pos_err = Win32Error::SetPositionFailed("test error".to_string());
-        let display = format!("{}", set_pos_err);
-        assert!(display.contains("test error"));
-        assert!(display.contains("position"));
-
-        let cloak_err = Win32Error::CloakFailed("cloak failed".to_string());
-        let display = format!("{}", cloak_err);
-        assert!(display.contains("cloak"));
-
-        let window_not_found = Win32Error::WindowNotFound(12345);
-        let display = format!("{}", window_not_found);
-        assert!(display.contains("12345"));
-    }
-
-    #[test]
-    fn test_is_benign_window_race_error_only_for_nonzero_not_found() {
-        assert!(is_benign_window_race_error(&Win32Error::WindowNotFound(
-            123
-        )));
-        assert!(!is_benign_window_race_error(&Win32Error::WindowNotFound(0)));
-        assert!(!is_benign_window_race_error(
-            &Win32Error::SetPositionFailed("hard failure".to_string())
-        ));
-    }
-
-    #[test]
-    fn test_should_filter_window_event_by_manageability_covers_hooked_events() {
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_OBJECT_CREATE
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_OBJECT_SHOW
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_OBJECT_UNCLOAKED
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_SYSTEM_MOVESIZEEND
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_SYSTEM_FOREGROUND
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_OBJECT_FOCUS
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_OBJECT_DESTROY
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_SYSTEM_MINIMIZESTART
-        ));
-        assert!(should_filter_window_event_by_manageability(
-            EVENT_SYSTEM_MINIMIZEEND
-        ));
-    }
-
-    #[test]
-    fn test_should_treat_cloak_query_failure_as_cloaked_only_for_invalid_windows() {
-        assert!(!should_treat_cloak_query_failure_as_cloaked(true));
-        assert!(should_treat_cloak_query_failure_as_cloaked(false));
-    }
-
-    #[test]
-    fn test_is_border_color_unsupported_hresult_mapping() {
-        assert!(is_border_color_unsupported_hresult(windows::core::HRESULT(
-            0x8007_0057u32 as i32
-        )));
-        assert!(is_border_color_unsupported_hresult(windows::core::HRESULT(
-            0x8000_4001u32 as i32
-        )));
-        assert!(!is_border_color_unsupported_hresult(
-            windows::core::HRESULT(0x8000_4005u32 as i32)
-        ));
-    }
-
-    #[test]
-    fn test_collect_uncloak_targets_move_offscreen_includes_offscreen() {
-        let visible = [WindowPlacement {
-            window_id: 1,
-            rect: Rect::new(0, 0, 100, 100),
-            visibility: Visibility::Visible,
-            column_index: 0,
-        }];
-        let offscreen = [
-            WindowPlacement {
-                window_id: 2,
-                rect: Rect::new(100, 0, 100, 100),
-                visibility: Visibility::OffScreenLeft,
-                column_index: 0,
-            },
-            WindowPlacement {
-                window_id: 1,
-                rect: Rect::new(200, 0, 100, 100),
-                visibility: Visibility::OffScreenLeft,
-                column_index: 0,
-            },
-        ];
-        let visible_refs: Vec<_> = visible.iter().collect();
-        let offscreen_refs: Vec<_> = offscreen.iter().collect();
-
-        let cloak_targets =
-            collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::Cloak);
-        assert_eq!(cloak_targets, vec![1]);
-
-        let move_targets =
-            collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::MoveOffScreen);
-        assert_eq!(move_targets, vec![1, 2]);
     }
 
     #[test]
@@ -4271,11 +3901,370 @@ mod tests {
         assert!(matches!(result, Err(Win32Error::HookInstallFailed(m)) if m == "boom"));
     }
 
+    // =========================================================================
+    // Event filtering and window classification
+    // =========================================================================
+
+    #[test]
+    fn test_event_target_policy_keeps_destroy_events_exact() {
+        let cases = [
+            (EVENT_OBJECT_DESTROY, EventTargetPolicy::Exact),
+            (EVENT_OBJECT_CREATE, EventTargetPolicy::TopLevelOnly),
+            (EVENT_OBJECT_SHOW, EventTargetPolicy::TopLevelOnly),
+            (EVENT_OBJECT_UNCLOAKED, EventTargetPolicy::TopLevelOnly),
+            (EVENT_SYSTEM_MOVESIZEEND, EventTargetPolicy::TopLevelOnly),
+            (EVENT_SYSTEM_FOREGROUND, EventTargetPolicy::NormalizeToRoot),
+            (EVENT_OBJECT_FOCUS, EventTargetPolicy::NormalizeToRoot),
+        ];
+        for (event, policy) in cases {
+            assert_eq!(event_target_policy(event), policy, "event {event:#x}");
+        }
+
+        // Every hooked event goes through the manageability filter.
+        for event in [
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_UNCLOAKED,
+            EVENT_SYSTEM_MOVESIZEEND,
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_OBJECT_FOCUS,
+            EVENT_OBJECT_DESTROY,
+            EVENT_SYSTEM_MINIMIZESTART,
+            EVENT_SYSTEM_MINIMIZEEND,
+        ] {
+            assert!(
+                should_filter_window_event_by_manageability(event),
+                "event {event:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_skip_lists() {
+        for (class, skip) in [
+            ("Shell_TrayWnd", true),
+            ("Progman", true),
+            ("WorkerW", true),
+            ("Windows.UI.Core.CoreWindow", true),
+            // UWP apps (Calculator, Photos) must stay tileable.
+            ("ApplicationFrameWindow", false),
+            ("Notepad", false),
+        ] {
+            assert_eq!(should_skip_window_by_class(class), skip, "class {class}");
+        }
+        for (title, skip) in [
+            ("Program Manager", true),
+            ("Windows Input Experience", true),
+            ("Settings - Notepad", false),
+        ] {
+            assert_eq!(should_skip_window_by_title(title), skip, "title {title}");
+        }
+    }
+
+    #[test]
+    fn test_parse_hotkey_string() {
+        let none = Modifiers::default();
+        let cases = [
+            ("Alt+H", Modifiers { alt: true, ..none }, vk::H),
+            (
+                "alt+shift+l",
+                Modifiers {
+                    alt: true,
+                    shift: true,
+                    ..none
+                },
+                vk::L,
+            ),
+            (
+                "Win+Ctrl+Escape",
+                Modifiers {
+                    win: true,
+                    ctrl: true,
+                    ..none
+                },
+                vk::ESCAPE,
+            ),
+            (
+                "Ctrl+Alt+Left",
+                Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..none
+                },
+                vk::LEFT,
+            ),
+            ("Alt+1", Modifiers { alt: true, ..none }, vk::N1),
+            ("Win+F12", Modifiers { win: true, ..none }, vk::F12),
+            ("Alt+Space", Modifiers { alt: true, ..none }, vk::SPACE),
+            ("Alt+Tab", Modifiers { alt: true, ..none }, vk::TAB),
+            ("Alt+Enter", Modifiers { alt: true, ..none }, vk::ENTER),
+        ];
+        for (input, mods, key) in cases {
+            let (parsed_mods, parsed_key) =
+                parse_hotkey_string(input).unwrap_or_else(|| panic!("{input} should parse"));
+            assert_eq!(parsed_mods, mods, "modifiers of {input}");
+            assert_eq!(parsed_key, key, "key of {input}");
+        }
+        for invalid in ["Foo+H", "Win+InvalidKey", "Alt+F13", "Alt+"] {
+            assert!(parse_hotkey_string(invalid).is_none(), "{invalid}");
+        }
+
+        let flags = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..none
+        }
+        .to_win32();
+        assert!(flags.contains(MOD_CONTROL) && flags.contains(MOD_ALT));
+        assert!(!flags.contains(MOD_WIN) && !flags.contains(MOD_SHIFT));
+        assert!(
+            flags.contains(MOD_NOREPEAT),
+            "held keys must not auto-repeat commands"
+        );
+    }
+
+    // =========================================================================
+    // Error classification and invalid handles
+    // =========================================================================
+
+    #[test]
+    fn test_is_benign_window_race_error_only_for_nonzero_not_found() {
+        assert!(is_benign_window_race_error(&Win32Error::WindowNotFound(
+            123
+        )));
+        assert!(!is_benign_window_race_error(&Win32Error::WindowNotFound(0)));
+        assert!(!is_benign_window_race_error(
+            &Win32Error::SetPositionFailed("hard failure".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_is_border_color_unsupported_hresult_mapping() {
+        assert!(is_border_color_unsupported_hresult(windows::core::HRESULT(
+            0x8007_0057u32 as i32
+        )));
+        assert!(is_border_color_unsupported_hresult(windows::core::HRESULT(
+            0x8000_4001u32 as i32
+        )));
+        assert!(!is_border_color_unsupported_hresult(
+            windows::core::HRESULT(0x8000_4005u32 as i32)
+        ));
+    }
+
+    #[test]
+    fn test_invalid_window_ids_are_rejected() {
+        let not_found = |result: Result<(), Win32Error>, id: WindowId| matches!(result, Err(Win32Error::WindowNotFound(got)) if got == id);
+        assert!(!is_valid_window(0));
+        assert!(not_found(window_id_to_hwnd(0).map(|_| ()), 0));
+        assert!(not_found(set_foreground_window(0).map(|_| ()), 0));
+        assert!(not_found(
+            set_foreground_window(u64::MAX).map(|_| ()),
+            u64::MAX
+        ));
+        assert!(not_found(close_window(0), 0));
+        assert!(not_found(
+            set_window_border_color(0, 0x4285F4).map(|_| ()),
+            0
+        ));
+        assert!(not_found(
+            set_window_border_color(u64::MAX, 0x4285F4).map(|_| ()),
+            u64::MAX
+        ));
+        assert!(not_found(reset_window_border_color(0).map(|_| ()), 0));
+    }
+
     #[test]
     fn test_own_process_is_not_more_privileged_than_itself() {
         assert!(own_integrity_rid().is_some());
         assert!(!is_process_more_privileged(std::process::id()));
     }
+
+    // =========================================================================
+    // Cloak tracking and uncloak targets
+    // =========================================================================
+
+    #[test]
+    fn test_collect_uncloak_targets_move_offscreen_includes_offscreen() {
+        let visible = [placement(1, Visibility::Visible)];
+        let offscreen = [
+            placement(2, Visibility::OffScreenLeft),
+            placement(1, Visibility::OffScreenLeft),
+        ];
+        let visible_refs: Vec<_> = visible.iter().collect();
+        let offscreen_refs: Vec<_> = offscreen.iter().collect();
+
+        let cloak_targets =
+            collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::Cloak);
+        assert_eq!(cloak_targets, vec![1]);
+
+        let move_targets =
+            collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::MoveOffScreen);
+        assert_eq!(move_targets, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_filter_uncloak_targets_skips_windows_that_are_not_cloaked() {
+        let targets = vec![1, 2, 3];
+        assert_eq!(
+            filter_uncloak_targets(targets.clone(), |id| id == 2),
+            vec![2]
+        );
+        assert!(filter_uncloak_targets(targets, |_| false).is_empty());
+    }
+
+    #[test]
+    fn test_select_visible_fallback_window_prefers_non_foreground() {
+        let visible = [
+            placement(1, Visibility::Visible),
+            placement(2, Visibility::Visible),
+        ];
+        let visible_refs: Vec<_> = visible.iter().collect();
+        assert_eq!(select_visible_fallback_window(&visible_refs, 1), Some(2));
+        assert_eq!(select_visible_fallback_window(&visible_refs, 2), Some(1));
+        // Only the foreground window is visible: it is still the fallback.
+        assert_eq!(
+            select_visible_fallback_window(&visible_refs[..1], 1),
+            Some(1)
+        );
+        assert_eq!(select_visible_fallback_window(&[], 42), None);
+    }
+
+    #[test]
+    fn test_cloak_journal_format_round_trip() {
+        let ids: HashSet<WindowId> = [3, 1, 2].into_iter().collect();
+        let text = format_cloak_journal(&ids);
+        assert_eq!(text, "1\n2\n3\n");
+        assert_eq!(parse_cloak_journal(&text), vec![1, 2, 3]);
+        // Tolerates a partially written or edited file.
+        assert_eq!(
+            parse_cloak_journal("7\n\ngarbage\n0\n 9 \n12"),
+            vec![7, 9, 12]
+        );
+    }
+
+    #[test]
+    fn test_daemon_cloak_tracking_round_trip() {
+        let journal =
+            std::env::temp_dir().join(format!("openniri-cloak-journal-{}.txt", std::process::id()));
+        *CLOAK_JOURNAL_PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex) = Some(journal.clone());
+
+        let window_id: WindowId = 0xDEAD_0001;
+        assert!(!is_daemon_cloaked(window_id));
+        track_daemon_cloak(window_id, true);
+        assert!(is_daemon_cloaked(window_id));
+        assert!(read_cloak_journal().contains(&window_id));
+        track_daemon_cloak(window_id, false);
+        assert!(!is_daemon_cloaked(window_id));
+        // Deletion can be pending briefly on Windows (e.g. an antivirus scan holds
+        // the file open), so check what recovery would read, not the file itself.
+        assert!(
+            read_cloak_journal().is_empty(),
+            "an empty journal records no windows"
+        );
+
+        *CLOAK_JOURNAL_PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex) = None;
+    }
+
+    // =========================================================================
+    // MoveOffScreen sentinel and restore
+    // =========================================================================
+
+    #[test]
+    fn test_move_offscreen_sentinel_fits_win32_coordinate_range() {
+        assert!(MOVE_OFFSCREEN_SENTINEL_COORD >= i16::MIN as i32);
+        assert!(is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_SENTINEL_COORD
+        ));
+    }
+
+    #[test]
+    fn test_move_offscreen_sentinel_detection() {
+        assert!(is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD - 1,
+            MOVE_OFFSCREEN_SENTINEL_COORD - 500
+        ));
+        // Windows clamps positions to 16 bits; older versions' parked windows sit here.
+        assert!(is_move_offscreen_sentinel_position(-32_768, -32_768));
+        // Windows commonly reports minimized windows at (-32000, -32000).
+        assert!(!is_move_offscreen_sentinel_position(-32_000, -32_000));
+        assert!(!is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_DETECTION_THRESHOLD + 1,
+            MOVE_OFFSCREEN_SENTINEL_COORD
+        ));
+        assert!(!is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_DETECTION_THRESHOLD + 1
+        ));
+    }
+
+    #[test]
+    fn test_move_offscreen_restore_rect_clamps_size() {
+        let offscreen = Rect::new(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            5000,
+            0,
+        );
+        let work_area = Rect::new(100, 200, 1920, 1080);
+        let restored = compute_restore_rect_from_offscreen(&offscreen, &work_area);
+
+        assert_eq!(restored, Rect::new(100, 200, 1920, 1));
+        assert!(is_move_offscreen_sentinel_rect(&offscreen));
+        assert!(!is_move_offscreen_sentinel_rect(&restored));
+    }
+
+    #[test]
+    fn test_restore_windows_moved_offscreen_ignores_races_and_reports_hard_failures() {
+        let window_ids = [10, 20, 30, 40];
+        let work_area = Rect::new(0, 0, 1920, 1080);
+        let mut seen: Vec<WindowId> = Vec::new();
+        let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
+            &window_ids,
+            &work_area,
+            |window_id, _| {
+                seen.push(window_id);
+                match window_id {
+                    10 => Ok(true),
+                    20 => Err(Win32Error::WindowNotFound(20)),
+                    30 => Ok(false),
+                    40 => Err(Win32Error::SetPositionFailed("boom".to_string())),
+                    _ => unreachable!(),
+                }
+            },
+        );
+
+        assert_eq!(seen, window_ids, "one failure must not stop the others");
+        assert_eq!(restored, 1);
+        assert_eq!(failures.len(), 1, "a vanished window is not a failure");
+        assert!(failures[0].contains("window 40"));
+        assert!(failures[0].contains("boom"));
+    }
+
+    #[test]
+    fn test_apply_placements_reports_move_offscreen_errors() {
+        let config = PlatformConfig {
+            hide_strategy: HideStrategy::MoveOffScreen,
+            use_deferred_positioning: false,
+        };
+        let placements = vec![WindowPlacement {
+            window_id: 0,
+            rect: Rect::new(0, 0, 800, 600),
+            visibility: Visibility::OffScreenLeft,
+            column_index: 0,
+        }];
+
+        let result = apply_placements(&placements, &config);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Geometry: borders, visibility, monitors
+    // =========================================================================
 
     #[test]
     fn test_invisible_border_compensation() {
@@ -4326,48 +4315,6 @@ mod tests {
     }
 
     #[test]
-    fn test_event_target_policy_keeps_destroy_events_exact() {
-        assert_eq!(
-            event_target_policy(EVENT_OBJECT_DESTROY),
-            EventTargetPolicy::Exact
-        );
-        assert_eq!(
-            event_target_policy(EVENT_OBJECT_CREATE),
-            EventTargetPolicy::TopLevelOnly
-        );
-        assert_eq!(
-            event_target_policy(EVENT_OBJECT_SHOW),
-            EventTargetPolicy::TopLevelOnly
-        );
-        assert_eq!(
-            event_target_policy(EVENT_OBJECT_UNCLOAKED),
-            EventTargetPolicy::TopLevelOnly
-        );
-        assert_eq!(
-            event_target_policy(EVENT_SYSTEM_MOVESIZEEND),
-            EventTargetPolicy::TopLevelOnly
-        );
-        assert_eq!(
-            event_target_policy(EVENT_SYSTEM_FOREGROUND),
-            EventTargetPolicy::NormalizeToRoot
-        );
-        assert_eq!(
-            event_target_policy(EVENT_OBJECT_FOCUS),
-            EventTargetPolicy::NormalizeToRoot
-        );
-    }
-
-    #[test]
-    fn test_filter_uncloak_targets_skips_windows_that_are_not_cloaked() {
-        let targets = vec![1, 2, 3];
-        assert_eq!(
-            filter_uncloak_targets(targets.clone(), |id| id == 2),
-            vec![2]
-        );
-        assert!(filter_uncloak_targets(targets, |_| false).is_empty());
-    }
-
-    #[test]
     fn test_visible_fraction_and_clamp() {
         let monitors = [Rect::new(0, 0, 1000, 800), Rect::new(1000, 0, 1000, 800)];
         assert_eq!(
@@ -4406,334 +4353,55 @@ mod tests {
 
     #[test]
     fn test_nearest_monitor_prefers_overlap_then_distance() {
-        let monitor = |id: MonitorId, x: i32| MonitorInfo {
-            id,
-            rect: Rect::new(x, 0, 1000, 800),
-            work_area: Rect::new(x, 0, 1000, 760),
-            is_primary: id == 1,
-            device_name: format!("DISPLAY{}", id),
+        let monitors = [monitor(1, 0), monitor(2, 1920)];
+        let nearest = |x: i32| {
+            nearest_monitor(&Rect::new(x, 0, 100, 100), &monitors)
+                .unwrap()
+                .id
         };
-        let monitors = [monitor(1, 0), monitor(2, 1000)];
-        assert_eq!(
-            nearest_monitor(&Rect::new(1500, 0, 100, 100), &monitors)
-                .unwrap()
-                .id,
-            2
-        );
-        assert_eq!(
-            nearest_monitor(&Rect::new(-500, 0, 100, 100), &monitors)
-                .unwrap()
-                .id,
-            1
-        );
-        assert_eq!(
-            nearest_monitor(&Rect::new(2500, 0, 100, 100), &monitors)
-                .unwrap()
-                .id,
-            2
-        );
+        assert_eq!(nearest(2500), 2);
+        assert_eq!(nearest(-500), 1);
+        assert_eq!(nearest(5000), 2);
     }
 
     #[test]
-    fn test_cloak_journal_format_round_trip() {
-        let ids: HashSet<WindowId> = [3, 1, 2].into_iter().collect();
-        let text = format_cloak_journal(&ids);
-        assert_eq!(text, "1\n2\n3\n");
-        assert_eq!(parse_cloak_journal(&text), vec![1, 2, 3]);
-        // Tolerates a partially written or edited file.
-        assert_eq!(
-            parse_cloak_journal("7\n\ngarbage\n0\n 9 \n12"),
-            vec![7, 9, 12]
-        );
-    }
-
-    #[test]
-    fn test_daemon_cloak_tracking_round_trip() {
-        let journal =
-            std::env::temp_dir().join(format!("openniri-cloak-journal-{}.txt", std::process::id()));
-        *CLOAK_JOURNAL_PATH_OVERRIDE
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex) = Some(journal.clone());
-
-        let window_id: WindowId = 0xDEAD_0001;
-        assert!(!is_daemon_cloaked(window_id));
-        track_daemon_cloak(window_id, true);
-        assert!(is_daemon_cloaked(window_id));
-        assert!(read_cloak_journal().contains(&window_id));
-        track_daemon_cloak(window_id, false);
-        assert!(!is_daemon_cloaked(window_id));
-        // Deletion can be pending briefly on Windows (e.g. an antivirus scan holds
-        // the file open), so check what recovery would read, not the file itself.
+    fn test_monitor_hit_testing() {
+        let primary = monitor(1, 0);
+        assert!(primary.contains_point(0, 0));
+        assert!(primary.contains_point(1919, 540));
         assert!(
-            read_cloak_journal().is_empty(),
-            "an empty journal records no windows"
+            !primary.contains_point(1920, 540),
+            "right edge is exclusive"
         );
+        assert!(!primary.contains_point(-1, 0));
 
-        *CLOAK_JOURNAL_PATH_OVERRIDE
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex) = None;
-    }
+        // Mostly off-screen, but the center is inside.
+        assert!(primary.contains_rect_center(&Rect::new(-300, 100, 800, 600)));
+        assert!(!primary.contains_rect_center(&Rect::new(1800, 100, 800, 600)));
 
-    #[test]
-    fn test_offscreen_contains_window_detects_target() {
-        let offscreen = [
-            WindowPlacement {
-                window_id: 10,
-                rect: Rect::new(0, 0, 100, 100),
-                visibility: Visibility::OffScreenLeft,
-                column_index: 0,
-            },
-            WindowPlacement {
-                window_id: 20,
-                rect: Rect::new(100, 0, 100, 100),
-                visibility: Visibility::OffScreenRight,
-                column_index: 0,
-            },
-        ];
-        let offscreen_refs: Vec<_> = offscreen.iter().collect();
-        assert!(offscreen_contains_window(&offscreen_refs, 10));
-        assert!(offscreen_contains_window(&offscreen_refs, 20));
-        assert!(!offscreen_contains_window(&offscreen_refs, 30));
-    }
-
-    #[test]
-    fn test_select_visible_fallback_window_prefers_non_foreground() {
-        let visible = [
-            WindowPlacement {
-                window_id: 1,
-                rect: Rect::new(0, 0, 100, 100),
-                visibility: Visibility::Visible,
-                column_index: 0,
-            },
-            WindowPlacement {
-                window_id: 2,
-                rect: Rect::new(100, 0, 100, 100),
-                visibility: Visibility::Visible,
-                column_index: 0,
-            },
-        ];
-        let visible_refs: Vec<_> = visible.iter().collect();
-        assert_eq!(select_visible_fallback_window(&visible_refs, 1), Some(2));
-        assert_eq!(select_visible_fallback_window(&visible_refs, 2), Some(1));
-    }
-
-    #[test]
-    fn test_select_visible_fallback_window_handles_empty_visible() {
-        let visible: [WindowPlacement; 0] = [];
-        let visible_refs: Vec<_> = visible.iter().collect();
-        assert_eq!(select_visible_fallback_window(&visible_refs, 42), None);
-    }
-
-    #[test]
-    fn test_restore_windows_moved_offscreen_with_work_area_ignores_benign_races() {
-        let window_ids = [10, 20, 30];
-        let work_area = Rect::new(0, 0, 1920, 1080);
-        let mut seen: Vec<WindowId> = Vec::new();
-        let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
-            &window_ids,
-            &work_area,
-            |window_id, _| {
-                seen.push(window_id);
-                match window_id {
-                    10 => Ok(true),
-                    20 => Err(Win32Error::WindowNotFound(20)),
-                    30 => Ok(false),
-                    _ => unreachable!(),
-                }
-            },
-        );
-
-        assert_eq!(seen, window_ids);
-        assert_eq!(restored, 1);
-        assert!(failures.is_empty());
-    }
-
-    #[test]
-    fn test_restore_windows_moved_offscreen_with_work_area_reports_hard_failures() {
-        let window_ids = [7, 8];
-        let work_area = Rect::new(0, 0, 1920, 1080);
-        let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
-            &window_ids,
-            &work_area,
-            |window_id, _| match window_id {
-                7 => Ok(true),
-                8 => Err(Win32Error::SetPositionFailed("boom".to_string())),
-                _ => unreachable!(),
-            },
-        );
-
-        assert_eq!(restored, 1);
-        assert_eq!(failures.len(), 1);
-        assert!(failures[0].contains("window 8"));
-        assert!(failures[0].contains("boom"));
-    }
-
-    #[test]
-    fn test_apply_placements_empty() {
-        // Verify empty placements succeed without error
-        let config = PlatformConfig::default();
-        let result = apply_placements(&[], &config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_apply_placements_reports_move_offscreen_errors() {
-        let config = PlatformConfig {
-            hide_strategy: HideStrategy::MoveOffScreen,
-            use_deferred_positioning: false,
+        let monitors = vec![monitor(1, 0), monitor(2, 1920)];
+        let on = |x: i32| {
+            find_monitor_for_rect(&monitors, &Rect::new(x, 100, 800, 600))
+                .unwrap()
+                .id
         };
-        let placements = vec![WindowPlacement {
-            window_id: 0,
-            rect: Rect::new(0, 0, 800, 600),
-            visibility: Visibility::OffScreenLeft,
-            column_index: 0,
-        }];
-
-        let result = apply_placements(&placements, &config);
-        assert!(result.is_err());
+        assert_eq!(on(100), 1);
+        assert_eq!(on(2000), 2);
     }
 
     #[test]
-    fn test_move_offscreen_sentinel_fits_win32_coordinate_range() {
-        assert!(MOVE_OFFSCREEN_SENTINEL_COORD >= i16::MIN as i32);
-        assert!(is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD,
-            MOVE_OFFSCREEN_SENTINEL_COORD
-        ));
-    }
+    fn test_monitor_left_right_navigation() {
+        // Deliberately not in left-to-right order.
+        let monitors = vec![monitor(2, 1920), monitor(1, 0)];
+        let sorted: Vec<_> = monitors_by_position(&monitors)
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sorted, vec![1, 2]);
 
-    #[test]
-    fn test_move_offscreen_sentinel_detection() {
-        assert!(is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD,
-            MOVE_OFFSCREEN_SENTINEL_COORD
-        ));
-        assert!(is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD - 1,
-            MOVE_OFFSCREEN_SENTINEL_COORD - 500
-        ));
-        // Windows clamps positions to 16 bits; older versions' parked windows sit here.
-        assert!(is_move_offscreen_sentinel_position(-32_768, -32_768));
-        assert!(!is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_DETECTION_THRESHOLD + 1,
-            MOVE_OFFSCREEN_SENTINEL_COORD
-        ));
-        assert!(!is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD,
-            MOVE_OFFSCREEN_DETECTION_THRESHOLD + 1
-        ));
-    }
-
-    #[test]
-    fn test_move_offscreen_sentinel_does_not_match_minimized_coordinates() {
-        // Windows commonly reports minimized windows around (-32000, -32000).
-        assert!(!is_move_offscreen_sentinel_position(-32_000, -32_000));
-    }
-
-    #[test]
-    fn test_move_offscreen_restore_rect_clamps_size() {
-        let offscreen = Rect::new(
-            MOVE_OFFSCREEN_SENTINEL_COORD,
-            MOVE_OFFSCREEN_SENTINEL_COORD,
-            5000,
-            0,
-        );
-        let work_area = Rect::new(100, 200, 1920, 1080);
-        let restored = compute_restore_rect_from_offscreen(&offscreen, &work_area);
-
-        assert_eq!(restored.x, 100);
-        assert_eq!(restored.y, 200);
-        assert_eq!(restored.width, 1920);
-        assert_eq!(restored.height, 1);
-        assert!(is_move_offscreen_sentinel_rect(&offscreen));
-        assert!(!is_move_offscreen_sentinel_rect(&restored));
-    }
-
-    #[test]
-    fn test_restore_windows_moved_offscreen_empty_list() {
-        let result = restore_windows_moved_offscreen(&[]);
-        assert_eq!(result.unwrap(), 0);
-    }
-
-    #[test]
-    fn test_window_id_to_hwnd_zero_returns_error() {
-        let result = window_id_to_hwnd(0);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
-    }
-
-    #[test]
-    fn test_window_id_to_hwnd_nonzero_succeeds() {
-        let result = window_id_to_hwnd(12345);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_is_valid_window_zero_returns_false() {
-        assert!(!is_valid_window(0));
-    }
-
-    #[test]
-    fn test_set_foreground_window_zero_fails() {
-        let result = set_foreground_window(0);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
-    }
-
-    #[test]
-    fn test_set_foreground_window_invalid_hwnd_fails() {
-        let result = set_foreground_window(u64::MAX);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            Win32Error::WindowNotFound(u64::MAX)
-        ));
-    }
-
-    #[test]
-    fn test_close_window_zero_fails() {
-        let result = close_window(0);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
-    }
-
-    #[test]
-    fn test_set_window_border_color_zero_fails() {
-        let result = set_window_border_color(0, 0x4285F4);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
-    }
-
-    #[test]
-    fn test_set_window_border_color_invalid_hwnd_fails() {
-        let result = set_window_border_color(u64::MAX, 0x4285F4);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            Win32Error::WindowNotFound(u64::MAX)
-        ));
-    }
-
-    #[test]
-    fn test_reset_window_border_color_zero_fails() {
-        let result = reset_window_border_color(0);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Win32Error::WindowNotFound(0)));
-    }
-
-    #[test]
-    fn test_skip_classes_does_not_contain_application_frame_window() {
-        let skip = should_skip_window_by_class("ApplicationFrameWindow");
-        assert!(
-            !skip,
-            "ApplicationFrameWindow should NOT be in skip list (UWP apps should be tiled)"
-        );
-    }
-
-    #[test]
-    #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
-    fn test_set_dpi_awareness_no_panic() {
-        // On CI/test environments this may return false (already set), but must not panic
-        let _result = set_dpi_awareness();
+        assert_eq!(monitor_to_right(&monitors, 1).unwrap().id, 2);
+        assert_eq!(monitor_to_left(&monitors, 2).unwrap().id, 1);
+        assert!(monitor_to_left(&monitors, 1).is_none());
+        assert!(monitor_to_right(&monitors, 2).is_none());
     }
 }

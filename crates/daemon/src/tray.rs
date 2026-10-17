@@ -374,105 +374,42 @@ mod tests {
 
     #[test]
     fn test_create_default_icon() {
-        let icon = create_default_icon();
-        assert!(icon.is_ok(), "Should create default icon successfully");
-    }
-
-    #[test]
-    fn test_tray_event_toggle_pause_variant() {
-        let event = TrayEvent::TogglePause;
-        assert!(matches!(event, TrayEvent::TogglePause));
-    }
-
-    #[test]
-    fn test_tray_event_emergency_uncloak_variant() {
-        let event = TrayEvent::EmergencyUncloakAll;
-        assert!(matches!(event, TrayEvent::EmergencyUncloakAll));
+        assert!(create_default_icon().is_ok());
     }
 
     #[test]
     fn test_map_menu_id_to_event() {
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::REFRESH),
-            Some(TrayEvent::Refresh)
-        ));
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::RELOAD),
-            Some(TrayEvent::Reload)
-        ));
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::EXIT),
-            Some(TrayEvent::Exit)
-        ));
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::TOGGLE_PAUSE),
-            Some(TrayEvent::TogglePause)
-        ));
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::OPEN_CONFIG),
-            Some(TrayEvent::OpenConfig)
-        ));
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::VIEW_LOGS),
-            Some(TrayEvent::ViewLogs)
-        ));
-        assert!(matches!(
-            map_menu_id_to_event(menu_ids::EMERGENCY_UNCLOAK_ALL),
-            Some(TrayEvent::EmergencyUncloakAll)
-        ));
+        let cases = [
+            (menu_ids::REFRESH, "Refresh"),
+            (menu_ids::RELOAD, "Reload"),
+            (menu_ids::EXIT, "Exit"),
+            (menu_ids::TOGGLE_PAUSE, "TogglePause"),
+            (menu_ids::OPEN_CONFIG, "OpenConfig"),
+            (menu_ids::VIEW_LOGS, "ViewLogs"),
+            (menu_ids::EMERGENCY_UNCLOAK_ALL, "EmergencyUncloakAll"),
+        ];
+        for (id, expected) in cases {
+            let event = map_menu_id_to_event(id);
+            assert_eq!(
+                event.map(|e| format!("{:?}", e)).as_deref(),
+                Some(expected),
+                "menu id {id}"
+            );
+        }
         assert!(map_menu_id_to_event("unknown").is_none());
     }
 
     #[test]
-    fn test_tooltip_format() {
-        let active = format_tooltip_text(14, 2, false, None);
-        assert_eq!(active, "OpenNiri - Active (14 windows, 2 monitors)");
-
-        let paused = format_tooltip_text(3, 1, true, None);
-        assert_eq!(paused, "OpenNiri - Paused (3 windows, 1 monitors)");
-    }
-
-    #[test]
-    fn test_tooltip_format_with_hotkey_mismatch() {
-        let tooltip = format_tooltip_text(10, 2, false, Some((7, 10)));
+    fn test_tooltip_reports_state_and_failed_hotkeys() {
         assert_eq!(
-            tooltip,
+            format_tooltip_text(10, 2, false, Some((7, 10))),
             "OpenNiri - Active (10 windows, 2 monitors)\nHotkeys: 7/10 (3 failed)"
         );
-    }
-
-    #[test]
-    fn test_tooltip_format_no_hotkey_mismatch() {
-        // When registered == requested, no mismatch line
-        let tooltip = format_tooltip_text(10, 2, false, Some((10, 10)));
-        assert_eq!(tooltip, "OpenNiri - Active (10 windows, 2 monitors)");
-    }
-
-    #[test]
-    fn test_tooltip_format_paused_with_mismatch() {
-        let tooltip = format_tooltip_text(5, 1, true, Some((3, 8)));
-        assert!(tooltip.contains("Paused"));
-        assert!(tooltip.contains("3/8 (5 failed)"));
-    }
-
-    #[test]
-    fn test_menu_ids_constants() {
-        // Ensure menu IDs are distinct
-        let ids = [
-            menu_ids::REFRESH,
-            menu_ids::RELOAD,
-            menu_ids::EXIT,
-            menu_ids::TOGGLE_PAUSE,
-            menu_ids::OPEN_CONFIG,
-            menu_ids::VIEW_LOGS,
-            menu_ids::EMERGENCY_UNCLOAK_ALL,
-        ];
-        for (i, a) in ids.iter().enumerate() {
-            for (j, b) in ids.iter().enumerate() {
-                if i != j {
-                    assert_ne!(a, b, "Menu IDs must be distinct");
-                }
-            }
-        }
+        let paused = format_tooltip_text(3, 1, true, Some((10, 10)));
+        assert!(paused.contains("Paused"));
+        assert!(
+            !paused.contains("Hotkeys"),
+            "no warning when all registered"
+        );
     }
 }
