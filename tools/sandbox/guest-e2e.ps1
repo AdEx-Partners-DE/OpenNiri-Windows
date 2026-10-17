@@ -201,6 +201,13 @@ try {
     $tiled = Snap 'tiled'
     $managed = Invoke-Cli @('query', 'all')
     Check 'A-default: daemon manages all test windows' (($tiled.Count -eq $script:titles.Count) -and (($managed.Output -split 'E2E-').Count - 1) -ge $script:titles.Count) ("query all exit={0}" -f $managed.Code)
+
+    # The IPC pipe must only admit this user and SYSTEM.
+    $pipeName = [System.IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -match 'openniri' } | Select-Object -First 1
+    $pipeSddl = [E2E]::SecuritySddl($pipeName)
+    $broadGroups = @('WD', 'AU', 'BU', 'AN', 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')
+    $broad = @($broadGroups | Where-Object { $pipeSddl -match (";;;{0}\)" -f [regex]::Escape($_)) })
+    Check 'A-default: IPC pipe ACL admits only this user and SYSTEM' ($pipeSddl -like 'O:*D:P*' -and $broad.Count -eq 0) ("{0} -> {1}" -f $pipeName, $pipeSddl)
     $tileProblems = Test-Tiled $tiled
     Check 'A-default: windows are tiled at startup (full height, no overlap)' ($tileProblems.Count -eq 0) ($tileProblems -join '; ')
     $offscreen = @($tiled | Where-Object { -not (Test-OnScreen $_) -or $_.Cloaked -ne 0 })

@@ -147,6 +147,11 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 - HOTKEY_SENDER changed from OnceLock to Mutex to support hotkey re-registration (iter 19)
 - AppState refactored from single workspace to per-monitor HashMap of workspaces (iter 11)
 
+### Security
+
+- The IPC pipe is created with an access list that admits only the user running the daemon and SYSTEM (previously the default ACL)
+- The CLI no longer falls back to the global `\\.\pipe\openniri` name, which any local user could create, and refuses a pipe server running in another logon session or owned by another user
+
 ### Fixed
 
 - Windows cloaked by a daemon that crashed or was killed are recorded in `%LOCALAPPDATA%\openniri\cloaked-windows.txt` and restored by `emergency-uncloak`, the panic path and the next daemon start

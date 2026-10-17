@@ -1,5 +1,11 @@
 # OpenNiri-Windows Development Iteration Log
 
+## IPC hardening iteration — 2026-10-17
+
+- Scope: review finding on IPC trust. The pipe is created with DACL `D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)`. The CLI drops the legacy global pipe name fallback and verifies the server process (same logon session; same user SID when the token is readable) via `GetNamedPipeServerProcessId`.
+- Residual risk: a process of another user in the same logon session whose token cannot be read is accepted on the session check.
+- Validation: unit tests, clippy, fmt; sandbox run reads the live pipe ACL (`O:BAD:P(A;;FA;;;<user>)(A;;FA;;;SY)`) and drives every CLI command through the hardened pipe.
+
 ## Shell cloaking iteration — 2026-10-17
 
 - Scope: replace `DWMWA_CLOAK` (denied for foreign windows) with shell cloaking through the undocumented `IApplicationView::SetCloak`, on a dedicated STA thread with reconnect after Explorer restarts (`INC-49-8`). Interface layout from GlazeWM (GPL-3.0).

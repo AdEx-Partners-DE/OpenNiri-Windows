@@ -637,7 +637,21 @@ async fn open_pipe_with_retry(
         let mut hard_error: Option<anyhow::Error> = None;
         for pipe_name in &pipe_names {
             match ClientOptions::new().open(pipe_name) {
-                Ok(client) => return Ok(client),
+                Ok(client) => {
+                    // Refuse a server that another user created under our pipe name.
+                    use std::os::windows::io::AsRawHandle;
+                    openniri_platform_win32::pipe_security::verify_pipe_server(
+                        client.as_raw_handle() as isize,
+                    )
+                    .map_err(|reason| {
+                        anyhow::anyhow!(
+                            "Refusing to talk to the process behind '{}': {}",
+                            pipe_name,
+                            reason
+                        )
+                    })?;
+                    return Ok(client);
+                }
                 Err(e) if is_pipe_busy(&e) || is_pipe_not_found(&e) => {
                     saw_busy |= is_pipe_busy(&e);
                     saw_not_found |= is_pipe_not_found(&e);

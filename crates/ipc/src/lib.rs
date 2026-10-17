@@ -66,14 +66,12 @@ pub fn preferred_pipe_name() -> String {
     }
 }
 
-/// Candidate pipe names in preference order with legacy compatibility fallback.
+/// Pipe names a client tries, in order.
+///
+/// The legacy global `PIPE_NAME` is no longer tried when a per-user name is
+/// available: any local user can create a pipe with that global name.
 pub fn pipe_name_candidates() -> Vec<String> {
-    let preferred = preferred_pipe_name();
-    if preferred == PIPE_NAME {
-        vec![preferred]
-    } else {
-        vec![preferred, PIPE_NAME.to_string()]
-    }
+    vec![preferred_pipe_name()]
 }
 
 /// Return the protocol identifier for this crate version.
@@ -606,10 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_name_candidates_include_legacy_fallback() {
+    fn test_pipe_name_candidates_have_no_global_fallback() {
         let candidates = pipe_name_candidates();
-        assert!(!candidates.is_empty());
-        assert_eq!(candidates.last().unwrap(), PIPE_NAME);
+        assert_eq!(candidates, vec![preferred_pipe_name()]);
+        if preferred_pipe_name() != PIPE_NAME {
+            assert!(!candidates.contains(&PIPE_NAME.to_string()));
+        }
     }
 
     #[test]
