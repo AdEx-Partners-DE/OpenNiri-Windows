@@ -63,10 +63,14 @@ public static class E2E
         try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
     }
 
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT value, int size);
+
     public class WinInfo
     {
         public long Hwnd; public uint Pid; public string Title; public string Class;
         public int X, Y, W, H; public bool Visible, Iconic; public int Cloaked;
+        // Visible frame (DWMWA_EXTENDED_FRAME_BOUNDS), without invisible resize borders.
+        public int FX, FY, FW, FH;
     }
 
     public static WinInfo Describe(IntPtr h)
@@ -80,6 +84,10 @@ public static class E2E
         info.X = r.Left; info.Y = r.Top; info.W = r.Right - r.Left; info.H = r.Bottom - r.Top;
         info.Visible = IsWindowVisible(h); info.Iconic = IsIconic(h);
         int cloaked; info.Cloaked = DwmGetWindowAttribute(h, DWMWA_CLOAKED, out cloaked, 4) == 0 ? cloaked : -1;
+        RECT f;
+        if (DwmGetWindowAttribute(h, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, out f, Marshal.SizeOf(typeof(RECT))) == 0)
+        { info.FX = f.Left; info.FY = f.Top; info.FW = f.Right - f.Left; info.FH = f.Bottom - f.Top; }
+        else { info.FX = info.X; info.FY = info.Y; info.FW = info.W; info.FH = info.H; }
         return info;
     }
 
