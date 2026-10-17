@@ -10,6 +10,7 @@
 //! - Visual overlay for snap hints
 
 pub mod overlay;
+mod shell_cloak;
 
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::HashSet;
@@ -923,6 +924,142 @@ pub fn is_process_more_privileged(pid: u32) -> bool {
     }
 }
 
+/// Title, class name and process id of a window, read directly.
+///
+/// Unlike [`enumerate_windows`], this does not skip cloaked or untitled windows,
+/// so it also works for managed windows the daemon has cloaked.
+pub fn describe_window(window_id: WindowId) -> Option<(String, String, u32)> {
+    let hwnd = window_id_to_hwnd(window_id).ok()?;
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        let mut title_buf: Vec<u16> = vec![0; 512];
+        let title_len = GetWindowTextW(hwnd, &mut title_buf).max(0) as usize;
+        let mut class_buf: Vec<u16> = vec![0; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buf).max(0) as usize;
+        let mut process_id: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        Some((
+            String::from_utf16_lossy(&title_buf[..title_len]),
+            String::from_utf16_lossy(&class_buf[..class_len]),
+            process_id,
+        ))
+    }
+}
+
+/// Fraction of `rect`'s area that lies on any of the given monitor rectangles.
+fn visible_fraction(rect: &Rect, monitors: &[Rect]) -> f64 {
+    let area = rect.width.max(0) as f64 * rect.height.max(0) as f64;
+    if area <= 0.0 {
+        return 0.0;
+    }
+    let visible: f64 = monitors
+        .iter()
+        .map(|m| {
+            let w = (rect.x + rect.width).min(m.x + m.width) - rect.x.max(m.x);
+            let h = (rect.y + rect.height).min(m.y + m.height) - rect.y.max(m.y);
+            if w > 0 && h > 0 {
+                w as f64 * h as f64
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    (visible / area).min(1.0)
+}
+
+/// Move `rect` inside `work_area`, shrinking it if it is larger.
+fn clamp_rect_into(rect: &Rect, work_area: &Rect) -> Rect {
+    let width = rect.width.clamp(1, work_area.width.max(1));
+    let height = rect.height.clamp(1, work_area.height.max(1));
+    let x = rect
+        .x
+        .clamp(work_area.x, work_area.x + work_area.width - width);
+    let y = rect
+        .y
+        .clamp(work_area.y, work_area.y + work_area.height - height);
+    Rect::new(x, y, width, height)
+}
+
+/// Monitor whose area overlaps `rect` most, or whose center is nearest.
+fn nearest_monitor<'a>(rect: &Rect, monitors: &'a [MonitorInfo]) -> Option<&'a MonitorInfo> {
+    let overlap = |m: &MonitorInfo| visible_fraction(rect, std::slice::from_ref(&m.rect));
+    let center = |r: &Rect| {
+        (
+            r.x as i64 + r.width as i64 / 2,
+            r.y as i64 + r.height as i64 / 2,
+        )
+    };
+    let (cx, cy) = center(rect);
+    monitors.iter().max_by(|a, b| {
+        overlap(a)
+            .partial_cmp(&overlap(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let (ax, ay) = center(&a.rect);
+                let (bx, by) = center(&b.rect);
+                let da = (ax - cx).pow(2) + (ay - cy).pow(2);
+                let db = (bx - cx).pow(2) + (by - cy).pow(2);
+                db.cmp(&da)
+            })
+    })
+}
+
+/// Move windows that are (partly) outside every monitor back onto the nearest
+/// monitor's work area. A window is moved when less than `min_visible_fraction`
+/// of it is on screen; minimized windows are left alone. Returns how many moved.
+///
+/// After a stop, crash or emergency recovery, windows at the edge of the strip
+/// would otherwise stay (mostly) outside the screen.
+pub fn bring_windows_into_view(window_ids: &[WindowId], min_visible_fraction: f64) -> usize {
+    let monitors = match enumerate_monitors() {
+        Ok(monitors) if !monitors.is_empty() => monitors,
+        _ => return 0,
+    };
+    let monitor_rects: Vec<Rect> = monitors.iter().map(|m| m.rect).collect();
+    let mut moved = 0;
+    for &window_id in window_ids {
+        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+            continue;
+        };
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
+                continue;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(hwnd, &mut r).is_err() {
+                continue;
+            }
+            let rect = Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top);
+            if visible_fraction(&rect, &monitor_rects) >= min_visible_fraction {
+                continue;
+            }
+            let Some(monitor) = nearest_monitor(&rect, &monitors) else {
+                continue;
+            };
+            let target = clamp_rect_into(&rect, &monitor.work_area);
+            if SetWindowPos(
+                hwnd,
+                None,
+                target.x,
+                target.y,
+                target.width,
+                target.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .is_ok()
+            {
+                moved += 1;
+            }
+        }
+    }
+    if moved > 0 {
+        tracing::info!("Moved {} window(s) back into view", moved);
+    }
+    moved
+}
+
 /// Check if a window handle is still valid.
 ///
 /// This helps prevent race conditions where a window is destroyed
@@ -959,11 +1096,122 @@ fn track_daemon_cloak(window_id: WindowId, cloaked: bool) {
         .lock()
         .unwrap_or_else(recover_poisoned_mutex);
     let set = guard.get_or_insert_with(HashSet::new);
-    if cloaked {
-        set.insert(window_id);
+    let changed = if cloaked {
+        set.insert(window_id)
     } else {
-        set.remove(&window_id);
+        set.remove(&window_id)
+    };
+    if changed {
+        write_cloak_journal(set);
     }
+}
+
+// ----------------------------------------------------------------------------
+// Cloak journal
+// ----------------------------------------------------------------------------
+//
+// Shell-cloaked windows look exactly like windows on other virtual desktops
+// (DWM_CLOAKED_SHELL), so after a crash or hard kill they cannot be told apart
+// by their state. The daemon therefore records the windows it cloaked in a small
+// file that recovery (CLI `emergency-uncloak`, the panic hook, the next daemon
+// start) reads to uncloak exactly those windows.
+
+static CLOAK_JOURNAL_PATH_OVERRIDE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn cloak_journal_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = CLOAK_JOURNAL_PATH_OVERRIDE
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .clone()
+    {
+        return Some(path);
+    }
+    std::env::var_os("LOCALAPPDATA").map(|dir| {
+        std::path::PathBuf::from(dir)
+            .join("openniri")
+            .join("cloaked-windows.txt")
+    })
+}
+
+fn format_cloak_journal(window_ids: &HashSet<WindowId>) -> String {
+    let mut ids: Vec<WindowId> = window_ids.iter().copied().collect();
+    ids.sort_unstable();
+    ids.iter().map(|id| format!("{}\n", id)).collect()
+}
+
+fn parse_cloak_journal(text: &str) -> Vec<WindowId> {
+    text.lines()
+        .filter_map(|line| line.trim().parse::<WindowId>().ok())
+        .filter(|id| *id != 0)
+        .collect()
+}
+
+fn write_cloak_journal(window_ids: &HashSet<WindowId>) {
+    let Some(path) = cloak_journal_path() else {
+        return;
+    };
+    let result = if window_ids.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    } else {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&path, format_cloak_journal(window_ids))
+    };
+    if let Err(e) = result {
+        tracing::warn!("Failed to update cloak journal {}: {}", path.display(), e);
+    }
+}
+
+fn read_cloak_journal() -> Vec<WindowId> {
+    cloak_journal_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| parse_cloak_journal(&text))
+        .unwrap_or_default()
+}
+
+/// Uncloak every window recorded in the cloak journal (left cloaked by a daemon
+/// that crashed or was killed) and clear the journal. Returns how many windows
+/// were uncloaked.
+pub fn restore_journaled_cloaked_windows() -> usize {
+    let journaled = read_cloak_journal();
+    if journaled.is_empty() {
+        return 0;
+    }
+    let mut restored = 0;
+    for window_id in journaled {
+        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+            continue;
+        };
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            continue;
+        }
+        match shell_cloak::set_cloak(window_id, false) {
+            Ok(()) => restored += 1,
+            Err(e) => tracing::warn!(
+                "Failed to uncloak journaled window {} through the shell: {}",
+                window_id,
+                e
+            ),
+        }
+    }
+    {
+        let mut guard = DAEMON_CLOAKED_WINDOWS
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        if let Some(set) = guard.as_mut() {
+            set.clear();
+        }
+    }
+    write_cloak_journal(&HashSet::new());
+    if restored > 0 {
+        tracing::info!("Uncloaked {} journaled window(s)", restored);
+    }
+    restored
 }
 
 fn is_daemon_cloaked(window_id: WindowId) -> bool {
@@ -974,6 +1222,10 @@ fn is_daemon_cloaked(window_id: WindowId) -> bool {
 }
 
 fn note_cloak_access_denied() {
+    // With shell cloaking available, a DWM denial only affects that one window.
+    if shell_cloak::available() {
+        return;
+    }
     if !CLOAK_ACCESS_DENIED.swap(true, Ordering::SeqCst) {
         tracing::warn!(
             "DWM denied cloaking a foreign window (E_ACCESSDENIED); hiding off-screen windows by moving them off-screen instead"
@@ -1511,6 +1763,19 @@ pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
             return Err(Win32Error::WindowNotFound(window_id));
         }
 
+        // The shell can cloak any window; DWM only windows of this process.
+        match shell_cloak::set_cloak(window_id, true) {
+            Ok(()) => {
+                track_daemon_cloak(window_id, true);
+                return Ok(());
+            }
+            Err(e) => tracing::debug!(
+                "Shell cloak failed for window {}: {}; trying DWM",
+                window_id,
+                e
+            ),
+        }
+
         let cloak_value: u32 = 1;
 
         let result = DwmSetWindowAttribute(
@@ -1545,7 +1810,24 @@ pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
     let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
+            track_daemon_cloak(window_id, false);
             return Err(Win32Error::WindowNotFound(window_id));
+        }
+
+        // Only windows this daemon cloaked go through the shell; a window cloaked
+        // by its own application (or on another virtual desktop) must stay hidden.
+        if is_daemon_cloaked(window_id) {
+            match shell_cloak::set_cloak(window_id, false) {
+                Ok(()) => {
+                    track_daemon_cloak(window_id, false);
+                    return Ok(());
+                }
+                Err(e) => tracing::debug!(
+                    "Shell uncloak failed for window {}: {}; trying DWM",
+                    window_id,
+                    e
+                ),
+            }
         }
 
         let cloak_value: u32 = 0;
@@ -1851,6 +2133,7 @@ pub fn restore_windows_moved_offscreen(window_ids: &[WindowId]) -> Result<usize,
 /// Logs warnings for failures but never panics. Also resets border colors and
 /// restores windows parked at MoveOffScreen sentinel coordinates.
 pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
+    restore_journaled_cloaked_windows();
     for &wid in window_ids {
         if wid == 0 {
             continue;
@@ -1871,6 +2154,10 @@ pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
             e
         );
     }
+
+    // Managed windows at the edge of the strip are partly off-screen; after a
+    // stop every managed window should be fully visible.
+    bring_windows_into_view(window_ids, 0.95);
 
     tracing::info!(
         "Uncloaked {} managed windows during shutdown",
@@ -1945,10 +2232,16 @@ pub fn restore_all_windows_moved_offscreen_best_effort() -> usize {
 /// This does not require AppState and works even if state is poisoned,
 /// making it suitable for use in panic hooks.
 pub fn uncloak_all_visible_windows() {
+    restore_journaled_cloaked_windows();
     unsafe {
         let _ = EnumWindows(Some(uncloak_all_callback), LPARAM(0));
     }
     let _ = restore_all_windows_moved_offscreen_best_effort();
+    // Without the daemon's window list, only move windows that are mostly off-screen.
+    if let Ok(windows) = enumerate_windows() {
+        let ids: Vec<WindowId> = windows.iter().map(|w| w.hwnd).collect();
+        bring_windows_into_view(&ids, 0.5);
+    }
     // eprintln because tracing may not work in a panic hook
     eprintln!("[openniri] Emergency uncloak of all windows complete");
 }
@@ -3961,13 +4254,105 @@ mod tests {
     }
 
     #[test]
+    fn test_visible_fraction_and_clamp() {
+        let monitors = [Rect::new(0, 0, 1000, 800), Rect::new(1000, 0, 1000, 800)];
+        assert_eq!(
+            visible_fraction(&Rect::new(100, 100, 200, 200), &monitors),
+            1.0
+        );
+        // Spans both monitors: still fully visible.
+        assert_eq!(
+            visible_fraction(&Rect::new(900, 0, 200, 100), &monitors),
+            1.0
+        );
+        assert_eq!(
+            visible_fraction(&Rect::new(-150, 0, 200, 100), &monitors),
+            0.25
+        );
+        assert_eq!(
+            visible_fraction(&Rect::new(-30_000, -30_000, 200, 100), &monitors),
+            0.0
+        );
+
+        let work_area = Rect::new(0, 0, 1000, 760);
+        assert_eq!(
+            clamp_rect_into(&Rect::new(-150, 10, 200, 700), &work_area),
+            Rect::new(0, 10, 200, 700)
+        );
+        assert_eq!(
+            clamp_rect_into(&Rect::new(900, 10, 300, 700), &work_area),
+            Rect::new(700, 10, 300, 700)
+        );
+        // Larger than the work area: shrink to fit.
+        assert_eq!(
+            clamp_rect_into(&Rect::new(-50, -50, 2000, 2000), &work_area),
+            Rect::new(0, 0, 1000, 760)
+        );
+    }
+
+    #[test]
+    fn test_nearest_monitor_prefers_overlap_then_distance() {
+        let monitor = |id: MonitorId, x: i32| MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1000, 800),
+            work_area: Rect::new(x, 0, 1000, 760),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{}", id),
+        };
+        let monitors = [monitor(1, 0), monitor(2, 1000)];
+        assert_eq!(
+            nearest_monitor(&Rect::new(1500, 0, 100, 100), &monitors)
+                .unwrap()
+                .id,
+            2
+        );
+        assert_eq!(
+            nearest_monitor(&Rect::new(-500, 0, 100, 100), &monitors)
+                .unwrap()
+                .id,
+            1
+        );
+        assert_eq!(
+            nearest_monitor(&Rect::new(2500, 0, 100, 100), &monitors)
+                .unwrap()
+                .id,
+            2
+        );
+    }
+
+    #[test]
+    fn test_cloak_journal_format_round_trip() {
+        let ids: HashSet<WindowId> = [3, 1, 2].into_iter().collect();
+        let text = format_cloak_journal(&ids);
+        assert_eq!(text, "1\n2\n3\n");
+        assert_eq!(parse_cloak_journal(&text), vec![1, 2, 3]);
+        // Tolerates a partially written or edited file.
+        assert_eq!(
+            parse_cloak_journal("7\n\ngarbage\n0\n 9 \n12"),
+            vec![7, 9, 12]
+        );
+    }
+
+    #[test]
     fn test_daemon_cloak_tracking_round_trip() {
+        let journal =
+            std::env::temp_dir().join(format!("openniri-cloak-journal-{}.txt", std::process::id()));
+        *CLOAK_JOURNAL_PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex) = Some(journal.clone());
+
         let window_id: WindowId = 0xDEAD_0001;
         assert!(!is_daemon_cloaked(window_id));
         track_daemon_cloak(window_id, true);
         assert!(is_daemon_cloaked(window_id));
+        assert!(read_cloak_journal().contains(&window_id));
         track_daemon_cloak(window_id, false);
         assert!(!is_daemon_cloaked(window_id));
+        assert!(!journal.exists(), "an empty journal is removed");
+
+        *CLOAK_JOURNAL_PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex) = None;
     }
 
     #[test]

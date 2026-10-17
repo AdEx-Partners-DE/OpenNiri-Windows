@@ -126,6 +126,8 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 
 ### Changed
 
+- Windows scrolled out of view are now **cloaked in place through the Windows shell** (`IApplicationView::SetCloak`, as in GlazeWM) instead of being moved off-screen. DWM's own cloak call is denied for other processes' windows, so cloaking never worked before. The shell connection is re-established after Explorer restarts.
+
 - **Default hotkeys now use Alt instead of Win** (`Alt+H/J/K/L` focus, `Alt+Shift+H/L` move column, `Alt+Ctrl+H/L` resize, `Alt+F` / `Alt+Shift+F` floating/fullscreen, `Alt+1/2/3/0` widths, `Alt+Shift+Q` close, `Alt+Shift+R` refresh). Most `Win+letter` combinations are reserved by Windows 11 and `Win+L` can never be registered. Monitor bindings (`Win+Alt+...`) and the `Win+Ctrl+Escape` panic key are unchanged. Existing config files keep their bindings.
 - Hotkeys that register are kept when others fail; each failed hotkey is logged by name (previously one failure disabled all hotkeys, including the panic key)
 - Touchpad gestures are off by default and marked experimental: swipes are detected from scroll-wheel deltas, so ordinary scrolling triggered them
@@ -146,6 +148,10 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 - AppState refactored from single workspace to per-monitor HashMap of workspaces (iter 11)
 
 ### Fixed
+
+- Windows cloaked by a daemon that crashed or was killed are recorded in `%LOCALAPPDATA%\openniri\cloaked-windows.txt` and restored by `emergency-uncloak`, the panic path and the next daemon start
+- Windows at the edge of the strip are moved fully into view on stop and recovery instead of staying partly off-screen
+- `openniri-cli query all` shows titles for cloaked windows instead of "Unknown"
 
 - **Windows hidden by moving them off-screen were never restored.** Windows clamps positions to -32768, so windows parked at -100000 were not found again by stop, `emergency-uncloak` or the panic key. The parking position is now -30000, and windows left at -32768 by older versions are restored too. Minimized windows are never repositioned.
 - Windows found at startup are tiled immediately instead of on the first command

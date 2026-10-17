@@ -140,6 +140,19 @@
       ],
       "status": "done",
       "evidence": "Windows Sandbox run (networking off) of the release build: tiling at startup, Alt-hotkey walk over 10 windows, click activation without focus stealing, CLI scenario, stop recovery, hard kill + emergency-uncloak recovery, cursor latency p95 < 3 ms with mouse hooks. Fixed MoveOffScreen sentinel (-100000 clamped to -32768, never restored), startup layout, focus-follows-mouse scroll loop, foreground attach thread, display sender cleared on reload. INC-49-1/4/T1 still need confirmation on the operator desktop."
+    },
+    {
+      "id": "INC-49-8",
+      "priority": "high",
+      "title": "Cloak foreign windows through the shell and make cloaking crash-safe",
+      "targets": [
+        "crates/platform_win32/src/shell_cloak.rs",
+        "crates/platform_win32/src/lib.rs",
+        "crates/daemon/src/main.rs",
+        "tools/sandbox/guest-e2e.ps1"
+      ],
+      "status": "done",
+      "evidence": "IApplicationView::SetCloak on a dedicated STA thread with reconnect; cloak journal restored by emergency-uncloak, panic path and daemon start; windows clamped into view on stop/recovery. Sandbox run 36/36 incl. kill-while-cloaked + restart."
     }
   ],
   "required_tests": [

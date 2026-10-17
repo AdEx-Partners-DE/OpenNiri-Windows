@@ -27,9 +27,13 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
 ] }
+
+# Needed by the windows::core::interface macro for custom COM interfaces
+windows-core = "0.62"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

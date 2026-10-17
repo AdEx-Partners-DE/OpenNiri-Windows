@@ -1,5 +1,12 @@
 # OpenNiri-Windows Development Iteration Log
 
+## Shell cloaking iteration — 2026-10-17
+
+- Scope: replace `DWMWA_CLOAK` (denied for foreign windows) with shell cloaking through the undocumented `IApplicationView::SetCloak`, on a dedicated STA thread with reconnect after Explorer restarts (`INC-49-8`). Interface layout from GlazeWM (GPL-3.0).
+- Crash safety: shell-cloaked windows are indistinguishable from windows on other virtual desktops, so cloaked HWNDs are journaled to `%LOCALAPPDATA%\openniri\cloaked-windows.txt`. Every recovery path and daemon startup uncloaks journaled windows.
+- Sandbox run also found that windows at the strip edge stayed partly off-screen after stop and recovery, and that `query all` showed "Unknown" for cloaked windows. Both are fixed.
+- Validation: unit tests, clippy, fmt; sandbox run 36/36 including a new restart-after-kill phase.
+
 ## Sandbox end-to-end iteration — 2026-10-17
 
 - Scope: run the real daemon against real windows in Windows Sandbox (`tools/sandbox/run-sandbox-e2e.ps1`) and fix what it finds (`INC-49-7`).
