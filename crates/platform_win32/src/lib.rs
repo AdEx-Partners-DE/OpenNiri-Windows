@@ -73,7 +73,19 @@ const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 // Window message for display configuration changes
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 /// Sentinel coordinate used by MoveOffScreen strategy.
-pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = -100_000;
+///
+/// Windows clamps window positions to the 16-bit range, so a window moved to
+/// -100000 lands at -32768. The old -100000 sentinel was therefore never found
+/// again and parked windows stayed lost after stop or emergency recovery.
+/// -30000 is representable and distinct from the minimized position (-32000).
+pub const MOVE_OFFSCREEN_SENTINEL_COORD: i32 = -30_000;
+
+/// Coordinates at or below this on both axes count as parked off-screen. This also
+/// covers windows parked by older versions, which ended up at -32768.
+const MOVE_OFFSCREEN_DETECTION_THRESHOLD: i32 = -29_000;
+
+/// Position Windows gives minimized windows; never treat it as parked.
+const MINIMIZED_WINDOW_COORD: i32 = -32_000;
 
 /// Recover from a poisoned mutex, logging a warning.
 ///
@@ -711,7 +723,9 @@ fn should_treat_cloak_query_failure_as_cloaked(window_is_valid: bool) -> bool {
 
 /// Check whether coordinates indicate MoveOffScreen sentinel placement.
 pub fn is_move_offscreen_sentinel_position(x: i32, y: i32) -> bool {
-    x <= MOVE_OFFSCREEN_SENTINEL_COORD && y <= MOVE_OFFSCREEN_SENTINEL_COORD
+    x <= MOVE_OFFSCREEN_DETECTION_THRESHOLD
+        && y <= MOVE_OFFSCREEN_DETECTION_THRESHOLD
+        && !(x == MINIMIZED_WINDOW_COORD && y == MINIMIZED_WINDOW_COORD)
 }
 
 /// Check whether a rectangle indicates MoveOffScreen sentinel placement.
@@ -762,7 +776,7 @@ fn restore_window_if_offscreen_to_work_area(
             current_rect.bottom - current_rect.top,
         );
 
-        if !is_move_offscreen_sentinel_rect(&current_rect) {
+        if !is_move_offscreen_sentinel_rect(&current_rect) || IsIconic(hwnd).as_bool() {
             return Ok(false);
         }
 
@@ -1593,12 +1607,29 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
         let current_thread = GetCurrentThreadId();
         let mut diagnostics: Vec<String> = Vec::new();
 
-        // Attach to the target thread's input queue to allow SetForegroundWindow
+        let foreground_hwnd = GetForegroundWindow();
+        if foreground_hwnd == hwnd {
+            return Ok(true);
+        }
+        // Windows only lets the foreground process change the foreground window.
+        // Attaching to the input queue of the thread that owns the current
+        // foreground window lifts that restriction. Attaching to the target's
+        // thread does not, because the target is not in the foreground; that is
+        // why focus-follows-mouse focus changes were reverted.
+        let attach_thread = if foreground_hwnd.0.is_null() {
+            target_thread
+        } else {
+            match GetWindowThreadProcessId(foreground_hwnd, None) {
+                0 => target_thread,
+                thread => thread,
+            }
+        };
+
         let mut attached = false;
-        if target_thread != current_thread {
+        if attach_thread != current_thread {
             if windows::Win32::System::Threading::AttachThreadInput(
                 current_thread,
-                target_thread,
+                attach_thread,
                 true,
             )
             .as_bool()
@@ -1606,8 +1637,8 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
                 attached = true;
             } else {
                 diagnostics.push(format!(
-                    "AttachThreadInput attach failed (current_thread={}, target_thread={})",
-                    current_thread, target_thread
+                    "AttachThreadInput attach failed (current_thread={}, attach_thread={})",
+                    current_thread, attach_thread
                 ));
             }
         }
@@ -1634,14 +1665,14 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
         if attached
             && !windows::Win32::System::Threading::AttachThreadInput(
                 current_thread,
-                target_thread,
+                attach_thread,
                 false,
             )
             .as_bool()
         {
             diagnostics.push(format!(
-                "AttachThreadInput detach failed (current_thread={}, target_thread={})",
-                current_thread, target_thread
+                "AttachThreadInput detach failed (current_thread={}, attach_thread={})",
+                current_thread, attach_thread
             ));
         }
 
@@ -1824,8 +1855,11 @@ pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
         if wid == 0 {
             continue;
         }
-        if let Err(e) = uncloak_window(wid) {
-            tracing::warn!("Failed to uncloak window {} during shutdown: {}", wid, e);
+        // Uncloaking a window that is not cloaked fails for foreign windows.
+        if needs_uncloak(wid) {
+            if let Err(e) = uncloak_window(wid) {
+                tracing::warn!("Failed to uncloak window {} during shutdown: {}", wid, e);
+            }
         }
         // Best-effort border reset
         let _ = reset_window_border_color(wid);
@@ -1924,7 +1958,9 @@ unsafe extern "system" fn uncloak_all_callback(hwnd: HWND, _lparam: LPARAM) -> B
     let wid = hwnd.0 as WindowId;
     if wid != 0 {
         // Best-effort uncloak — ignore errors
-        let _ = uncloak_window(wid);
+        if needs_uncloak(wid) {
+            let _ = uncloak_window(wid);
+        }
         let _ = reset_window_border_color(wid);
     }
     TRUE // continue enumeration
@@ -2462,10 +2498,16 @@ static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>
 /// Custom message to signal the hotkey thread to stop.
 const WM_QUIT_HOTKEY_THREAD: u32 = WM_USER + 1;
 
+/// Clear the hotkey sender. The display-change sender is left alone: it outlives
+/// hotkey re-registration on config reload, and clearing it here used to stop
+/// monitor-change detection after every reload.
 fn clear_hotkey_globals() {
     let mut sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
     *sender = None;
-    drop(sender);
+}
+
+/// Drop the display-change sender so its forwarding thread can exit at shutdown.
+pub fn clear_display_change_sender() {
     let mut sender = DISPLAY_CHANGE_SENDER
         .lock()
         .unwrap_or_else(recover_poisoned_mutex);
@@ -3320,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_hotkey_globals_resets_senders() {
+    fn test_clear_hotkey_globals_keeps_display_change_sender() {
         let _guard = GLOBAL_SENDER_TEST_LOCK
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
@@ -3344,6 +3386,17 @@ mod tests {
         let hotkey_sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
         assert!(hotkey_sender.is_none());
         drop(hotkey_sender);
+        {
+            let display_sender = DISPLAY_CHANGE_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            assert!(
+                display_sender.is_some(),
+                "hotkey re-registration on reload must not disable display-change detection"
+            );
+        }
+
+        clear_display_change_sender();
         let display_sender = DISPLAY_CHANGE_SENDER
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
@@ -4037,6 +4090,15 @@ mod tests {
     }
 
     #[test]
+    fn test_move_offscreen_sentinel_fits_win32_coordinate_range() {
+        assert!(MOVE_OFFSCREEN_SENTINEL_COORD >= i16::MIN as i32);
+        assert!(is_move_offscreen_sentinel_position(
+            MOVE_OFFSCREEN_SENTINEL_COORD,
+            MOVE_OFFSCREEN_SENTINEL_COORD
+        ));
+    }
+
+    #[test]
     fn test_move_offscreen_sentinel_detection() {
         assert!(is_move_offscreen_sentinel_position(
             MOVE_OFFSCREEN_SENTINEL_COORD,
@@ -4046,13 +4108,15 @@ mod tests {
             MOVE_OFFSCREEN_SENTINEL_COORD - 1,
             MOVE_OFFSCREEN_SENTINEL_COORD - 500
         ));
+        // Windows clamps positions to 16 bits; older versions' parked windows sit here.
+        assert!(is_move_offscreen_sentinel_position(-32_768, -32_768));
         assert!(!is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD + 1,
+            MOVE_OFFSCREEN_DETECTION_THRESHOLD + 1,
             MOVE_OFFSCREEN_SENTINEL_COORD
         ));
         assert!(!is_move_offscreen_sentinel_position(
             MOVE_OFFSCREEN_SENTINEL_COORD,
-            MOVE_OFFSCREEN_SENTINEL_COORD + 1
+            MOVE_OFFSCREEN_DETECTION_THRESHOLD + 1
         ));
     }
 

@@ -9,6 +9,8 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 
 ### Added
 
+- `tools/sandbox/run-sandbox-e2e.ps1`: end-to-end test in a disposable Windows Sandbox covering tiling, hotkeys, focus, focus-follows-mouse, cursor latency, stop and crash recovery
+
 - CI now provisions MinGW and uses `stable-x86_64-pc-windows-gnu`, with a release metadata gate that enforces tag/version/changelog consistency (iter 48)
 - `openniri-cli health` command and `HealthCheck` IPC endpoint returning uptime, window count, and error count (iter 43)
 - Structured crash reports via `format_crash_report()` with timestamped artifacts in `%TEMP%` (iter 43)
@@ -144,6 +146,13 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 - AppState refactored from single workspace to per-monitor HashMap of workspaces (iter 11)
 
 ### Fixed
+
+- **Windows hidden by moving them off-screen were never restored.** Windows clamps positions to -32768, so windows parked at -100000 were not found again by stop, `emergency-uncloak` or the panic key. The parking position is now -30000, and windows left at -32768 by older versions are restored too. Minimized windows are never repositioned.
+- Windows found at startup are tiled immediately instead of on the first command
+- Focus-follows-mouse no longer scrolls the strip; scrolling put another window under the cursor, which then took focus
+- Setting the foreground window now attaches to the current foreground thread, so focus changes that do not come from a hotkey (focus-follows-mouse) are no longer reverted by Windows
+- Config reload no longer disables monitor-change detection
+- Shutdown recovery no longer logs an uncloak failure for every window that was never cloaked
 
 - WinEvent hooks, mouse hooks and the tray icon now run on threads with a message loop. They used to sit on the async main thread, which caused cursor lag after start, late or missing window events, gestures that never fired and an unresponsive tray menu (#12)
 - Uncloak is only attempted for windows that are cloaked, and a denied cloak falls back to moving the window off-screen; this ends the repeated `DwmSetWindowAttribute(CLOAK=0) failed` errors and failed layout passes, also with `use_cloaking = false` (#12)
