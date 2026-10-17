@@ -45,10 +45,16 @@ function Invoke-Cli([string[]]$cliArgs) {
     return [pscustomobject]@{ Code = $code; Output = $output }
 }
 
-function Start-Daemon {
-    $process = Start-Process -FilePath $script:daemon -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $Out ("daemon-{0}.out.log" -f $script:phase)) `
-        -RedirectStandardError (Join-Path $Out ("daemon-{0}.err.log" -f $script:phase))
+function Start-Daemon([string[]]$DaemonArgs = @()) {
+    $startParams = @{
+        FilePath = $script:daemon
+        PassThru = $true
+        WindowStyle = 'Hidden'
+        RedirectStandardOutput = (Join-Path $Out ("daemon-{0}.out.log" -f $script:phase))
+        RedirectStandardError = (Join-Path $Out ("daemon-{0}.err.log" -f $script:phase))
+    }
+    if ($DaemonArgs.Count -gt 0) { $startParams.ArgumentList = $DaemonArgs }
+    $process = Start-Process @startParams
     $ready = $false
     for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Milliseconds 250
@@ -175,6 +181,46 @@ function Measure-CursorLatency([string]$tag) {
     Check ("cursor latency p95 < 50 ms ({0})" -f $tag) ($timeouts -eq 0 -and $p95 -ge 0 -and $p95 -lt 50) ("p95={0:N1}ms max={1:N1}ms timeouts={2}" -f $p95, $max, $timeouts)
 }
 
+function Test-MouseFocus {
+    $vs = [E2E]::VirtualScreen()
+    $targets = @(Get-TestWindows | Where-Object { $_.Cloaked -eq 0 -and (Test-OnScreen $_) } | Sort-Object X)
+    $failures = New-Object System.Collections.Generic.List[string]
+    $visited = 0
+    foreach ($window in $targets) {
+        $x = [int](([Math]::Max($window.FX, $vs[0]) + [Math]::Min($window.FX + $window.FW, $vs[0] + $vs[2])) / 2)
+        $y = $window.FY + 60
+        $hit = [E2E]::WindowAt($x, $y)
+        if ($hit -ne $window.Hwnd) { $failures.Add(("{0}: hover point hits {1}" -f $window.Title, $hit)); continue }
+        $result = [E2E]::ObserveHover($x, $y, $false, 0, 0)
+        $visited++
+        if (-not $result.CursorArrived -or $result.AfterDelay -ne $window.Hwnd -or $result.Later -ne $window.Hwnd -or $result.UnderCursor -ne $window.Hwnd) {
+            $failures.Add(("{0}: after delay={1} later={2} under cursor={3}" -f $window.Title, $result.AfterDelay, $result.Later, $result.UnderCursor))
+        }
+    }
+    Check 'mouse hover focuses windows and focus stays with stationary cursor' ($visited -ge 2 -and $failures.Count -eq 0) ("visited={0}; {1}" -f $visited, ($failures -join ' | '))
+
+    # A move into the desktop's outer gap does not emit MouseEnterWindow for a
+    # managed window. Stay away from the remote session's bottom screen edge.
+    # An old hover must therefore be rejected by the live hit test at expiry.
+    $leaveX = $vs[0] + 5
+    $leaveY = $vs[1] + 5
+    $leaveHit = [E2E]::WindowAt($leaveX, $leaveY)
+    $foreground = [E2E]::Foreground()
+    $target = $targets | Where-Object { $_.Hwnd -ne $foreground } | Select-Object -First 1
+    $leaveIsManaged = @(Get-TestWindows | Where-Object { $_.Hwnd -eq $leaveHit }).Count -gt 0
+    if ($null -eq $target -or $leaveIsManaged) {
+        Check 'leaving a hovered window before the delay preserves focus' $false 'Missing nonfocused hover target or unmanaged exit point'
+    } else {
+        $x = [int](([Math]::Max($target.FX, $vs[0]) + [Math]::Min($target.FX + $target.FW, $vs[0] + $vs[2])) / 2)
+        $y = $target.FY + 60
+        $hit = [E2E]::WindowAt($x, $y)
+        $result = [E2E]::ObserveHover($x, $y, $true, $leaveX, $leaveY)
+        $pass = $hit -eq $target.Hwnd -and $result.CursorArrived -and $result.Before -eq $foreground -and $result.AfterDelay -eq $foreground -and $result.Later -eq $foreground -and $result.UnderCursor -eq $leaveHit
+        Check 'leaving a hovered window before the delay preserves focus' $pass ("before={0} after delay={1} later={2} under cursor={3} expected hit={4} arrived={5} cursor=({6},{7}) exit=({8},{9})" -f $result.Before, $result.AfterDelay, $result.Later, $result.UnderCursor, $leaveHit, $result.CursorArrived, $result.CursorX, $result.CursorY, $leaveX, $leaveY)
+    }
+    Snap 'mouse-focus' | Out-Null
+}
+
 $VK_ALT = 0x12; $VK_SHIFT = 0x10; $VK_H = 0x48; $VK_L = 0x4C
 # Enough windows that the strip is wider than any sandbox viewport.
 $script:titles = @('E2E-A', 'E2E-B', 'E2E-C', 'E2E-D', 'E2E-E', 'E2E-F', 'E2E-G', 'E2E-H', 'E2E-I', 'E2E-J')
@@ -200,7 +246,12 @@ try {
         Start-Process -FilePath (Join-Path $work 'TestWindow.exe') -ArgumentList $title, (Join-Path $Out 'activations.log')
         Start-Sleep -Milliseconds 300
     }
-    Start-Sleep -Seconds 2
+    # On a busy host .NET window startup can take much longer than two seconds.
+    # Wait for the actual test windows before starting the daemon under test.
+    $windowsDeadline = (Get-Date).AddSeconds(30)
+    while (@(Get-TestWindows).Count -ne $script:titles.Count -and (Get-Date) -lt $windowsDeadline) {
+        Start-Sleep -Milliseconds 250
+    }
     $before = Snap 'before-daemon'
     if ($before.Count -ne $script:titles.Count) { throw ("setup: only {0} of {1} test windows opened" -f $before.Count, $script:titles.Count) }
 
@@ -271,12 +322,17 @@ try {
 
     # ------------------------------------------------------------------
     # B: low-level mouse hooks installed (focus-follows-mouse + gestures)
-    # Focus-follows-mouse behaviour itself is not asserted: see issue #63.
+    # Regression coverage for stale delayed focus (issue #63).
     # ------------------------------------------------------------------
     $script:phase = 'B'
-    Write-Config "[behavior]`nlog_level = `"debug`"`nfocus_follows_mouse = true`nfocus_follows_mouse_delay_ms = 100`n`n[gestures]`nenabled = true`n"
+    Write-Config "[layout]`ndefault_column_width = 400`nmin_column_width = 300`nmax_column_width = 400`n`n[behavior]`nlog_level = `"debug`"`nfocus_follows_mouse = true`nfocus_follows_mouse_delay_ms = 100`n`n[gestures]`nenabled = true`n"
     $daemonProcess = Start-Daemon
     Measure-CursorLatency 'mouse hooks installed'
+    # Start at the left edge so at least two narrow columns are visible,
+    # regardless of the scroll offset saved by phase A.
+    Invoke-Cli @('scroll', 'left', '--pixels', '100000') | Out-Null
+    Start-Sleep -Milliseconds 500
+    Test-MouseFocus
     Stop-Daemon $daemonProcess
     Start-Sleep -Seconds 1
 
@@ -312,9 +368,76 @@ try {
     Test-AllRecovered 'restart + stop'
 
     # ------------------------------------------------------------------
-    # E: Explorer restarts while the daemon runs (shell reconnect)
+    # F: launch options survive repeated IPC reloads.
+    # ------------------------------------------------------------------
+    $reloadConfig = "[behavior]`nlog_level = `"debug`"`n`n[appearance]`nuse_cloaking = true`n`n[hotkeys]`n`"Alt+Ctrl+F8`" = `"reload`"`n"
+    foreach ($flag in @('--safe-mode', '--no-hotkeys', '--no-cloak')) {
+        $script:phase = 'F-' + $flag.TrimStart('-')
+        Write-Config $reloadConfig
+        $keyWasFree = [E2E]::HotkeyAvailable(3, 0x77)
+        $daemonProcess = Start-Daemon @($flag)
+        $failures = New-Object System.Collections.Generic.List[string]
+        if (-not $keyWasFree) { $failures.Add('test hotkey already registered before daemon start') }
+        for ($attempt = 0; $attempt -lt 2; $attempt++) {
+            $reload = Invoke-Cli @('reload')
+            if ($reload.Code -ne 0) { $failures.Add(("reload {0} failed: {1}" -f $attempt, $reload.Output)) }
+            $keyFree = [E2E]::HotkeyAvailable(3, 0x77)
+            $expectFree = $flag -ne '--no-cloak'
+            if ($keyFree -ne $expectFree) { $failures.Add(("hotkey available={0}, expected={1}" -f $keyFree, $expectFree)) }
+            Invoke-Cli @('scroll', 'right', '--pixels', '100000') | Out-Null
+            Start-Sleep -Milliseconds 400
+            $windows = Get-TestWindows
+            $cloaked = @($windows | Where-Object { $_.Cloaked -ne 0 }).Count
+            $parked = @($windows | Where-Object { $_.X -le -29000 -and $_.Y -le -29000 }).Count
+            $expectCloak = $flag -eq '--no-hotkeys'
+            if (($expectCloak -and ($cloaked -eq 0 -or $parked -ne 0)) -or (-not $expectCloak -and ($cloaked -ne 0 -or $parked -eq 0))) {
+                $failures.Add(("cloaked={0} parked={1} expected cloaking={2}" -f $cloaked, $parked, $expectCloak))
+            }
+        }
+        Check ("{0} survives repeated config reloads" -f $flag) ($failures.Count -eq 0) ($failures -join ' | ')
+        Stop-Daemon $daemonProcess
+        Start-Sleep -Seconds 1
+        Test-AllRecovered ("{0} reload + stop" -f $flag)
+    }
+
+    # ------------------------------------------------------------------
+    # G: a reload hotkey replaces its own binding; invalid TOML preserves it.
+    # ------------------------------------------------------------------
+    $script:phase = 'G'
+    Write-Config $reloadConfig
+    $keysWereFree = [E2E]::HotkeyAvailable(3, 0x77) -and [E2E]::HotkeyAvailable(3, 0x78)
+    $daemonProcess = Start-Daemon
+    Write-Config "[behavior]`nlog_level = `"debug`"`n`n[hotkeys]`n`"Alt+Ctrl+F9`" = `"toggle_pause`"`n"
+    [E2E]::Chord(0x12, 0x11, 0x77)
+    $rebound = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 100
+        if ([E2E]::HotkeyAvailable(3, 0x77) -and -not [E2E]::HotkeyAvailable(3, 0x78)) { $rebound = $true; break }
+    }
+    Check 'hotkey-triggered reload replaces OS shortcut registrations' ($keysWereFree -and $rebound) ("old key released and new key registered={0}" -f $rebound)
+    [E2E]::Chord(0x12, 0x11, 0x78)
+    Start-Sleep -Milliseconds 400
+    $health = Invoke-Cli @('health')
+    Check 'new shortcut executes its reloaded command' ($health.Code -eq 0 -and $health.Output -match 'Status: PAUSED') $health.Output.Trim()
+
+    Write-Config '[hotkeys'
+    $reload = Invoke-Cli @('reload')
+    [E2E]::Chord(0x12, 0x11, 0x78)
+    Start-Sleep -Milliseconds 400
+    $health = Invoke-Cli @('health')
+    $retained = -not [E2E]::HotkeyAvailable(3, 0x78) -and [E2E]::HotkeyAvailable(3, 0x77)
+    Check 'invalid config preserves bindings and their commands' ($reload.Code -ne 0 -and $retained -and $health.Code -eq 0 -and $health.Output -notmatch 'Status: PAUSED') ("reload exit={0}; {1}" -f $reload.Code, $health.Output.Trim())
+    Stop-Daemon $daemonProcess
+    Start-Sleep -Seconds 1
+    Test-AllRecovered 'hotkey reload + stop'
+
+    # ------------------------------------------------------------------
+    # E: Explorer restarts while the daemon runs (shell reconnect).
+    # Run this destructive shell scenario last: failed recovery here must not
+    # contaminate the reload tests with windows hidden by an earlier phase.
     # ------------------------------------------------------------------
     $script:phase = 'E'
+    Write-Config "[behavior]`nlog_level = `"debug`"`n"
     $daemonProcess = Start-Daemon
     Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
     $explorerBack = $false

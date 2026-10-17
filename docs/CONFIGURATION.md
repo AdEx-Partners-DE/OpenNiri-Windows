@@ -16,6 +16,15 @@ To reload configuration without restarting the daemon, use the CLI:
 openniri-cli reload
 ```
 
+Reload validates and clamps configuration values, logging any corrections. Hotkey
+bindings are updated whether reload is triggered through the CLI, tray, a hotkey,
+or a gesture. If the new layout cannot be applied, the command reports an error;
+the parsed configuration and its bindings still take effect. Invalid TOML leaves
+the previous configuration and bindings in place.
+
+Startup flags `--safe-mode`, `--no-hotkeys`, and `--no-cloak` remain in effect after
+every reload. Restart the daemon without the corresponding flag to remove it.
+
 ---
 
 ## Table of Contents

@@ -55,6 +55,10 @@ pub(crate) struct AppState {
     pub(crate) platform_config: PlatformConfig,
     /// User configuration.
     pub(crate) config: Config,
+    /// Command-line override that must survive configuration reloads.
+    pub(crate) force_no_cloak: bool,
+    /// Incremented when a parsed configuration is committed, even if layout fails.
+    pub(crate) config_revision: u64,
     /// Pre-compiled window rules for efficient matching.
     pub(crate) compiled_rules: Vec<config::CompiledWindowRule>,
     /// Previously focused window for border color tracking.
@@ -158,6 +162,8 @@ impl AppState {
             focused_monitor,
             platform_config,
             config,
+            force_no_cloak: false,
+            config_revision: 0,
             compiled_rules,
             previous_focused_hwnd: None,
             paused: false,
@@ -198,7 +204,13 @@ impl AppState {
     }
 
     /// Apply configuration to all workspaces.
-    pub(crate) fn apply_config(&mut self, config: Config) {
+    pub(crate) fn apply_config(&mut self, mut config: Config) {
+        if self.force_no_cloak {
+            config.appearance.use_cloaking = false;
+        }
+        for warning in config.validate() {
+            warn!("Config: {} - {}", warning.field, warning.message);
+        }
         for workspace in self.workspaces.values_mut() {
             workspace.set_gap(config.layout.gap);
             workspace.set_outer_gap(config.layout.outer_gap);
@@ -213,6 +225,7 @@ impl AppState {
         };
         self.compiled_rules = config.compile_window_rules();
         self.config = config;
+        self.config_revision = self.config_revision.wrapping_add(1);
         info!(
             "Configuration applied to all {} workspaces",
             self.workspaces.len()
@@ -697,6 +710,44 @@ mod tests {
     use super::*;
     use crate::recovery::join_with_timeout;
     use crate::test_support::*;
+
+    #[test]
+    fn reloaded_config_is_validated_and_keeps_the_cloaking_override() {
+        use openniri_platform_win32::HideStrategy;
+
+        for force_no_cloak in [false, true] {
+            let mut state = paused_state(two_monitors());
+            state.force_no_cloak = force_no_cloak;
+            for requested_cloaking in [false, true, true] {
+                let mut config = test_config();
+                config.appearance.use_cloaking = requested_cloaking;
+                config.layout.gap = -10;
+                config.layout.outer_gap = -20;
+                config.layout.min_column_width = 800;
+                config.layout.max_column_width = 200;
+                config.layout.default_column_width = 5000;
+                state.apply_config(config);
+
+                let uses_cloaking = requested_cloaking && !force_no_cloak;
+                assert_eq!(state.config.appearance.use_cloaking, uses_cloaking);
+                assert_eq!(
+                    state.platform_config.hide_strategy == HideStrategy::Cloak,
+                    uses_cloaking
+                );
+                assert_eq!(state.config.layout.min_column_width, 200);
+                assert_eq!(state.config.layout.max_column_width, 800);
+                for workspace in state.workspaces.values_mut() {
+                    workspace
+                        .insert_window(state.config_revision, None)
+                        .unwrap();
+                    let last = workspace.columns().last().unwrap();
+                    assert_eq!(last.width(), 800);
+                    assert_eq!(workspace.gap(), 0);
+                    assert_eq!(workspace.outer_gap(), 0);
+                }
+            }
+        }
+    }
 
     fn snapshot(workspaces: &[(&str, f64)], focused: &str) -> StateSnapshot {
         StateSnapshot {

@@ -27,6 +27,14 @@ fn validate_set_width_fraction(fraction: f64) -> std::result::Result<(), String>
 }
 
 impl AppState {
+    fn reload_config(&mut self, config: Config) -> IpcResponse {
+        self.apply_config(config);
+        if let Err(e) = self.apply_layout() {
+            return IpcResponse::error(format!("Failed to apply layout: {}", e));
+        }
+        IpcResponse::Ok
+    }
+
     /// Move the focused window to another monitor using an all-or-nothing update.
     ///
     /// The source and target workspaces are mutated on cloned snapshots first and
@@ -295,13 +303,7 @@ impl AppState {
                 IpcResponse::Ok
             }
             IpcCommand::Reload => match Config::load() {
-                Ok(new_config) => {
-                    self.apply_config(new_config);
-                    if let Err(e) = self.apply_layout() {
-                        return IpcResponse::error(format!("Failed to apply layout: {}", e));
-                    }
-                    IpcResponse::Ok
-                }
+                Ok(new_config) => self.reload_config(new_config),
                 Err(e) => IpcResponse::error(format!("Failed to reload config: {}", e)),
             },
             IpcCommand::TogglePause => {
@@ -526,6 +528,34 @@ mod tests {
     // ========================================================================
     // IPC command handling
     // ========================================================================
+
+    #[test]
+    fn reload_commits_config_even_when_placement_fails() {
+        use crate::state::TestApplyPlacementsBehavior;
+        use std::time::Duration;
+
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state
+            .focused_workspace_mut()
+            .unwrap()
+            .insert_window(100, None)
+            .unwrap();
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+        let mut config = test_config();
+        config.hotkeys.bindings.clear();
+        let previous_revision = state.config_revision;
+
+        assert!(matches!(
+            state.reload_config(config),
+            IpcResponse::Error { .. }
+        ));
+        assert!(state.config.hotkeys.bindings.is_empty());
+        assert_ne!(
+            state.config_revision, previous_revision,
+            "runtime bindings must follow the committed config despite a layout error"
+        );
+    }
 
     #[test]
     fn test_noop_safe_commands_succeed_on_empty_state() {

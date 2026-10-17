@@ -4,15 +4,15 @@ use crate::error::Win32Error;
 use openniri_core_layout::{Rect, WindowId};
 use std::ffi::c_void;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_VISIBLE,
+    EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetWindow, GetWindowLongW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 
 /// Convert a WindowId to an HWND safely, returning an error for null (zero) IDs.
@@ -177,6 +177,20 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
     });
 
     TRUE
+}
+
+/// Return the top-level window currently under the cursor, or None if unavailable.
+/// Uses the same root normalization as the mouse hook, including child controls.
+pub fn window_under_cursor() -> Option<WindowId> {
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point).ok()?;
+        let hwnd = WindowFromPoint(point);
+        if hwnd.is_invalid() {
+            return None;
+        }
+        Some(normalize_to_root_window(hwnd).0 as WindowId)
+    }
 }
 
 pub(crate) fn normalize_to_root_window(hwnd: HWND) -> HWND {

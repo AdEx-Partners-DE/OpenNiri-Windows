@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Hotkey registration result containing handle and mapping.
+#[derive(Default)]
 pub(crate) struct HotkeyState {
     /// Handle to unregister hotkeys on drop.
     pub(crate) handle: Option<openniri_platform_win32::HotkeyHandle>,
@@ -24,7 +25,15 @@ pub(crate) struct HotkeyState {
 /// Register hotkeys from config and return state.
 ///
 /// This function is called both at startup and on config reload.
-pub(crate) fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> HotkeyState {
+pub(crate) fn setup_hotkeys(
+    config: &Config,
+    event_tx: mpsc::Sender<DaemonEvent>,
+    disabled: bool,
+) -> HotkeyState {
+    if disabled {
+        info!("Hotkeys disabled by command-line flag");
+        return HotkeyState::default();
+    }
     let config_hotkeys = &config.hotkeys.bindings;
 
     // Build hotkey definitions and command mapping

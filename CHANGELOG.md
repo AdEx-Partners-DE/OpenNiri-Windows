@@ -154,6 +154,10 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 
 ### Fixed
 
+- Configuration reload validates and clamps values just like startup, preserves `--safe-mode` / `--no-hotkeys` / `--no-cloak`, and refreshes hotkeys for every reload source (including hotkeys and gestures), even if applying the new layout fails. Pending mouse focus is cancelled on reload.
+
+- Focus-follows-mouse no longer applies stale debounce requests: pending focus is replaced directly in the event loop and the window under the cursor is checked again before focusing (daemon portion of #63).
+
 - Gaps between tiled windows now match the configured `gap`/`outer_gap`: placement compensates for the invisible resize borders Windows 10/11 adds around windows (`DWMWA_EXTENDED_FRAME_BOUNDS`). Previously visible gaps were about 14 px larger and differed between applications.
 
 - Windows cloaked by a daemon that crashed or was killed are recorded in `%LOCALAPPDATA%\openniri\cloaked-windows.txt` and restored by `emergency-uncloak`, the panic path and the next daemon start

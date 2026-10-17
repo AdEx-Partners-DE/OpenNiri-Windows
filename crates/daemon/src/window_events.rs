@@ -645,8 +645,17 @@ impl AppState {
     }
 
     /// Apply focus to a window for focus-follows-mouse.
-    /// Returns true if focus was applied, false if the window isn't managed.
-    pub(crate) fn apply_focus_follows_mouse(&mut self, hwnd: u64) -> bool {
+    /// Revalidate the live cursor target after the debounce delay. Leaving for an
+    /// unmanaged window or the desktop does not necessarily produce a hook event.
+    /// Returns true if focus was applied.
+    pub(crate) fn apply_focus_follows_mouse(
+        &mut self,
+        hwnd: u64,
+        cursor_window: Option<u64>,
+    ) -> bool {
+        if cursor_window != Some(hwnd) {
+            return false;
+        }
         if let Some(monitor_id) = self.find_window_workspace(hwnd) {
             // Update focused monitor to match the window's monitor
             self.focused_monitor = monitor_id;
@@ -909,20 +918,50 @@ mod tests {
         ws.insert_window(200, Some(800)).unwrap();
         ws.add_floating(500, Rect::new(100, 100, 400, 300)).unwrap();
 
-        assert!(state.apply_focus_follows_mouse(100));
+        assert!(state.apply_focus_follows_mouse(100, Some(100)));
         assert_eq!(state.previous_focused_hwnd, Some(100));
         assert_eq!(
             state.focused_workspace().unwrap().focused_window(),
             Some(100)
         );
 
-        assert!(state.apply_focus_follows_mouse(500));
+        assert!(state.apply_focus_follows_mouse(500, Some(500)));
         assert_eq!(state.previous_focused_hwnd, Some(500));
         assert_eq!(
             state.focused_workspace().unwrap().focused_window(),
             Some(100),
             "floating focus-follows-mouse should not mutate tiled focus"
         );
+    }
+
+    #[test]
+    fn stale_mouse_focus_preserves_focus_and_monitor() {
+        for cursor_window in [None, Some(200), Some(999)] {
+            let mut state = paused_state(two_monitors());
+            state
+                .workspaces
+                .get_mut(&1)
+                .unwrap()
+                .insert_window(100, None)
+                .unwrap();
+            state
+                .workspaces
+                .get_mut(&2)
+                .unwrap()
+                .insert_window(200, None)
+                .unwrap();
+            state.focused_monitor = 2;
+            state.previous_focused_hwnd = Some(200);
+
+            assert!(!state.apply_focus_follows_mouse(100, cursor_window));
+            assert_eq!(state.focused_monitor, 2);
+            assert_eq!(state.previous_focused_hwnd, Some(200));
+            assert_eq!(
+                state.focused_workspace().unwrap().focused_window(),
+                Some(200)
+            );
+            assert!(state.mouse_focus_pending.is_none());
+        }
     }
 
     #[test]

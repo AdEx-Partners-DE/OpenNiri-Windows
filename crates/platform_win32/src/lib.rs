@@ -61,5 +61,5 @@ pub use offscreen::{
 pub use placement::{apply_placements, HideStrategy, PlatformConfig};
 pub use window::{
     describe_window, enumerate_windows, get_process_executable, is_process_more_privileged,
-    is_valid_window, WindowInfo,
+    is_valid_window, window_under_cursor, WindowInfo,
 };
