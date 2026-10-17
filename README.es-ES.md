@@ -31,7 +31,7 @@ Implementado actualmente:
 - Espacios de trabajo para varios monitores con comandos de enfoque y movimiento conscientes del monitor
 - Atajos globales con recarga de configuración en tiempo real
 - Alternancia de ventanas flotantes y pantalla completa
-- Preajustes de ancho (`Win+1/2/3`) y equilibrado (`Win+0`)
+- Preajustes de ancho (`Alt+1/2/3`) y equilibrado (`Alt+0`)
 - Animaciones de desplazamiento suaves, sugerencias de ajuste (*snap*) y gestos del trackpad
 - Opción de enfoque que sigue al mouse (*focus-follows-mouse*)
 - Acciones en la bandeja del sistema (pausar/recargar/abrir config/abrir registros/salir)
@@ -118,21 +118,23 @@ Para detalles sobre recuperación de incidentes, consulta [docs/SUPPORT_PLAYBOOK
 
 ## Atajos Predeterminados
 
+La mayoría de las combinaciones `Win+letra` están reservadas por Windows 11 (`Win+L` nunca se puede registrar), por lo que los valores predeterminados usan `Alt`, como GlazeWM. Los archivos de configuración existentes conservan los atajos que ya contienen. Los atajos que no se pueden registrar se anotan por nombre en el registro y el resto sigue activo.
+
 | Tecla | Acción |
 |---|---|
-| `Win+H / Win+L` | Enfoque izquierda / derecha |
-| `Win+J / Win+K` | Enfoque abajo / arriba |
-| `Win+Shift+H / Win+Shift+L` | Mover columna izquierda / derecha |
-| `Win+Ctrl+H / Win+Ctrl+L` | Encoger / ampliar columna |
+| `Alt+H / Alt+L` | Enfoque izquierda / derecha |
+| `Alt+J / Alt+K` | Enfoque abajo / arriba |
+| `Alt+Shift+H / Alt+Shift+L` | Mover columna izquierda / derecha |
+| `Alt+Ctrl+H / Alt+Ctrl+L` | Encoger / ampliar columna |
 | `Win+Ctrl+Escape` | Restauración de visibilidad de emergencia + revertir pánico del demonio |
 | `Win+Alt+H / Win+Alt+L` | Enfoque monitor izquierda / derecha |
 | `Win+Alt+Shift+H / Win+Alt+Shift+L` | Mover ventana al monitor izquierda / derecha |
-| `Win+Shift+Q` | Cerrar ventana enfocada |
-| `Win+F` | Alternar flotante |
-| `Win+Shift+F` | Alternar pantalla completa |
-| `Win+1 / Win+2 / Win+3` | Establecer ancho a 1/3, 1/2, 2/3 |
-| `Win+0` | Igualar todos los anchos de columna |
-| `Win+R` | Actualizar (reenumerar ventanas) |
+| `Alt+Shift+Q` | Cerrar ventana enfocada |
+| `Alt+F` | Alternar flotante |
+| `Alt+Shift+F` | Alternar pantalla completa |
+| `Alt+1 / Alt+2 / Alt+3` | Establecer ancho a 1/3, 1/2, 2/3 |
+| `Alt+0` | Igualar todos los anchos de columna |
+| `Alt+Shift+R` | Actualizar (reenumerar ventanas) |
 
 ## Iniciar Automáticamente con Windows
 

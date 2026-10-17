@@ -275,23 +275,25 @@ Hotkeys are specified as strings: `Modifier+Modifier+Key`
 
 **Supported Modifiers**: `Win`, `Ctrl`, `Alt`, `Shift`
 
-**Example**: `Win+Shift+H` = Windows key + Shift + H
+**Example**: `Alt+Shift+H` = Alt + Shift + H
+
+Most `Win+letter` combinations are reserved by Windows 11 (`Win+L` can never be registered), so the defaults use `Alt`, like GlazeWM. Registration is not all-or-nothing: hotkeys that register are kept, each one that cannot be registered is logged by name, and the tray tooltip shows the registered/requested mismatch. If the emergency panic hotkey cannot be registered, a warning says to use `openniri-cli panic-revert` or the tray menu.
 
 ### Default Bindings
 
 | Hotkey | Command |
 |--------|---------|
-| Win+H/J/K/L | Focus left/down/up/right |
-| Win+Shift+H/L | Move column left/right |
-| Win+Ctrl+H/L | Resize shrink/grow |
+| Alt+H/J/K/L | Focus left/down/up/right |
+| Alt+Shift+H/L | Move column left/right |
+| Alt+Ctrl+H/L | Resize shrink/grow |
 | Win+Alt+H/L | Focus monitor left/right |
 | Win+Alt+Shift+H/L | Move window to monitor left/right |
-| Win+Shift+Q | Close focused window |
-| Win+F | Toggle floating |
-| Win+Shift+F | Toggle fullscreen |
-| Win+1/2/3 | Set column width preset |
-| Win+0 | Equalize column widths |
-| Win+R | Refresh (re-enumerate windows) |
+| Alt+Shift+Q | Close focused window |
+| Alt+F | Toggle floating |
+| Alt+Shift+F | Toggle fullscreen |
+| Alt+1/2/3 | Set column width preset |
+| Alt+0 | Equalize column widths |
+| Alt+Shift+R | Refresh (re-enumerate windows) |
 
 ### Live Reload
 
@@ -378,11 +380,11 @@ Uses a low-level mouse hook (WH_MOUSE_LL) to track mouse position. Rapid movemen
 
 ## Touchpad Gesture Support
 
-Touchpad gestures provide a natural way to navigate the scrollable strip:
+Touchpad gestures provide a way to navigate the scrollable strip. This feature is experimental and off by default, because swipes are detected by accumulating mouse-wheel deltas, so ordinary scrolling can trigger them:
 
 ```toml
 [gestures]
-enabled = true
+enabled = false
 swipe_left = "focus_left"
 swipe_right = "focus_right"
 swipe_up = "focus_up"

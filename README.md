@@ -29,8 +29,8 @@ Implemented now:
 - Multi-monitor workspaces with monitor-aware focus and move commands
 - Global hotkeys with live config reload
 - Floating and fullscreen toggles
-- Width presets (`Win+1/2/3`) and equalize (`Win+0`)
-- Smooth scroll animations, snap hints, and touchpad gestures
+- Width presets (`Alt+1/2/3`) and equalize (`Alt+0`)
+- Smooth scroll animations, snap hints, and touchpad gestures (experimental, off by default)
 - Optional focus-follows-mouse
 - System tray actions (pause/reload/open config/open logs/exit)
 - Workspace persistence and safer shutdown/recovery behavior
@@ -116,21 +116,23 @@ For incident recovery details, see [docs/SUPPORT_PLAYBOOK.md](docs/SUPPORT_PLAYB
 
 ## Default Hotkeys
 
+Most `Win+letter` combinations are reserved by Windows 11 (`Win+L` can never be registered), so the defaults use `Alt`, like GlazeWM. Existing config files keep whatever bindings they contain. Hotkeys that cannot be registered are logged by name and the rest stay active.
+
 | Key | Action |
 |---|---|
-| `Win+H / Win+L` | Focus left / right |
-| `Win+J / Win+K` | Focus down / up |
-| `Win+Shift+H / Win+Shift+L` | Move column left / right |
-| `Win+Ctrl+H / Win+Ctrl+L` | Shrink / grow column |
+| `Alt+H / Alt+L` | Focus left / right |
+| `Alt+J / Alt+K` | Focus down / up |
+| `Alt+Shift+H / Alt+Shift+L` | Move column left / right |
+| `Alt+Ctrl+H / Alt+Ctrl+L` | Shrink / grow column |
 | `Win+Ctrl+Escape` | Emergency visibility restore + daemon panic-revert |
 | `Win+Alt+H / Win+Alt+L` | Focus monitor left / right |
 | `Win+Alt+Shift+H / Win+Alt+Shift+L` | Move window to monitor left / right |
-| `Win+Shift+Q` | Close focused window |
-| `Win+F` | Toggle floating |
-| `Win+Shift+F` | Toggle fullscreen |
-| `Win+1 / Win+2 / Win+3` | Set width to 1/3, 1/2, 2/3 |
-| `Win+0` | Equalize all column widths |
-| `Win+R` | Refresh (re-enumerate windows) |
+| `Alt+Shift+Q` | Close focused window |
+| `Alt+F` | Toggle floating |
+| `Alt+Shift+F` | Toggle fullscreen |
+| `Alt+1 / Alt+2 / Alt+3` | Set width to 1/3, 1/2, 2/3 |
+| `Alt+0` | Equalize all column widths |
+| `Alt+Shift+R` | Refresh (re-enumerate windows) |
 
 ## Start Automatically with Windows
 

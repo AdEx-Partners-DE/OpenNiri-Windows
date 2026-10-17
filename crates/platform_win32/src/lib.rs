@@ -12,11 +12,13 @@
 pub mod overlay;
 
 use openniri_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
+use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use thiserror::Error;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HWND, LPARAM, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED,
 };
@@ -42,6 +44,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, WH_MOUSE_LL, WM_HOTKEY, WM_MOUSEMOVE, WM_USER,
     WNDCLASSW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    PeekMessageW, TranslateMessage, PM_NOREMOVE, WM_APP,
+};
 
 // WinEvent constants (not all are exposed by windows-rs)
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
@@ -53,6 +58,8 @@ const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
 const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
 const OBJID_WINDOW: i32 = 0;
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+/// `CHILDID_SELF`: the event is about the object itself, not one of its children.
+const CHILDID_SELF: i32 = 0;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 
 // Window message for display configuration changes
@@ -609,6 +616,27 @@ fn should_filter_window_event_by_manageability(event: u32) -> bool {
     )
 }
 
+/// How a WinEvent's HWND maps to the window the daemon manages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventTargetPolicy {
+    /// Focus-style events: a focused child control means its top-level window has focus.
+    NormalizeToRoot,
+    /// Create/move events for child windows (tabs, browser panes) are ignored.
+    TopLevelOnly,
+    /// Destroy events keep the original HWND. A destroyed window can no longer be
+    /// mapped to its root, and normalizing a destroyed child used to remove its
+    /// still-open top-level window from management.
+    Exact,
+}
+
+fn event_target_policy(event: u32) -> EventTargetPolicy {
+    match event {
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_LOCATIONCHANGE => EventTargetPolicy::TopLevelOnly,
+        EVENT_OBJECT_DESTROY => EventTargetPolicy::Exact,
+        _ => EventTargetPolicy::NormalizeToRoot,
+    }
+}
+
 fn normalize_to_root_window(hwnd: HWND) -> HWND {
     let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
     if root_hwnd.0.is_null() {
@@ -798,6 +826,74 @@ pub fn get_process_executable(pid: u32) -> Option<String> {
     }
 }
 
+/// Mandatory integrity level RID (for example `0x2000` medium, `0x3000` high) of a process.
+fn process_integrity_rid(
+    process: windows::Win32::Foundation::HANDLE,
+) -> Result<u32, windows::core::Error> {
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
+
+        let mut len: u32 = 0;
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut len);
+        // u64 storage keeps the TOKEN_MANDATORY_LABEL read aligned.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let result = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        result?;
+
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return Err(windows::core::Error::from(E_ACCESSDENIED));
+        }
+        Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
+    }
+}
+
+/// Integrity level of this process, read once.
+fn own_integrity_rid() -> Option<u32> {
+    static OWN: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *OWN.get_or_init(|| {
+        process_integrity_rid(unsafe { windows::Win32::System::Threading::GetCurrentProcess() })
+            .ok()
+    })
+}
+
+/// Whether a process runs with a higher integrity level than this one.
+///
+/// Windows blocks moving, resizing and cloaking windows of more privileged
+/// processes (UIPI), for example an administrator terminal when OpenNiri runs
+/// unelevated. Such windows must not be tiled: every placement fails with
+/// "Access is denied" (INC-49). A process whose token cannot be read at all is
+/// treated as more privileged.
+pub fn is_process_more_privileged(pid: u32) -> bool {
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return false;
+    };
+    let theirs = process_integrity_rid(process);
+    let _ = unsafe { CloseHandle(process) };
+    match (theirs, own_integrity_rid()) {
+        (Ok(theirs), Some(ours)) => theirs > ours,
+        (Err(e), _) => e.code() == E_ACCESSDENIED,
+        (Ok(_), None) => false,
+    }
+}
+
 /// Check if a window handle is still valid.
 ///
 /// This helps prevent race conditions where a window is destroyed
@@ -810,6 +906,84 @@ pub fn is_valid_window(hwnd: WindowId) -> bool {
         let hwnd = HWND(hwnd as *mut c_void);
         IsWindow(Some(hwnd)).as_bool()
     }
+}
+
+/// Windows this process has successfully cloaked and not yet uncloaked.
+///
+/// Uncloak is only attempted for windows in this set or windows DWM reports as
+/// app-cloaked. Calling `DWMWA_CLOAK` on a window that was never cloaked fails
+/// for most foreign windows, and those failures used to fail every layout pass.
+static DAEMON_CLOAKED_WINDOWS: std::sync::Mutex<Option<HashSet<WindowId>>> =
+    std::sync::Mutex::new(None);
+
+/// Set once DWM rejects a cloak request with `E_ACCESSDENIED`.
+///
+/// DWM only lets the owning process cloak a window, so after the first denial
+/// off-screen windows are moved off-screen instead of cloaked.
+static CLOAK_ACCESS_DENIED: AtomicBool = AtomicBool::new(false);
+
+/// `DWM_CLOAKED_APP`: the window was cloaked by an application.
+const DWM_CLOAKED_APP_FLAG: u32 = 0x1;
+
+fn track_daemon_cloak(window_id: WindowId, cloaked: bool) {
+    let mut guard = DAEMON_CLOAKED_WINDOWS
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    let set = guard.get_or_insert_with(HashSet::new);
+    if cloaked {
+        set.insert(window_id);
+    } else {
+        set.remove(&window_id);
+    }
+}
+
+fn is_daemon_cloaked(window_id: WindowId) -> bool {
+    let guard = DAEMON_CLOAKED_WINDOWS
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    guard.as_ref().is_some_and(|set| set.contains(&window_id))
+}
+
+fn note_cloak_access_denied() {
+    if !CLOAK_ACCESS_DENIED.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            "DWM denied cloaking a foreign window (E_ACCESSDENIED); hiding off-screen windows by moving them off-screen instead"
+        );
+    }
+}
+
+/// Whether DWM has rejected cloaking for this process.
+pub fn cloak_access_denied() -> bool {
+    CLOAK_ACCESS_DENIED.load(Ordering::SeqCst)
+}
+
+/// Whether DWM reports the window as cloaked by an application (`DWM_CLOAKED_APP`).
+fn is_window_app_cloaked(window_id: WindowId) -> bool {
+    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+        return false;
+    };
+    let mut cloaked: u32 = 0;
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    result.is_ok() && cloaked & DWM_CLOAKED_APP_FLAG != 0
+}
+
+/// Keep only uncloak targets that are actually cloaked.
+fn filter_uncloak_targets<F>(targets: Vec<WindowId>, is_cloaked: F) -> Vec<WindowId>
+where
+    F: Fn(WindowId) -> bool,
+{
+    targets.into_iter().filter(|id| is_cloaked(*id)).collect()
+}
+
+fn needs_uncloak(window_id: WindowId) -> bool {
+    is_daemon_cloaked(window_id) || is_window_app_cloaked(window_id)
 }
 
 fn collect_uncloak_targets(
@@ -905,10 +1079,14 @@ fn select_visible_fallback_window(
         .map(|placement| placement.window_id)
 }
 
+/// Undo visibility changes made by a failed `apply_placements` call.
+///
+/// This deliberately does not change the foreground window. A failed apply can
+/// repeat on every animation frame, and forcing focus each time locked users out
+/// of their own windows (INC-49).
 fn rollback_apply_visibility_changes(
     cloaked_window_ids: &[WindowId],
     moved_offscreen_window_ids: &[WindowId],
-    visible_window_ids: &[WindowId],
 ) {
     for window_id in cloaked_window_ids {
         if let Err(e) = uncloak_window(*window_id) {
@@ -926,21 +1104,6 @@ fn rollback_apply_visibility_changes(
                 "Rollback failed while restoring moved-offscreen windows after apply error: {}",
                 e
             );
-        }
-    }
-
-    for window_id in visible_window_ids {
-        match set_foreground_window(*window_id) {
-            Ok(true) => break,
-            Ok(false) => tracing::warn!(
-                "Rollback foreground restore was denied for window {}",
-                window_id
-            ),
-            Err(e) => tracing::warn!(
-                "Rollback foreground restore failed for window {}: {}",
-                window_id,
-                e
-            ),
         }
     }
 }
@@ -984,10 +1147,6 @@ pub fn apply_placements(
     let (visible, offscreen): (Vec<_>, Vec<_>) = placements
         .iter()
         .partition(|p| p.visibility == Visibility::Visible);
-    let visible_window_ids: Vec<WindowId> = visible
-        .iter()
-        .map(|placement| placement.window_id)
-        .collect();
     let mut side_effect_failures: Vec<String> = Vec::new();
     let mut benign_side_effect_races: usize = 0;
     let mut cloaked_window_ids: Vec<WindowId> = Vec::new();
@@ -1003,7 +1162,11 @@ pub fn apply_placements(
     }
 
     // Keep windows visible under the active hide strategy.
-    for window_id in collect_uncloak_targets(&visible, &offscreen, config.hide_strategy) {
+    let uncloak_targets = filter_uncloak_targets(
+        collect_uncloak_targets(&visible, &offscreen, config.hide_strategy),
+        needs_uncloak,
+    );
+    for window_id in uncloak_targets {
         if let Err(e) = uncloak_window(window_id) {
             record_apply_side_effect_failure(
                 &mut side_effect_failures,
@@ -1020,7 +1183,7 @@ pub fn apply_placements(
 
     if let Some(window_id) = protected_foreground_window {
         match config.hide_strategy {
-            HideStrategy::Cloak => {
+            HideStrategy::Cloak if needs_uncloak(window_id) => {
                 if let Err(e) = uncloak_window(window_id) {
                     record_apply_side_effect_failure(
                         &mut side_effect_failures,
@@ -1031,6 +1194,7 @@ pub fn apply_placements(
                     );
                 }
             }
+            HideStrategy::Cloak => {}
             HideStrategy::MoveOffScreen => {
                 if let Err(e) = restore_windows_moved_offscreen(&[window_id]) {
                     record_apply_side_effect_failure(
@@ -1045,60 +1209,50 @@ pub fn apply_placements(
         }
     }
 
-    // Hide off-screen windows based on strategy
-    match config.hide_strategy {
-        HideStrategy::Cloak => {
-            for placement in &offscreen {
-                if protected_foreground_window == Some(placement.window_id) {
-                    tracing::warn!(
-                        "Skipping cloak for foreground window {} because focus handoff was not confirmed",
-                        placement.window_id
-                    );
+    // Hide off-screen windows. Cloak when the strategy allows it; when DWM
+    // rejects the cloak, move the window off-screen instead so one foreign
+    // window cannot fail the whole pass.
+    for placement in &offscreen {
+        if protected_foreground_window == Some(placement.window_id) {
+            tracing::warn!(
+                "Skipping hide for foreground window {} because focus handoff was not confirmed",
+                placement.window_id
+            );
+            continue;
+        }
+        if config.hide_strategy == HideStrategy::Cloak && !cloak_access_denied() {
+            match cloak_window(placement.window_id) {
+                Ok(()) => {
+                    cloaked_window_ids.push(placement.window_id);
                     continue;
                 }
-                if let Err(e) = cloak_window(placement.window_id) {
-                    record_apply_side_effect_failure(
-                        &mut side_effect_failures,
-                        &mut benign_side_effect_races,
-                        "cloak",
-                        placement.window_id,
-                        e,
-                    );
-                } else {
-                    cloaked_window_ids.push(placement.window_id);
+                Err(e) if is_benign_window_race_error(&e) => {
+                    benign_side_effect_races += 1;
+                    continue;
                 }
+                Err(e) => tracing::debug!(
+                    "Cloak failed for window {}: {}; moving it off-screen instead",
+                    placement.window_id,
+                    e
+                ),
             }
         }
-        HideStrategy::MoveOffScreen => {
-            // Move windows far off-screen (don't cloak them)
-            // They remain in Alt-Tab but aren't visible
-            for placement in &offscreen {
-                if protected_foreground_window == Some(placement.window_id) {
-                    tracing::warn!(
-                        "Skipping MoveOffScreen for foreground window {} because focus handoff was not confirmed",
-                        placement.window_id
-                    );
-                    continue;
-                }
-                // Move to far off-screen position
-                let offscreen_placement = WindowPlacement {
-                    window_id: placement.window_id,
-                    rect: move_offscreen_rect_for(&placement.rect),
-                    visibility: Visibility::OffScreenLeft,
-                    column_index: placement.column_index,
-                };
-                if let Err(e) = set_window_pos_immediate(&offscreen_placement) {
-                    record_apply_side_effect_failure(
-                        &mut side_effect_failures,
-                        &mut benign_side_effect_races,
-                        "move off-screen",
-                        placement.window_id,
-                        e,
-                    );
-                } else {
-                    moved_offscreen_window_ids.push(placement.window_id);
-                }
-            }
+        let offscreen_placement = WindowPlacement {
+            window_id: placement.window_id,
+            rect: move_offscreen_rect_for(&placement.rect),
+            visibility: Visibility::OffScreenLeft,
+            column_index: placement.column_index,
+        };
+        if let Err(e) = set_window_pos_immediate(&offscreen_placement) {
+            record_apply_side_effect_failure(
+                &mut side_effect_failures,
+                &mut benign_side_effect_races,
+                "move off-screen",
+                placement.window_id,
+                e,
+            );
+        } else {
+            moved_offscreen_window_ids.push(placement.window_id);
         }
     }
 
@@ -1109,11 +1263,7 @@ pub fn apply_placements(
     );
 
     if !side_effect_failures.is_empty() {
-        rollback_apply_visibility_changes(
-            &cloaked_window_ids,
-            &moved_offscreen_window_ids,
-            &visible_window_ids,
-        );
+        rollback_apply_visibility_changes(&cloaked_window_ids, &moved_offscreen_window_ids);
         return Err(combine_operation_failures(
             "apply_placements completed with side-effect failures",
             side_effect_failures,
@@ -1345,16 +1495,22 @@ pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
             std::mem::size_of::<u32>() as u32,
         );
 
-        if result.is_err() {
+        if let Err(e) = result {
             if !IsWindow(Some(hwnd)).as_bool() {
                 return Err(Win32Error::WindowNotFound(window_id));
             }
+            if e.code() == E_ACCESSDENIED {
+                note_cloak_access_denied();
+            }
             return Err(Win32Error::CloakFailed(format!(
-                "DwmSetWindowAttribute(CLOAK=1) failed for {:?}",
-                hwnd
+                "DwmSetWindowAttribute(CLOAK=1) failed for {:?}: {} (HRESULT 0x{:08X})",
+                hwnd,
+                e,
+                e.code().0 as u32
             )));
         }
     }
+    track_daemon_cloak(window_id, true);
     Ok(())
 }
 
@@ -1376,16 +1532,20 @@ pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
             std::mem::size_of::<u32>() as u32,
         );
 
-        if result.is_err() {
+        if let Err(e) = result {
             if !IsWindow(Some(hwnd)).as_bool() {
+                track_daemon_cloak(window_id, false);
                 return Err(Win32Error::WindowNotFound(window_id));
             }
             return Err(Win32Error::CloakFailed(format!(
-                "DwmSetWindowAttribute(CLOAK=0) failed for {:?}",
-                hwnd
+                "DwmSetWindowAttribute(CLOAK=0) failed for {:?}: {} (HRESULT 0x{:08X})",
+                hwnd,
+                e,
+                e.code().0 as u32
             )));
         }
     }
+    track_daemon_cloak(window_id, false);
     Ok(())
 }
 
@@ -1795,8 +1955,9 @@ pub enum WindowEvent {
 
 /// Global sender for window events from WinEvent callbacks.
 ///
-/// This uses a thread-safe channel because WinEvent callbacks run on Windows'
-/// internal thread pool and we need to forward events to the async runtime.
+/// Out-of-context WinEvent callbacks run on the thread that installed the hooks,
+/// during its message loop (see [`spawn_event_hook_thread`]). The channel
+/// forwards events from that thread to the async runtime.
 static EVENT_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
     std::sync::Mutex::new(None);
 
@@ -1907,7 +2068,7 @@ pub fn install_event_hooks() -> Result<(EventHookHandle, mpsc::Receiver<WindowEv
 
 /// Callback function for WinEvent hooks.
 ///
-/// This runs on Windows' thread pool, so we forward events to the channel.
+/// Runs on the hook thread's message loop; events are forwarded to the channel.
 /// Wrapped with catch_unwind to prevent panics from crashing the application.
 unsafe extern "system" fn win_event_callback(
     hook: HWINEVENTHOOK,
@@ -1942,12 +2103,12 @@ fn win_event_callback_inner(
     event: u32,
     hwnd: HWND,
     id_object: i32,
-    _id_child: i32,
+    id_child: i32,
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    // Only handle window-level events (not child objects like menus)
-    if id_object != OBJID_WINDOW {
+    // Only handle events about the window itself (not child objects like menus)
+    if id_object != OBJID_WINDOW || id_child != CHILDID_SELF {
         return;
     }
 
@@ -1956,8 +2117,16 @@ fn win_event_callback_inner(
         return;
     }
 
-    // Normalize to top-level window in case we got a child HWND.
-    let hwnd = normalize_to_root_window(hwnd);
+    let hwnd = match event_target_policy(event) {
+        EventTargetPolicy::NormalizeToRoot => normalize_to_root_window(hwnd),
+        EventTargetPolicy::TopLevelOnly => {
+            if normalize_to_root_window(hwnd) != hwnd {
+                return;
+            }
+            hwnd
+        }
+        EventTargetPolicy::Exact => hwnd,
+    };
 
     if should_filter_window_event_by_manageability(event)
         && !should_emit_window_event_for(event, hwnd)
@@ -1982,6 +2151,186 @@ fn win_event_callback_inner(
     if let Some(sender) = clone_event_sender() {
         let _ = sender.send(window_event);
     }
+}
+
+// ============================================================================
+// Message-Loop Threads
+// ============================================================================
+
+/// Thread message that asks a message-loop thread to run its wake handler.
+const WM_OPENNIRI_WAKE: u32 = WM_APP + 0x51;
+/// Thread message that asks a message-loop thread to exit.
+const WM_OPENNIRI_QUIT: u32 = WM_APP + 0x52;
+
+/// A dedicated thread that owns thread-affine Win32 resources and pumps messages.
+///
+/// WinEvent hooks (`WINEVENT_OUTOFCONTEXT`), low-level mouse hooks and tray icons
+/// deliver their callbacks through the message queue of the thread that created
+/// them. Created on a thread that never calls `GetMessageW` (such as the tokio
+/// main thread), every callback waits: the mouse lags, window events arrive late
+/// or not at all, and Windows silently removes low-level hooks that time out.
+///
+/// The resources are created and dropped on this thread. Dropping the handle
+/// stops the loop and waits briefly for the thread to exit.
+pub struct MessageLoopThread {
+    name: String,
+    thread_id: u32,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MessageLoopThread {
+    /// Ask the thread to run its wake handler. Returns false if the post failed.
+    pub fn wake(&self) -> bool {
+        unsafe { PostThreadMessageW(self.thread_id, WM_OPENNIRI_WAKE, WPARAM(0), LPARAM(0)) }
+            .is_ok()
+    }
+
+    /// Stop the message loop and wait up to `timeout` for the thread to exit.
+    ///
+    /// Returns false if the thread did not exit in time; it is then left detached.
+    pub fn shutdown(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        let _ =
+            unsafe { PostThreadMessageW(self.thread_id, WM_OPENNIRI_QUIT, WPARAM(0), LPARAM(0)) };
+        let deadline = std::time::Instant::now() + timeout;
+        while !thread.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "{} thread did not exit within {:?}; detaching it",
+                    self.name,
+                    timeout
+                );
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = thread.join();
+        true
+    }
+}
+
+impl Drop for MessageLoopThread {
+    fn drop(&mut self) {
+        self.shutdown(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Spawn a thread that runs `init`, then pumps messages until shut down.
+///
+/// `init` runs on the new thread and returns thread-local state `S` (kept and
+/// dropped on that thread, so it need not be `Send`) plus a payload `T` handed
+/// back to the caller. `on_wake` runs on the thread after each
+/// [`MessageLoopThread::wake`].
+pub fn spawn_message_loop_thread<S, T, I, W>(
+    name: &str,
+    init: I,
+    mut on_wake: W,
+) -> Result<(MessageLoopThread, T), Win32Error>
+where
+    S: 'static,
+    T: Send + 'static,
+    I: FnOnce() -> Result<(S, T), Win32Error> + Send + 'static,
+    W: FnMut(&mut S) + Send + 'static,
+{
+    let (init_tx, init_rx) = mpsc::channel::<Result<(u32, T), Win32Error>>();
+    let thread = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let thread_id = unsafe { GetCurrentThreadId() };
+            let mut msg = MSG::default();
+            // Create this thread's message queue before reporting the thread id,
+            // so messages posted by other threads cannot be lost.
+            let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
+
+            let mut state = match init() {
+                Ok((state, payload)) => {
+                    if init_tx.send(Ok((thread_id, payload))).is_err() {
+                        return;
+                    }
+                    state
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            loop {
+                let result = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+                if result <= 0 {
+                    break;
+                }
+                if msg.hwnd.is_invalid() {
+                    match msg.message {
+                        WM_OPENNIRI_QUIT => break,
+                        WM_OPENNIRI_WAKE => {
+                            on_wake(&mut state);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            drop(state);
+        })
+        .map_err(|e| {
+            Win32Error::HookInstallFailed(format!("Failed to spawn {} thread: {}", name, e))
+        })?;
+
+    match init_rx.recv() {
+        Ok(Ok((thread_id, payload))) => Ok((
+            MessageLoopThread {
+                name: name.to_string(),
+                thread_id,
+                thread: Some(thread),
+            },
+            payload,
+        )),
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(Win32Error::HookInstallFailed(format!(
+                "{} thread exited during initialization",
+                name
+            )))
+        }
+    }
+}
+
+/// Install WinEvent hooks on a dedicated message-loop thread.
+///
+/// Prefer this over [`install_event_hooks`] in long-running code: the hooks only
+/// deliver events while their thread pumps messages.
+pub fn spawn_event_hook_thread(
+) -> Result<(MessageLoopThread, mpsc::Receiver<WindowEvent>), Win32Error> {
+    spawn_message_loop_thread("openniri-winevent-hooks", install_event_hooks, |_| {})
+}
+
+/// Install the focus-follows-mouse hook on a dedicated message-loop thread.
+pub fn spawn_mouse_hook_thread(
+    sender: mpsc::Sender<WindowEvent>,
+) -> Result<MessageLoopThread, Win32Error> {
+    spawn_message_loop_thread(
+        "openniri-mouse-hook",
+        move || install_mouse_hook(sender).map(|handle| (handle, ())),
+        |_| {},
+    )
+    .map(|(thread, ())| thread)
+}
+
+/// Install the gesture hook on a dedicated message-loop thread.
+pub fn spawn_gesture_thread(
+) -> Result<(MessageLoopThread, mpsc::Receiver<GestureEvent>), Win32Error> {
+    spawn_message_loop_thread("openniri-gesture-hook", register_gestures, |_| {})
 }
 
 // ============================================================================
@@ -2141,6 +2490,11 @@ pub struct HotkeyHandle {
 
 impl HotkeyHandle {
     /// Returns the number of successfully registered hotkeys.
+    /// Whether the hotkey with this id was registered.
+    pub fn is_registered(&self, id: HotkeyId) -> bool {
+        self.registered_ids.contains(&id)
+    }
+
     pub fn registered_count(&self) -> usize {
         self.registered_ids.len()
     }
@@ -2336,24 +2690,27 @@ pub fn register_hotkeys(
     // Reconstruct HWND from raw pointer
     let hwnd = HWND(hwnd_raw as *mut c_void);
 
-    if !hotkeys.is_empty() && registered_ids.len() != hotkeys.len() {
-        tracing::warn!(
-            "Hotkey registration incomplete ({}/{}); aborting and unregistering all to avoid partial shortcut state",
-            registered_ids.len(),
-            hotkeys.len()
-        );
+    // Keep every hotkey that registered. Rejecting the whole set when one combo
+    // was taken (Win+L can never be registered) left users with no shortcuts at
+    // all, including the emergency panic key.
+    if !hotkeys.is_empty() && registered_ids.is_empty() {
         let _ = request_hotkey_thread_shutdown(hwnd, thread_id);
         if thread.is_finished() {
             let _ = thread.join();
         }
         clear_hotkey_globals();
         return Err(Win32Error::HotkeyRegistrationFailed(format!(
-            "Only {}/{} hotkeys were registered; refusing to run with partial global shortcuts",
-            registered_ids.len(),
+            "None of the {} hotkeys could be registered",
             hotkeys.len()
         )));
     }
-    if !hotkeys.is_empty() {
+    if registered_ids.len() != hotkeys.len() {
+        tracing::warn!(
+            "Registered {}/{} hotkeys; the others are already taken by Windows or another application",
+            registered_ids.len(),
+            hotkeys.len()
+        );
+    } else if !hotkeys.is_empty() {
         tracing::info!(
             "Registered {}/{} hotkeys",
             registered_ids.len(),
@@ -3408,6 +3765,112 @@ mod tests {
         let move_targets =
             collect_uncloak_targets(&visible_refs, &offscreen_refs, HideStrategy::MoveOffScreen);
         assert_eq!(move_targets, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_message_loop_thread_runs_wake_handler_and_drops_state_on_its_thread() {
+        struct State {
+            wakes: u32,
+            events: mpsc::Sender<String>,
+        }
+        impl Drop for State {
+            fn drop(&mut self) {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                let _ = self.events.send(format!("dropped on {}", name));
+            }
+        }
+
+        let (events_tx, events_rx) = mpsc::channel::<String>();
+        let (mut thread, payload) = spawn_message_loop_thread(
+            "openniri-test-loop",
+            move || {
+                Ok((
+                    State {
+                        wakes: 0,
+                        events: events_tx,
+                    },
+                    7u32,
+                ))
+            },
+            |state: &mut State| {
+                state.wakes += 1;
+                let _ = state.events.send(format!("wake {}", state.wakes));
+            },
+        )
+        .expect("message loop thread should start");
+        assert_eq!(payload, 7);
+
+        let timeout = std::time::Duration::from_secs(2);
+        assert!(thread.wake());
+        assert_eq!(events_rx.recv_timeout(timeout).unwrap(), "wake 1");
+        assert!(thread.wake());
+        assert_eq!(events_rx.recv_timeout(timeout).unwrap(), "wake 2");
+
+        assert!(thread.shutdown(timeout));
+        assert_eq!(
+            events_rx.recv_timeout(timeout).unwrap(),
+            "dropped on openniri-test-loop"
+        );
+    }
+
+    #[test]
+    fn test_message_loop_thread_reports_init_failure() {
+        let result = spawn_message_loop_thread::<(), (), _, _>(
+            "openniri-test-loop-fail",
+            || Err(Win32Error::HookInstallFailed("boom".to_string())),
+            |_| {},
+        );
+        assert!(matches!(result, Err(Win32Error::HookInstallFailed(m)) if m == "boom"));
+    }
+
+    #[test]
+    fn test_own_process_is_not_more_privileged_than_itself() {
+        assert!(own_integrity_rid().is_some());
+        assert!(!is_process_more_privileged(std::process::id()));
+    }
+
+    #[test]
+    fn test_event_target_policy_keeps_destroy_events_exact() {
+        assert_eq!(
+            event_target_policy(EVENT_OBJECT_DESTROY),
+            EventTargetPolicy::Exact
+        );
+        assert_eq!(
+            event_target_policy(EVENT_OBJECT_CREATE),
+            EventTargetPolicy::TopLevelOnly
+        );
+        assert_eq!(
+            event_target_policy(EVENT_OBJECT_LOCATIONCHANGE),
+            EventTargetPolicy::TopLevelOnly
+        );
+        assert_eq!(
+            event_target_policy(EVENT_SYSTEM_FOREGROUND),
+            EventTargetPolicy::NormalizeToRoot
+        );
+        assert_eq!(
+            event_target_policy(EVENT_OBJECT_FOCUS),
+            EventTargetPolicy::NormalizeToRoot
+        );
+    }
+
+    #[test]
+    fn test_filter_uncloak_targets_skips_windows_that_are_not_cloaked() {
+        let targets = vec![1, 2, 3];
+        assert_eq!(
+            filter_uncloak_targets(targets.clone(), |id| id == 2),
+            vec![2]
+        );
+        assert!(filter_uncloak_targets(targets, |_| false).is_empty());
+    }
+
+    #[test]
+    fn test_daemon_cloak_tracking_round_trip() {
+        let window_id: WindowId = 0xDEAD_0001;
+        assert!(!is_daemon_cloaked(window_id));
+        track_daemon_cloak(window_id, true);
+        assert!(is_daemon_cloaked(window_id));
+        track_daemon_cloak(window_id, false);
+        assert!(!is_daemon_cloaked(window_id));
     }
 
     #[test]

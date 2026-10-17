@@ -1,5 +1,26 @@
 # OpenNiri-Windows Development Iteration Log
 
+## Lockout root-cause iteration — 2026-10-17
+
+- Scope: fix the code-level causes of INC-49 and GitHub issue #12 found in a whole-repo review (`INC-49-6`).
+- Root causes:
+  - WinEvent and low-level mouse hooks were installed on the tokio main thread, which never pumps messages. Callbacks waited for hook timeouts (cursor lag), events arrived late, and Windows removed the mouse hooks. The tray icon had the same problem.
+  - `apply_placements` uncloaked every visible window even with `use_cloaking = false`. DWM rejects `DWMWA_CLOAK` on other processes' windows, so every pass, including each animation frame, failed.
+  - Each failed pass ran a rollback that called `SetForegroundWindow`, so focus was forced back about 60 times a second.
+  - Child-window destroy events were normalized to their still-open top-level window, which was then dropped from management.
+  - Windows of elevated processes were managed although UIPI blocks moving them.
+  - Hotkey registration was all-or-nothing and the default `Win+L` can never be registered, so a default install had no hotkeys, including the panic key.
+- Changes:
+  - `spawn_message_loop_thread` / `MessageLoopThread` in the platform crate; hooks and tray run on their own message-loop threads.
+  - Uncloak only for windows the daemon cloaked or DWM reports app-cloaked. On `E_ACCESSDENIED` the daemon stops trying to cloak and moves windows off-screen instead.
+  - Rollback no longer changes the foreground window. Five consecutive apply failures pause tiling, cancel animations and run a visibility recovery pass.
+  - Destroy events keep their exact HWND; create/move events for child windows are ignored.
+  - Windows of more privileged processes are skipped with a log line.
+  - Partial hotkey registration with per-key warnings; Alt-based defaults (GlazeWM convention); `Win+Ctrl+Escape` panic key unchanged.
+  - Gestures off by default: they are detected from wheel deltas, so ordinary scrolling triggered them.
+- Validation: workspace tests, ignored tests, clippy `--all-targets -D warnings` and fmt passed locally. No daemon launch or host desktop run.
+- INC-49 remains open until a host run on this build passes. No tag or release.
+
 ## Portfolio delivery iteration — 2026-09-22
 
 - Scope: close missing post-merge `main` CI; add manual validation, immutable action pins, least-privilege checkout and locked Cargo commands.

@@ -64,7 +64,7 @@ Controls visual features like window cloaking, batched positioning, and active b
 
 | Field | Type | Default | Valid Values | Description |
 |-------|------|---------|--------------|-------------|
-| `use_cloaking` | boolean | `true` | `true`, `false` | When enabled, windows scrolled off-screen are hidden using the DWM cloaking API instead of being moved to extreme coordinates. This prevents taskbar thumbnails from showing off-screen content. |
+| `use_cloaking` | boolean | `true` | `true`, `false` | When enabled, windows scrolled off-screen are hidden using the DWM cloaking API instead of being moved to extreme coordinates. If DWM denies cloaking for a window (E_ACCESSDENIED, common for other apps' windows), OpenNiri falls back to moving that window off-screen. This prevents taskbar thumbnails from showing off-screen content. |
 | `use_deferred_positioning` | boolean | `true` | `true`, `false` | When enabled, multiple window move/resize operations are batched into a single `DeferWindowPos` call. This reduces flicker during layout updates. |
 | `active_border` | boolean | `true` | `true`, `false` | When enabled, the focused window's border color is set via the DWM border color API (Windows 11 and later). |
 | `active_border_color` | string | `"4285F4"` | 6-character hex RGB string | The color applied to the focused window's border when `active_border` is enabled. Format is hex RGB without a leading `#` (e.g., `"4285F4"` for Google Blue, `"FF0000"` for red). |
@@ -114,54 +114,56 @@ Supported modifiers: `Win`, `Ctrl`, `Alt`, `Shift`. These can be combined in any
 
 | Hotkey | Command | Description |
 |--------|---------|-------------|
-| `Win+H` | `focus_left` | Focus the column to the left |
-| `Win+L` | `focus_right` | Focus the column to the right |
-| `Win+J` | `focus_down` | Focus the window below (in stacked columns) |
-| `Win+K` | `focus_up` | Focus the window above (in stacked columns) |
-| `Win+Shift+H` | `move_column_left` | Move the focused column one position left |
-| `Win+Shift+L` | `move_column_right` | Move the focused column one position right |
-| `Win+Ctrl+H` | `resize_shrink` | Shrink the focused column by 50px |
-| `Win+Ctrl+L` | `resize_grow` | Grow the focused column by 50px |
+| `Alt+H` | `focus_left` | Focus the column to the left |
+| `Alt+L` | `focus_right` | Focus the column to the right |
+| `Alt+J` | `focus_down` | Focus the window below (in stacked columns) |
+| `Alt+K` | `focus_up` | Focus the window above (in stacked columns) |
+| `Alt+Shift+H` | `move_column_left` | Move the focused column one position left |
+| `Alt+Shift+L` | `move_column_right` | Move the focused column one position right |
+| `Alt+Ctrl+H` | `resize_shrink` | Shrink the focused column by 50px |
+| `Alt+Ctrl+L` | `resize_grow` | Grow the focused column by 50px |
 | `Win+Ctrl+Escape` | `panic_revert` | Emergency visibility restore and daemon shutdown |
 | `Win+Alt+H` | `focus_monitor_left` | Focus the monitor to the left |
 | `Win+Alt+L` | `focus_monitor_right` | Focus the monitor to the right |
 | `Win+Alt+Shift+H` | `move_to_monitor_left` | Move the focused window to the left monitor |
 | `Win+Alt+Shift+L` | `move_to_monitor_right` | Move the focused window to the right monitor |
-| `Win+R` | `refresh` | Re-enumerate windows and add new ones |
-| `Win+Shift+Q` | `close_window` | Close the focused window |
-| `Win+F` | `toggle_floating` | Toggle the focused window between tiled and floating |
-| `Win+Shift+F` | `toggle_fullscreen` | Toggle fullscreen for the focused window |
-| `Win+1` | `width_third` | Set focused column width to 1/3 of viewport |
-| `Win+2` | `width_half` | Set focused column width to 1/2 of viewport |
-| `Win+3` | `width_two_thirds` | Set focused column width to 2/3 of viewport |
-| `Win+0` | `equalize_widths` | Make all columns equal width |
+| `Alt+Shift+R` | `refresh` | Re-enumerate windows and add new ones |
+| `Alt+Shift+Q` | `close_window` | Close the focused window |
+| `Alt+F` | `toggle_floating` | Toggle the focused window between tiled and floating |
+| `Alt+Shift+F` | `toggle_fullscreen` | Toggle fullscreen for the focused window |
+| `Alt+1` | `width_third` | Set focused column width to 1/3 of viewport |
+| `Alt+2` | `width_half` | Set focused column width to 1/2 of viewport |
+| `Alt+3` | `width_two_thirds` | Set focused column width to 2/3 of viewport |
+| `Alt+0` | `equalize_widths` | Make all columns equal width |
 
 When you define a `[hotkeys]` section, it completely replaces the defaults. You must
 include every binding you want to keep.
 
+Most `Win+letter` combinations are reserved by Windows 11 (`Win+L` can never be registered), so the defaults use `Alt`, like GlazeWM. Existing config files keep whatever bindings they contain. Hotkey registration is not all-or-nothing: hotkeys that register are kept, each one that cannot be registered (taken by Windows or another app) is logged by name, and the tray tooltip shows the registered/requested mismatch. If the emergency `panic_revert` hotkey cannot be registered, a warning says to use `openniri-cli panic-revert` or the tray menu instead.
+
 ```toml
 [hotkeys]
-"Win+H" = "focus_left"
-"Win+L" = "focus_right"
-"Win+J" = "focus_down"
-"Win+K" = "focus_up"
-"Win+Shift+H" = "move_column_left"
-"Win+Shift+L" = "move_column_right"
-"Win+Ctrl+H" = "resize_shrink"
-"Win+Ctrl+L" = "resize_grow"
+"Alt+H" = "focus_left"
+"Alt+L" = "focus_right"
+"Alt+J" = "focus_down"
+"Alt+K" = "focus_up"
+"Alt+Shift+H" = "move_column_left"
+"Alt+Shift+L" = "move_column_right"
+"Alt+Ctrl+H" = "resize_shrink"
+"Alt+Ctrl+L" = "resize_grow"
 "Win+Ctrl+Escape" = "panic_revert"
 "Win+Alt+H" = "focus_monitor_left"
 "Win+Alt+L" = "focus_monitor_right"
 "Win+Alt+Shift+H" = "move_to_monitor_left"
 "Win+Alt+Shift+L" = "move_to_monitor_right"
-"Win+R" = "refresh"
-"Win+Shift+Q" = "close_window"
-"Win+F" = "toggle_floating"
-"Win+Shift+F" = "toggle_fullscreen"
-"Win+1" = "width_third"
-"Win+2" = "width_half"
-"Win+3" = "width_two_thirds"
-"Win+0" = "equalize_widths"
+"Alt+Shift+R" = "refresh"
+"Alt+Shift+Q" = "close_window"
+"Alt+F" = "toggle_floating"
+"Alt+Shift+F" = "toggle_fullscreen"
+"Alt+1" = "width_third"
+"Alt+2" = "width_half"
+"Alt+3" = "width_two_thirds"
+"Alt+0" = "equalize_widths"
 ```
 
 ---
@@ -170,9 +172,11 @@ include every binding you want to keep.
 
 Maps three-finger touchpad swipe gestures to commands.
 
+**Experimental, off by default.** Swipes are detected by accumulating mouse-wheel deltas, so ordinary scrolling can trigger them.
+
 | Field | Type | Default | Valid Values | Description |
 |-------|------|---------|--------------|-------------|
-| `enabled` | boolean | `true` | `true`, `false` | Master toggle for gesture support. When disabled, all touchpad gestures are ignored. |
+| `enabled` | boolean | `false` | `true`, `false` | Master toggle for gesture support (experimental). When disabled, all touchpad gestures are ignored. |
 | `swipe_left` | string | `"focus_left"` | Any valid command name | Command executed on three-finger swipe left. |
 | `swipe_right` | string | `"focus_right"` | Any valid command name | Command executed on three-finger swipe right. |
 | `swipe_up` | string | `"focus_up"` | Any valid command name | Command executed on three-finger swipe up. |
@@ -180,7 +184,7 @@ Maps three-finger touchpad swipe gestures to commands.
 
 ```toml
 [gestures]
-enabled = true
+enabled = false
 swipe_left = "focus_left"
 swipe_right = "focus_right"
 swipe_up = "focus_up"
@@ -327,14 +331,14 @@ Replace the default vim-style bindings with arrow-key navigation:
 #"Win+Ctrl+P" = "toggle_pause"
 "Win+Alt+Left" = "focus_monitor_left"
 "Win+Alt+Right" = "focus_monitor_right"
-"Win+Shift+Q" = "close_window"
-"Win+F" = "toggle_floating"
-"Win+Shift+F" = "toggle_fullscreen"
-"Win+R" = "refresh"
-"Win+1" = "width_third"
-"Win+2" = "width_half"
-"Win+3" = "width_two_thirds"
-"Win+0" = "equalize_widths"
+"Alt+Shift+Q" = "close_window"
+"Alt+F" = "toggle_floating"
+"Alt+Shift+F" = "toggle_fullscreen"
+"Alt+Shift+R" = "refresh"
+"Alt+1" = "width_third"
+"Alt+2" = "width_half"
+"Alt+3" = "width_two_thirds"
+"Alt+0" = "equalize_widths"
 ```
 
 ### 3. Window rules for floating specific apps
@@ -414,30 +418,30 @@ focus_follows_mouse = false
 focus_follows_mouse_delay_ms = 100
 
 [hotkeys]
-"Win+H" = "focus_left"
-"Win+L" = "focus_right"
-"Win+J" = "focus_down"
-"Win+K" = "focus_up"
-"Win+Shift+H" = "move_column_left"
-"Win+Shift+L" = "move_column_right"
-"Win+Ctrl+H" = "resize_shrink"
-"Win+Ctrl+L" = "resize_grow"
+"Alt+H" = "focus_left"
+"Alt+L" = "focus_right"
+"Alt+J" = "focus_down"
+"Alt+K" = "focus_up"
+"Alt+Shift+H" = "move_column_left"
+"Alt+Shift+L" = "move_column_right"
+"Alt+Ctrl+H" = "resize_shrink"
+"Alt+Ctrl+L" = "resize_grow"
 "Win+Ctrl+Escape" = "panic_revert"
 "Win+Alt+H" = "focus_monitor_left"
 "Win+Alt+L" = "focus_monitor_right"
 "Win+Alt+Shift+H" = "move_to_monitor_left"
 "Win+Alt+Shift+L" = "move_to_monitor_right"
-"Win+R" = "refresh"
-"Win+Shift+Q" = "close_window"
-"Win+F" = "toggle_floating"
-"Win+Shift+F" = "toggle_fullscreen"
-"Win+1" = "width_third"
-"Win+2" = "width_half"
-"Win+3" = "width_two_thirds"
-"Win+0" = "equalize_widths"
+"Alt+Shift+R" = "refresh"
+"Alt+Shift+Q" = "close_window"
+"Alt+F" = "toggle_floating"
+"Alt+Shift+F" = "toggle_fullscreen"
+"Alt+1" = "width_third"
+"Alt+2" = "width_half"
+"Alt+3" = "width_two_thirds"
+"Alt+0" = "equalize_widths"
 
 [gestures]
-enabled = true
+enabled = false
 swipe_left = "focus_left"
 swipe_right = "focus_right"
 swipe_up = "focus_up"

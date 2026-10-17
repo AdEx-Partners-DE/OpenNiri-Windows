@@ -147,21 +147,23 @@ This writes a fully commented default `config.toml` to the standard location. Us
 
 ### Hotkeys don't work
 
-1. **Check for conflicts.** Other applications (PowerToys, AutoHotkey, display drivers, etc.) may have registered the same key combinations. The default bindings use `Win+H/J/K/L` and several `Win+Shift` / `Win+Ctrl` chords. Try temporarily disabling other hotkey tools to isolate the conflict.
+1. **Check for conflicts.** Other applications (PowerToys, AutoHotkey, display drivers, etc.) may have registered the same key combinations. The default bindings use `Alt+H/J/K/L`, other `Alt` chords, and `Win+Alt` chords for monitor navigation. Most `Win+letter` combinations are reserved by Windows 11 (`Win+L` can never be registered), which is why the defaults use `Alt`. Try temporarily disabling other hotkey tools to isolate the conflict.
 
 2. **Verify config syntax.** Open your `config.toml` and confirm the `[hotkeys]` section uses the correct format:
 
    ```toml
    [hotkeys]
-   "Win+H" = "focus_left"
-   "Win+Shift+Q" = "close_window"
+   "Alt+H" = "focus_left"
+   "Alt+Shift+Q" = "close_window"
    ```
 
    Key names are case-insensitive. Valid modifiers are `Win`, `Ctrl`, `Alt`, and `Shift`. They are joined with `+`.
 
 3. **Check the log.** Set `log_level = "debug"` and look for lines about hotkey registration failures at startup.
 
-4. **Reload after editing.** Config changes are not picked up automatically. Run `openniri-cli reload` or use the tray menu "Reload Config" entry.
+4. **Partial registration is expected.** Hotkey registration is not all-or-nothing: hotkeys that register are kept, and each one that cannot be registered (taken by Windows or another app) is logged by name. The tray tooltip shows the registered/requested mismatch. If the emergency panic hotkey cannot be registered, a warning says to use `openniri-cli panic-revert` or the tray menu instead.
+
+5. **Reload after editing.** Config changes are not picked up automatically. Run `openniri-cli reload` or use the tray menu "Reload Config" entry.
 
 ### Windows aren't being tiled
 
@@ -173,9 +175,17 @@ This writes a fully commented default `config.toml` to the standard location. Us
 
 2. **Check window rules.** If you have `[[window_rules]]` entries in your config, a rule with `action = "float"` or `action = "ignore"` may be matching the window. Temporarily remove your window rules and reload to test.
 
-3. **Check for elevated windows.** Windows launched as Administrator (e.g. Task Manager, an elevated terminal) cannot be managed by a non-elevated OpenNiri process. See the "Known Limitations" section below for details.
+3. **Check for elevated windows.** Windows of processes running with higher privileges than OpenNiri (e.g. an administrator terminal while OpenNiri runs unelevated) are not tiled; the log says `Not managing window ...`. See the "Known Limitations" section below for details.
 
 4. **Verify the window is not minimized.** Minimized windows remain tracked but are excluded from placement calculations until they are restored.
+
+### Tiling paused itself after layout errors
+
+If applying the layout fails 5 times in a row, OpenNiri pauses tiling on its own, stops animations and restores window visibility. Check the log for the layout errors, fix the cause, then resume with `openniri-cli toggle-pause` (or tray **Resume Tiling**).
+
+### Repeated `DwmSetWindowAttribute(CLOAK=0) failed` messages
+
+With cloaking enabled, if DWM denies cloaking (E_ACCESSDENIED, common for other apps' windows), OpenNiri falls back to moving those windows off-screen instead of failing. It also no longer calls uncloak on windows that are not cloaked, which removes the repeated `DwmSetWindowAttribute(CLOAK=0) failed` log spam. If you still see it, update to the current build.
 
 ### Second daemon won't start
 
@@ -292,7 +302,7 @@ Binaries published on GitHub Releases are built by GitHub Actions CI in a clean 
 
 ## 7. Known Limitations
 
-- **Elevated (admin) windows.** OpenNiri cannot reposition or tile windows that belong to processes running with administrator privileges unless the daemon itself is also running elevated. This is a Windows security boundary. To manage elevated windows, launch `openniri.exe` from an Administrator terminal or shortcut.
+- **Elevated (admin) windows.** OpenNiri cannot reposition or tile windows that belong to processes running with higher privileges than the daemon (e.g. an administrator terminal while OpenNiri runs unelevated); such windows are left alone and the log says `Not managing window ...`. This is a Windows security boundary. To manage elevated windows, launch `openniri.exe` from an Administrator terminal or shortcut.
 
 - **Virtual desktop integration.** Windows virtual desktops (Win+Ctrl+D) are not currently supported. OpenNiri manages windows on the active desktop only. Switching desktops may cause unexpected layout behavior.
 
@@ -317,9 +327,10 @@ OpenNiri is designed to degrade gracefully. Here's what happens when operations 
 | Situation | What happens | Log message |
 |-----------|-------------|-------------|
 | `SetWindowPos` fails | Warning logged, window stays at previous position | `"Failed to apply layout..."` |
-| DWM cloak fails | Warning logged, window stays visible | `"Failed to cloak/uncloak..."` |
-| Access denied (elevated window) | Window is skipped during enumeration | `"Ignoring window..."` |
-| Hotkey registration fails | Warning logged, hotkey count reflects partial | `"Failed to register hotkey..."` |
+| DWM denies cloaking (E_ACCESSDENIED) | Window is moved off-screen instead; uncloak is skipped for windows that are not cloaked | `"Failed to cloak/uncloak..."` |
+| Access denied (elevated window) | Window is not tiled | `"Not managing window..."` |
+| Layout application fails 5 times in a row | Tiling pauses itself, animations stop, window visibility is restored; resume with `openniri-cli toggle-pause` | `"Failed to apply layout..."` |
+| Hotkey registration fails | Registered hotkeys are kept; each failure is logged by name and the tray tooltip shows registered/requested | `"Failed to register hotkey..."` |
 | Config file invalid TOML | Previous config retained, error logged | `"Failed to load configuration..."` |
 | Config value out of range | Value clamped to valid range, warning logged | `"Config: ... clamped to ..."` |
 | Monitor disconnected | Windows migrate to primary, workspace removed | `"Monitor removed..."` |
