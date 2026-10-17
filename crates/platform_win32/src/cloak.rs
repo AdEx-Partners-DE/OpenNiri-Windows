@@ -8,10 +8,13 @@ use crate::offscreen::{
     restore_windows_moved_offscreen,
 };
 use crate::placement::HideStrategy;
-use crate::shell_cloak;
-use crate::window::{enumerate_windows, window_id_to_hwnd};
+use crate::shell_cloak::{self, ShellCloakError};
+use crate::window::{
+    enumerate_windows, is_window_cloaked, window_id_to_hwnd, window_process_identity,
+    ProcessIdentity,
+};
 use openniri_core_layout::{WindowId, WindowPlacement};
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::BOOL;
@@ -21,13 +24,26 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, IsWindow};
 
-/// Windows this process has successfully cloaked and not yet uncloaked.
+/// Windows this process has cloaked (or asked the shell to cloak) and not yet
+/// uncloaked, with the identity of their owning process.
 ///
 /// Uncloak is only attempted for windows in this set or windows DWM reports as
 /// app-cloaked. Calling `DWMWA_CLOAK` on a window that was never cloaked fails
 /// for most foreign windows, and those failures used to fail every layout pass.
-static DAEMON_CLOAKED_WINDOWS: std::sync::Mutex<Option<HashSet<WindowId>>> =
-    std::sync::Mutex::new(None);
+struct CloakTracking {
+    windows: BTreeMap<WindowId, Option<ProcessIdentity>>,
+    /// The journal file does not reflect `windows` yet.
+    dirty: bool,
+}
+
+static TRACKING: std::sync::Mutex<CloakTracking> = std::sync::Mutex::new(CloakTracking {
+    windows: BTreeMap::new(),
+    dirty: false,
+});
+
+fn tracking() -> std::sync::MutexGuard<'static, CloakTracking> {
+    TRACKING.lock().unwrap_or_else(recover_poisoned_mutex)
+}
 
 /// Set once DWM rejects a cloak request with `E_ACCESSDENIED`.
 ///
@@ -38,19 +54,30 @@ static CLOAK_ACCESS_DENIED: AtomicBool = AtomicBool::new(false);
 /// `DWM_CLOAKED_APP`: the window was cloaked by an application.
 const DWM_CLOAKED_APP_FLAG: u32 = 0x1;
 
-pub(crate) fn track_daemon_cloak(window_id: WindowId, cloaked: bool) {
-    let mut guard = DAEMON_CLOAKED_WINDOWS
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex);
-    let set = guard.get_or_insert_with(HashSet::new);
-    let changed = if cloaked {
-        set.insert(window_id)
-    } else {
-        set.remove(&window_id)
-    };
-    if changed {
-        write_cloak_journal(set);
+/// Record that this process cloaked a window. Returns true if it was not tracked.
+///
+/// Only marks the journal dirty; [`flush_cloak_journal`] writes it.
+pub(crate) fn track_daemon_cloak(window_id: WindowId, owner: Option<ProcessIdentity>) -> bool {
+    let mut tracking = tracking();
+    if tracking.windows.contains_key(&window_id) {
+        return false;
     }
+    tracking.windows.insert(window_id, owner);
+    tracking.dirty = true;
+    true
+}
+
+/// Forget a window (uncloaked or destroyed). Only marks the journal dirty, so
+/// this is cheap enough for hook callbacks; a stale journal entry is harmless.
+pub(crate) fn untrack_daemon_cloak(window_id: WindowId) {
+    let mut tracking = tracking();
+    if tracking.windows.remove(&window_id).is_some() {
+        tracking.dirty = true;
+    }
+}
+
+fn is_daemon_cloaked(window_id: WindowId) -> bool {
+    tracking().windows.contains_key(&window_id)
 }
 
 // ----------------------------------------------------------------------------
@@ -62,9 +89,24 @@ pub(crate) fn track_daemon_cloak(window_id: WindowId, cloaked: bool) {
 // by their state. The daemon therefore records the windows it cloaked in a small
 // file that recovery (CLI `emergency-uncloak`, the panic hook, the next daemon
 // start) reads to uncloak exactly those windows.
+//
+// One line per window: `<hwnd> <pid> <process start time>`. Window handles are
+// reused, also across reboots, so recovery only acts on an entry whose window is
+// still owned by the recorded process. Lines with a bare `<hwnd>` (written by
+// older versions) carry no owner and are acted on as before.
+//
+// The file is written whole (temporary file plus rename) at batch boundaries:
+// before windows disappear (additions), and at the end of a layout pass or
+// recovery run (removals). Hook callbacks never write it.
+
+/// A journal line: a cloaked window and, when known, its owning process.
+type JournalEntry = (WindowId, Option<ProcessIdentity>);
 
 static CLOAK_JOURNAL_PATH_OVERRIDE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
+
+/// Serialises journal writers so an older snapshot never overwrites a newer one.
+static JOURNAL_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn cloak_journal_path() -> Option<std::path::PathBuf> {
     if let Some(path) = CLOAK_JOURNAL_PATH_OVERRIDE
@@ -81,91 +123,175 @@ fn cloak_journal_path() -> Option<std::path::PathBuf> {
     })
 }
 
-fn format_cloak_journal(window_ids: &HashSet<WindowId>) -> String {
-    let mut ids: Vec<WindowId> = window_ids.iter().copied().collect();
-    ids.sort_unstable();
-    ids.iter().map(|id| format!("{}\n", id)).collect()
-}
-
-fn parse_cloak_journal(text: &str) -> Vec<WindowId> {
-    text.lines()
-        .filter_map(|line| line.trim().parse::<WindowId>().ok())
-        .filter(|id| *id != 0)
+fn format_cloak_journal(entries: &[JournalEntry]) -> String {
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable_by_key(|(id, _)| *id);
+    sorted
+        .iter()
+        .map(|(id, owner)| match owner {
+            Some(owner) => format!("{} {} {}\n", id, owner.pid, owner.start_time),
+            None => format!("{}\n", id),
+        })
         .collect()
 }
 
-fn write_cloak_journal(window_ids: &HashSet<WindowId>) {
-    let Some(path) = cloak_journal_path() else {
-        return;
-    };
-    let result = if window_ids.is_empty() {
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+fn parse_cloak_journal(text: &str) -> Vec<JournalEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let id = fields
+                .next()?
+                .parse::<WindowId>()
+                .ok()
+                .filter(|id| *id != 0)?;
+            let owner = match fields.next() {
+                None => None,
+                Some(pid) => Some(ProcessIdentity {
+                    pid: pid.parse().ok()?,
+                    start_time: match fields.next() {
+                        Some(start) => start.parse().ok()?,
+                        None => 0,
+                    },
+                }),
+            };
+            Some((id, owner))
+        })
+        .collect()
+}
+
+/// Whether a journal entry still refers to the window it was written for.
+///
+/// `current` is the owner of the live window with that handle (`None` if there
+/// is no such window). Entries without an owner (old format) only need a live
+/// window. A start time of 0 means unknown and is not compared.
+fn journal_entry_matches(
+    recorded: Option<ProcessIdentity>,
+    current: Option<ProcessIdentity>,
+) -> bool {
+    match (recorded, current) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(recorded), Some(current)) => {
+            recorded.pid == current.pid
+                && (recorded.start_time == 0
+                    || current.start_time == 0
+                    || recorded.start_time == current.start_time)
         }
-    } else {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        std::fs::write(&path, format_cloak_journal(window_ids))
-    };
-    if let Err(e) = result {
-        tracing::warn!("Failed to update cloak journal {}: {}", path.display(), e);
     }
 }
 
-fn read_cloak_journal() -> Vec<WindowId> {
+fn write_cloak_journal(entries: &[JournalEntry]) -> std::io::Result<()> {
+    let Some(path) = cloak_journal_path() else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Recovery must never read a half-written file: write a temporary file and
+    // move it over the journal. The process id keeps the CLI and the daemon
+    // from sharing a temporary file.
+    let mut temp = path.clone().into_os_string();
+    temp.push(format!(".{}.tmp", std::process::id()));
+    let temp = std::path::PathBuf::from(temp);
+    std::fs::write(&temp, format_cloak_journal(entries))?;
+    std::fs::rename(&temp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// Write the journal if tracking changed since the last write.
+pub(crate) fn flush_cloak_journal() {
+    let _writer = JOURNAL_WRITE.lock().unwrap_or_else(recover_poisoned_mutex);
+    let snapshot: Vec<JournalEntry> = {
+        let mut tracking = tracking();
+        if !tracking.dirty {
+            return;
+        }
+        tracking.dirty = false;
+        tracking
+            .windows
+            .iter()
+            .map(|(id, owner)| (*id, *owner))
+            .collect()
+    };
+    if let Err(e) = write_cloak_journal(&snapshot) {
+        tracking().dirty = true;
+        tracing::warn!("Failed to update cloak journal: {}", e);
+    }
+}
+
+fn read_cloak_journal() -> Vec<JournalEntry> {
     cloak_journal_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| parse_cloak_journal(&text))
         .unwrap_or_default()
 }
 
-/// Uncloak every window recorded in the cloak journal (left cloaked by a daemon
-/// that crashed or was killed) and clear the journal. Returns how many windows
-/// were uncloaked.
+/// Uncloak every window recorded in the cloak journal or tracked by this
+/// process (left cloaked by a daemon that crashed or was killed). Returns how
+/// many windows were uncloaked.
+///
+/// Entries are dropped once their window is uncloaked, gone, or owned by a
+/// different process than recorded. Windows whose uncloak failed stay tracked
+/// and journaled, so later recovery (and [`uncloak_all_managed_windows`])
+/// retries them.
 pub fn restore_journaled_cloaked_windows() -> usize {
-    let journaled = read_cloak_journal();
-    if journaled.is_empty() {
+    let mut candidates: BTreeMap<WindowId, Option<ProcessIdentity>> =
+        read_cloak_journal().into_iter().collect();
+    for (id, owner) in tracking().windows.iter() {
+        candidates.insert(*id, *owner);
+    }
+    if candidates.is_empty() {
         return 0;
     }
+
     let mut restored = 0;
-    for window_id in journaled {
-        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
-            continue;
-        };
-        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+    let mut still_cloaked: Vec<JournalEntry> = Vec::new();
+    for (window_id, recorded) in &candidates {
+        let current = window_process_identity(*window_id);
+        if !journal_entry_matches(*recorded, current) {
+            if current.is_some() {
+                tracing::debug!(
+                    "Ignoring journaled window {}: its handle now belongs to another process",
+                    window_id
+                );
+            }
             continue;
         }
-        match shell_cloak::set_cloak(window_id, false) {
+        match shell_cloak::set_cloak(*window_id, false) {
             Ok(()) => restored += 1,
-            Err(e) => tracing::warn!(
-                "Failed to uncloak journaled window {} through the shell: {}",
-                window_id,
-                e
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to uncloak journaled window {} through the shell: {}",
+                    window_id,
+                    e
+                );
+                still_cloaked.push((*window_id, *recorded));
+            }
         }
     }
+
     {
-        let mut guard = DAEMON_CLOAKED_WINDOWS
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        if let Some(set) = guard.as_mut() {
-            set.clear();
+        let mut tracking = tracking();
+        for window_id in candidates.keys() {
+            tracking.windows.remove(window_id);
         }
+        // A pending (timed-out) uncloak is untracked by the shell thread when it
+        // completes; until then the window counts as cloaked.
+        tracking.windows.extend(still_cloaked);
+        tracking.dirty = true;
     }
-    write_cloak_journal(&HashSet::new());
+    flush_cloak_journal();
     if restored > 0 {
         tracing::info!("Uncloaked {} journaled window(s)", restored);
     }
     restored
-}
-
-fn is_daemon_cloaked(window_id: WindowId) -> bool {
-    let guard = DAEMON_CLOAKED_WINDOWS
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex);
-    guard.as_ref().is_some_and(|set| set.contains(&window_id))
 }
 
 fn note_cloak_access_denied() {
@@ -233,109 +359,160 @@ pub(crate) fn collect_uncloak_targets(
     targets
 }
 
-/// Cloak a window (hide from view but keep in Alt-Tab).
+/// Whether a window that should be hidden still needs a cloak request.
 ///
-/// Cloaked windows are hidden visually but remain in the taskbar
-/// and can still receive focus via Alt-Tab.
-pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
-    let window_id = hwnd;
-    let hwnd = window_id_to_hwnd(window_id)?;
-    unsafe {
-        if !IsWindow(Some(hwnd)).as_bool() {
-            return Err(Win32Error::WindowNotFound(window_id));
-        }
+/// Layout passes run on every animation frame, and each request is a COM round
+/// trip to Explorer. A window this process tracks as cloaked and that DWM
+/// reports cloaked is left alone; anything else (for example a cloak lost when
+/// Explorer restarted) is cloaked again.
+fn needs_cloak_request(tracked: bool, cloaked_now: bool) -> bool {
+    !(tracked && cloaked_now)
+}
 
-        // The shell can cloak any window; DWM only windows of this process.
-        match shell_cloak::set_cloak(window_id, true) {
-            Ok(()) => {
-                track_daemon_cloak(window_id, true);
-                return Ok(());
+fn dwm_set_cloak(window_id: WindowId, hwnd: HWND, cloak: bool) -> Result<(), Win32Error> {
+    let value: u32 = u32::from(cloak);
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &value as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    result.map_err(|e| {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return Win32Error::WindowNotFound(window_id);
+        }
+        if cloak && e.code() == E_ACCESSDENIED {
+            note_cloak_access_denied();
+        }
+        Win32Error::CloakFailed(format!(
+            "DwmSetWindowAttribute(CLOAK={}) failed for {:?}: {} (HRESULT 0x{:08X})",
+            value,
+            hwnd,
+            e,
+            e.code().0 as u32
+        ))
+    })
+}
+
+/// Cloak several windows, skipping those already cloaked by this process.
+///
+/// Every window is tracked and journaled *before* it is asked to disappear, so
+/// a crash at any point leaves no invisible window that recovery does not know
+/// about. A window stays tracked while its shell request is still pending; the
+/// shell thread records the eventual outcome.
+///
+/// Returns one result per window, in the order of `window_ids`.
+pub(crate) fn cloak_windows(window_ids: &[WindowId]) -> Vec<Result<(), Win32Error>> {
+    // Ok(Some(hwnd)) marks a window that still needs a cloak request.
+    let prepared: Vec<Result<Option<HWND>, Win32Error>> = window_ids
+        .iter()
+        .map(|&window_id| {
+            let hwnd = window_id_to_hwnd(window_id)?;
+            if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                return Err(Win32Error::WindowNotFound(window_id));
             }
-            Err(e) => tracing::debug!(
+            if !needs_cloak_request(is_daemon_cloaked(window_id), is_window_cloaked(hwnd)) {
+                return Ok(None);
+            }
+            track_daemon_cloak(window_id, window_process_identity(window_id));
+            Ok(Some(hwnd))
+        })
+        .collect();
+    flush_cloak_journal();
+
+    prepared
+        .into_iter()
+        .zip(window_ids)
+        .map(|(prepared, &window_id)| match prepared? {
+            Some(hwnd) => cloak_tracked_window(window_id, hwnd),
+            None => Ok(()),
+        })
+        .collect()
+}
+
+fn cloak_tracked_window(window_id: WindowId, hwnd: HWND) -> Result<(), Win32Error> {
+    // The shell can cloak any window; DWM only windows of this process.
+    let shell_pending = match shell_cloak::set_cloak(window_id, true) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            tracing::debug!(
                 "Shell cloak failed for window {}: {}; trying DWM",
                 window_id,
                 e
-            ),
+            );
+            matches!(e, ShellCloakError::Pending(_))
         }
-
-        let cloak_value: u32 = 1;
-
-        let result = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAK,
-            &cloak_value as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-
-        if let Err(e) = result {
-            if !IsWindow(Some(hwnd)).as_bool() {
-                return Err(Win32Error::WindowNotFound(window_id));
+    };
+    match dwm_set_cloak(window_id, hwnd, true) {
+        // The shell thread may have untracked the window after its own failure.
+        Ok(()) => {
+            track_daemon_cloak(window_id, window_process_identity(window_id));
+            Ok(())
+        }
+        Err(e) => {
+            // A pending shell request may still cloak the window; the shell
+            // thread untracks it if that fails.
+            if !shell_pending {
+                untrack_daemon_cloak(window_id);
             }
-            if e.code() == E_ACCESSDENIED {
-                note_cloak_access_denied();
-            }
-            return Err(Win32Error::CloakFailed(format!(
-                "DwmSetWindowAttribute(CLOAK=1) failed for {:?}: {} (HRESULT 0x{:08X})",
-                hwnd,
-                e,
-                e.code().0 as u32
-            )));
+            Err(e)
         }
     }
-    track_daemon_cloak(window_id, true);
-    Ok(())
+}
+
+/// Cloak a window (hide from view but keep in Alt-Tab).
+///
+/// Cloaked windows are hidden visually but remain in the taskbar
+/// and can still receive focus via Alt-Tab. Cloaking a window this process
+/// already cloaked is a no-op.
+pub fn cloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
+    cloak_windows(&[hwnd]).pop().unwrap_or(Ok(()))
 }
 
 /// Uncloak a window (make visible again).
+///
+/// Removes this process's shell cloak (if it cloaked the window) and any
+/// application (DWM) cloak. Windows cloaked by the shell for other reasons,
+/// such as being on another virtual desktop, are left alone.
 pub fn uncloak_window(hwnd: WindowId) -> Result<(), Win32Error> {
     let window_id = hwnd;
     let hwnd = window_id_to_hwnd(window_id)?;
-    unsafe {
-        if !IsWindow(Some(hwnd)).as_bool() {
-            track_daemon_cloak(window_id, false);
-            return Err(Win32Error::WindowNotFound(window_id));
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        untrack_daemon_cloak(window_id);
+        return Err(Win32Error::WindowNotFound(window_id));
+    }
+
+    // On success the shell thread untracks the window.
+    let shell_error = if is_daemon_cloaked(window_id) {
+        shell_cloak::set_cloak(window_id, false).err()
+    } else {
+        None
+    };
+    if is_window_app_cloaked(window_id) {
+        dwm_set_cloak(window_id, hwnd, false)?;
+    }
+    match shell_error {
+        None => {
+            untrack_daemon_cloak(window_id);
+            Ok(())
         }
-
-        // Only windows this daemon cloaked go through the shell; a window cloaked
-        // by its own application (or on another virtual desktop) must stay hidden.
-        if is_daemon_cloaked(window_id) {
-            match shell_cloak::set_cloak(window_id, false) {
-                Ok(()) => {
-                    track_daemon_cloak(window_id, false);
-                    return Ok(());
-                }
-                Err(e) => tracing::debug!(
-                    "Shell uncloak failed for window {}: {}; trying DWM",
-                    window_id,
-                    e
-                ),
-            }
-        }
-
-        let cloak_value: u32 = 0;
-
-        let result = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAK,
-            &cloak_value as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        );
-
-        if let Err(e) = result {
-            if !IsWindow(Some(hwnd)).as_bool() {
-                track_daemon_cloak(window_id, false);
-                return Err(Win32Error::WindowNotFound(window_id));
-            }
-            return Err(Win32Error::CloakFailed(format!(
-                "DwmSetWindowAttribute(CLOAK=0) failed for {:?}: {} (HRESULT 0x{:08X})",
-                hwnd,
-                e,
-                e.code().0 as u32
-            )));
+        // Still queued: the window counts as cloaked until the shell completes.
+        Some(e @ ShellCloakError::Pending(_)) => Err(Win32Error::CloakFailed(format!(
+            "shell uncloak of window {}: {}",
+            window_id, e
+        ))),
+        Some(e) if is_window_cloaked(hwnd) => Err(Win32Error::CloakFailed(format!(
+            "shell uncloak failed for window {}: {}",
+            window_id, e
+        ))),
+        // The shell failed, but nothing cloaks the window any more.
+        Some(_) => {
+            untrack_daemon_cloak(window_id);
+            Ok(())
         }
     }
-    track_daemon_cloak(window_id, false);
-    Ok(())
 }
 
 /// Uncloak a list of managed windows, best-effort.
@@ -358,6 +535,7 @@ pub fn uncloak_all_managed_windows(window_ids: &[WindowId]) {
         // Best-effort border reset
         let _ = reset_window_border_color(wid);
     }
+    flush_cloak_journal();
 
     if let Err(e) = restore_windows_moved_offscreen(window_ids) {
         tracing::warn!(
@@ -387,6 +565,7 @@ pub fn uncloak_all_visible_windows() {
     unsafe {
         let _ = EnumWindows(Some(uncloak_all_callback), LPARAM(0));
     }
+    flush_cloak_journal();
     let _ = restore_all_windows_moved_offscreen_best_effort();
     // Without the daemon's window list, only move windows that are mostly off-screen.
     if let Ok(windows) = enumerate_windows() {
@@ -413,7 +592,7 @@ unsafe extern "system" fn uncloak_all_callback(hwnd: HWND, _lparam: LPARAM) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::placement;
+    use crate::test_support::{placement, GLOBAL_SENDER_TEST_LOCK};
     use openniri_core_layout::Visibility;
 
     #[test]
@@ -446,20 +625,69 @@ mod tests {
     }
 
     #[test]
-    fn test_cloak_journal_format_round_trip() {
-        let ids: HashSet<WindowId> = [3, 1, 2].into_iter().collect();
-        let text = format_cloak_journal(&ids);
-        assert_eq!(text, "1\n2\n3\n");
-        assert_eq!(parse_cloak_journal(&text), vec![1, 2, 3]);
-        // Tolerates a partially written or edited file.
+    fn test_cloak_request_is_skipped_only_for_tracked_cloaked_windows() {
+        assert!(!needs_cloak_request(true, true));
+        // Tracked, but the cloak is gone (Explorer restarted): cloak again.
+        assert!(needs_cloak_request(true, false));
+        // Cloaked by someone else: this process must track its own cloak.
+        assert!(needs_cloak_request(false, true));
+        assert!(needs_cloak_request(false, false));
+    }
+
+    #[test]
+    fn test_cloak_journal_format_round_trip_with_owner() {
+        let owner = |pid, start_time| Some(ProcessIdentity { pid, start_time });
+        let entries = vec![(3, owner(30, 300)), (1, None), (2, owner(20, 0))];
+        let text = format_cloak_journal(&entries);
+        assert_eq!(text, "1\n2 20 0\n3 30 300\n");
         assert_eq!(
-            parse_cloak_journal("7\n\ngarbage\n0\n 9 \n12"),
-            vec![7, 9, 12]
+            parse_cloak_journal(&text),
+            vec![(1, None), (2, owner(20, 0)), (3, owner(30, 300))]
         );
     }
 
     #[test]
+    fn test_cloak_journal_reads_old_format_and_skips_garbage() {
+        // Bare handles from older versions; tolerates a partially written or edited file.
+        assert_eq!(
+            parse_cloak_journal("7\n\ngarbage\n0\n 9 \n12\n5 notapid\n6 60\n"),
+            vec![
+                (7, None),
+                (9, None),
+                (12, None),
+                (
+                    6,
+                    Some(ProcessIdentity {
+                        pid: 60,
+                        start_time: 0
+                    })
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_journal_entry_matches_only_the_recorded_owner() {
+        let owner = |pid, start_time| Some(ProcessIdentity { pid, start_time });
+        // Window gone.
+        assert!(!journal_entry_matches(owner(1, 10), None));
+        assert!(!journal_entry_matches(None, None));
+        // Old format: any live window.
+        assert!(journal_entry_matches(None, owner(5, 50)));
+        assert!(journal_entry_matches(owner(1, 10), owner(1, 10)));
+        // Handle reused by another process, or by a restarted process with the same pid.
+        assert!(!journal_entry_matches(owner(1, 10), owner(2, 10)));
+        assert!(!journal_entry_matches(owner(1, 10), owner(1, 11)));
+        // Unknown start time on either side: the pid decides.
+        assert!(journal_entry_matches(owner(1, 0), owner(1, 11)));
+        assert!(journal_entry_matches(owner(1, 10), owner(1, 0)));
+    }
+
+    #[test]
     fn test_daemon_cloak_tracking_round_trip() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
         let journal =
             std::env::temp_dir().join(format!("openniri-cloak-journal-{}.txt", std::process::id()));
         *CLOAK_JOURNAL_PATH_OVERRIDE
@@ -467,11 +695,19 @@ mod tests {
             .unwrap_or_else(recover_poisoned_mutex) = Some(journal.clone());
 
         let window_id: WindowId = 0xDEAD_0001;
+        let owner = Some(ProcessIdentity {
+            pid: 4242,
+            start_time: 7,
+        });
         assert!(!is_daemon_cloaked(window_id));
-        track_daemon_cloak(window_id, true);
+        assert!(track_daemon_cloak(window_id, owner));
+        assert!(!track_daemon_cloak(window_id, None), "already tracked");
         assert!(is_daemon_cloaked(window_id));
-        assert!(read_cloak_journal().contains(&window_id));
-        track_daemon_cloak(window_id, false);
+        flush_cloak_journal();
+        assert!(read_cloak_journal().contains(&(window_id, owner)));
+
+        // A dead handle is dropped from tracking and journal by recovery.
+        assert_eq!(restore_journaled_cloaked_windows(), 0);
         assert!(!is_daemon_cloaked(window_id));
         // Deletion can be pending briefly on Windows (e.g. an antivirus scan holds
         // the file open), so check what recovery would read, not the file itself.

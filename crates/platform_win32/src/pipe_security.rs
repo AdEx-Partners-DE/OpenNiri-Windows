@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, E_ACCESSDENIED, HANDLE, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -82,7 +82,7 @@ impl PipeSecurityAttributes {
     /// Build attributes that allow only the current user and SYSTEM.
     pub fn current_user_only() -> Result<Self, Win32Error> {
         let sid = current_user_sid().ok_or_else(|| {
-            Win32Error::HookInstallFailed("Could not read the current user's SID".to_string())
+            Win32Error::PipeSecurityFailed("Could not read the current user's SID".to_string())
         })?;
         let sddl: Vec<u16> = pipe_sddl(&sid).encode_utf16().chain(Some(0)).collect();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -95,7 +95,7 @@ impl PipeSecurityAttributes {
             )
         }
         .map_err(|e| {
-            Win32Error::HookInstallFailed(format!(
+            Win32Error::PipeSecurityFailed(format!(
                 "Failed to build pipe security descriptor: {}",
                 e
             ))
@@ -134,9 +134,13 @@ fn session_of(process_id: u32) -> Option<u32> {
 
 /// Check that the server end of a connected pipe belongs to this user.
 ///
-/// The server must run in this logon session. When its token can be read, its
-/// user SID must match ours; a token that cannot be read (for example an
-/// elevated daemon started by the same user) is accepted on the session check.
+/// Fails closed. The server must run in this logon session, its process token
+/// must be readable, and the token's user SID must equal ours. A server whose
+/// process or token cannot be opened is refused: a process of another user in
+/// this session (for example started with `runas`) denies token access exactly
+/// like that, so a denial proves nothing about the owner. An elevated daemon of
+/// the same user passes, because Windows lets a medium-integrity process of
+/// that user query the elevated token (`TOKEN_QUERY`; verified on Windows 11).
 pub fn verify_pipe_server(pipe_handle: isize) -> Result<(), String> {
     let handle = HANDLE(pipe_handle as *mut c_void);
     let mut server_pid = 0u32;
@@ -152,24 +156,22 @@ pub fn verify_pipe_server(pipe_handle: isize) -> Result<(), String> {
         ));
     }
 
-    let Some(own_sid) = current_user_sid() else {
-        return Ok(());
-    };
-    let Ok(process) =
-        (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, server_pid) })
-    else {
-        return Ok(());
-    };
+    let own_sid =
+        current_user_sid().ok_or_else(|| "cannot read this process's user SID".to_string())?;
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, server_pid) }
+        .map_err(|e| format!("cannot open pipe server process {}: {}", server_pid, e))?;
     let server_sid = token_user_sid(process);
     let _ = unsafe { CloseHandle(process) };
     match server_sid {
-        Ok(sid) if sid != own_sid => Err(format!(
+        Ok(sid) if sid == own_sid => Ok(()),
+        Ok(sid) => Err(format!(
             "pipe server process {} belongs to another user ({})",
             server_pid, sid
         )),
-        Ok(_) => Ok(()),
-        Err(e) if e.code() == E_ACCESSDENIED => Ok(()),
-        Err(_) => Ok(()),
+        Err(e) => Err(format!(
+            "cannot verify the owner of pipe server process {}: {}",
+            server_pid, e
+        )),
     }
 }
 

@@ -1,11 +1,23 @@
-//! Low-level mouse hooks: touchpad gesture detection and focus-follows-mouse.
+//! Low-level mouse hook: touchpad gesture detection and focus-follows-mouse.
+//!
+//! Every `WH_MOUSE_LL` hook adds latency to each mouse event system-wide, so both
+//! features share one hook per thread. [`spawn_input_hook_thread`] runs both on
+//! one thread with a single hook; [`spawn_mouse_hook_thread`] and
+//! [`spawn_gesture_thread`] each start their own thread (and hook).
 
-use crate::error::{recover_poisoned_mutex, Win32Error};
-use crate::events::{should_emit_window_event, WindowEvent};
+use crate::error::Win32Error;
+use crate::events::WindowEvent;
 use crate::message_loop::{spawn_message_loop_thread, MessageLoopThread};
-use crate::window::normalize_to_root_window;
+use crate::window::{manageable_window_names, normalize_to_root_window, WindowFilter};
 use openniri_core_layout::WindowId;
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HHOOK, MSLLHOOKSTRUCT,
     WH_MOUSE_LL, WM_MOUSEMOVE,
@@ -27,6 +39,143 @@ pub fn spawn_mouse_hook_thread(
 pub fn spawn_gesture_thread(
 ) -> Result<(MessageLoopThread, mpsc::Receiver<GestureEvent>), Win32Error> {
     spawn_message_loop_thread("openniri-gesture-hook", register_gestures, |_| {})
+}
+
+/// Run focus-follows-mouse (when `focus_sender` is set) and gesture detection
+/// (when `gestures` is true) on one message-loop thread with a single
+/// low-level mouse hook.
+///
+/// Returns the gesture receiver when gestures are enabled.
+pub fn spawn_input_hook_thread(
+    focus_sender: Option<mpsc::Sender<WindowEvent>>,
+    gestures: bool,
+) -> Result<(MessageLoopThread, Option<mpsc::Receiver<GestureEvent>>), Win32Error> {
+    spawn_message_loop_thread(
+        "openniri-input-hook",
+        move || {
+            let focus = focus_sender.map(install_mouse_hook).transpose()?;
+            let (gesture, receiver) = if gestures {
+                let (handle, receiver) = register_gestures()?;
+                (Some(handle), Some(receiver))
+            } else {
+                (None, None)
+            };
+            Ok(((focus, gesture), receiver))
+        },
+        |_| {},
+    )
+}
+
+// ============================================================================
+// Shared hook state
+// ============================================================================
+
+/// State of the low-level mouse hook installed on this thread.
+///
+/// The hook callback runs on the installing thread while it pumps messages, so
+/// the state is thread-local. The hook is installed with the first feature and
+/// removed with the last.
+struct InputHookState {
+    hook: Option<HHOOK>,
+    focus: Option<FocusFollowsMouse>,
+    gestures: Option<GestureDetector>,
+}
+
+thread_local! {
+    static INPUT_HOOK: RefCell<InputHookState> = const {
+        RefCell::new(InputHookState {
+            hook: None,
+            focus: None,
+            gestures: None,
+        })
+    };
+}
+
+impl InputHookState {
+    fn ensure_hook(&mut self) -> Result<(), Win32Error> {
+        if self.hook.is_none() {
+            let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
+                .map_err(|e| {
+                    Win32Error::HookInstallFailed(format!(
+                        "SetWindowsHookExW(WH_MOUSE_LL) failed: {}",
+                        e
+                    ))
+                })?;
+            self.hook = Some(hook);
+        }
+        Ok(())
+    }
+
+    fn release_hook_if_unused(&mut self) {
+        if self.focus.is_none() && self.gestures.is_none() {
+            if let Some(hook) = self.hook.take() {
+                let _ = unsafe { UnhookWindowsHookEx(hook) };
+            }
+        }
+    }
+
+    fn handle(&mut self, message: u32, info: &MSLLHOOKSTRUCT) {
+        if message == WM_MOUSEMOVE {
+            if let Some(focus) = self.focus.as_mut() {
+                focus.on_mouse_move(info.pt);
+            }
+        } else if message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL {
+            if let Some(gestures) = self.gestures.as_mut() {
+                // The high word of mouseData contains the wheel delta (signed).
+                let delta = (info.mouseData >> 16) as i16 as i32;
+                if let Some(event) =
+                    gestures.on_wheel(message == WM_MOUSEHWHEEL, delta, Instant::now())
+                {
+                    let _ = gestures.sender.send(event);
+                }
+            }
+        }
+    }
+}
+
+/// Install a feature into this thread's hook state, installing the hook if needed.
+fn add_feature(install: impl FnOnce(&mut InputHookState) -> bool) -> Result<(), Win32Error> {
+    INPUT_HOOK.with(|state| {
+        let mut state = state.borrow_mut();
+        if !install(&mut state) {
+            return Err(Win32Error::HookInstallFailed(
+                "this input hook is already installed on this thread".to_string(),
+            ));
+        }
+        // Without a hook no other feature was active, so clearing both leaves no
+        // state behind and a later install can succeed.
+        state.ensure_hook().inspect_err(|_| {
+            state.focus = None;
+            state.gestures = None;
+        })
+    })
+}
+
+/// Remove a feature from this thread's hook state, removing the hook if unused.
+fn remove_feature(remove: impl FnOnce(&mut InputHookState)) {
+    let _ = INPUT_HOOK.try_with(|state| {
+        let mut state = state.borrow_mut();
+        remove(&mut state);
+        state.release_hook_if_unused();
+    });
+}
+
+/// Low-level mouse hook callback shared by focus-follows-mouse and gestures.
+unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode >= 0 {
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let message = wparam.0 as u32;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = INPUT_HOOK.try_with(|state| {
+                // A nested call (while this thread waits in a cross-thread
+                // SendMessage) skips the event instead of panicking.
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    state.handle(message, info);
+                }
+            });
+        }));
+    }
+    CallNextHookEx(None, ncode, wparam, lparam)
 }
 
 // ============================================================================
@@ -54,51 +203,67 @@ const WM_MOUSEHWHEEL: u32 = 0x020E;
 /// 3 * WHEEL_DELTA (120) = 360.
 const GESTURE_SCROLL_THRESHOLD: i32 = 360;
 
-/// Timeout in milliseconds: if no scroll event arrives within this window,
-/// accumulators are reset.
-const GESTURE_TIMEOUT_MS: u128 = 300;
+/// If no scroll event arrives within this window, accumulators are reset.
+const GESTURE_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// Gesture accumulator state for the low-level mouse hook.
-struct GestureAccumState {
-    /// Accumulated horizontal wheel delta.
+/// Wheel-delta accumulator that turns touchpad scrolling into swipes.
+struct GestureDetector {
+    sender: mpsc::Sender<GestureEvent>,
     accum_x: i32,
-    /// Accumulated vertical wheel delta.
     accum_y: i32,
-    /// Timestamp of the last scroll event.
-    last_scroll_time: std::time::Instant,
+    last_scroll_time: Option<Instant>,
 }
 
-/// Global sender for gesture events.
-static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
-    std::sync::Mutex::new(None);
+impl GestureDetector {
+    fn on_wheel(&mut self, horizontal: bool, delta: i32, now: Instant) -> Option<GestureEvent> {
+        if self
+            .last_scroll_time
+            .is_some_and(|last| now.duration_since(last) > GESTURE_TIMEOUT)
+        {
+            self.accum_x = 0;
+            self.accum_y = 0;
+        }
+        self.last_scroll_time = Some(now);
 
-/// Global gesture accumulator state.
-/// Initialized to `None`; `register_gestures()` sets it to `Some(...)`.
-static GESTURE_STATE: std::sync::Mutex<Option<GestureAccumState>> = std::sync::Mutex::new(None);
+        if horizontal {
+            self.accum_x += delta;
+        } else {
+            self.accum_y += delta;
+        }
+
+        if self.accum_x.abs() >= GESTURE_SCROLL_THRESHOLD {
+            let event = if self.accum_x > 0 {
+                GestureEvent::SwipeRight
+            } else {
+                GestureEvent::SwipeLeft
+            };
+            self.accum_x = 0;
+            Some(event)
+        } else if self.accum_y.abs() >= GESTURE_SCROLL_THRESHOLD {
+            let event = if self.accum_y > 0 {
+                GestureEvent::SwipeDown
+            } else {
+                GestureEvent::SwipeUp
+            };
+            self.accum_y = 0;
+            Some(event)
+        } else {
+            None
+        }
+    }
+}
 
 /// Handle for gesture detection.
 ///
-/// Dropping this handle will unhook the low-level mouse hook and stop
-/// gesture detection.
+/// Dropping this handle (on the registering thread; it is not `Send`) stops
+/// gesture detection and removes the hook if focus-follows-mouse does not use it.
 pub struct GestureHandle {
-    hook: HHOOK,
+    _thread_affine: PhantomData<*const ()>,
 }
 
 impl Drop for GestureHandle {
     fn drop(&mut self) {
-        unsafe {
-            if !self.hook.is_invalid() {
-                let _ = UnhookWindowsHookEx(self.hook);
-            }
-        }
-
-        // Clear the global sender and state (recover from mutex poisoning)
-        let mut sender = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
-        drop(sender);
-        let mut state = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
-        *state = None;
-
+        remove_feature(|state| state.gestures = None);
         tracing::debug!("Gesture detection stopped");
     }
 }
@@ -106,249 +271,147 @@ impl Drop for GestureHandle {
 /// Register a low-level mouse hook for gesture detection via wheel events.
 ///
 /// Returns a handle that must be kept alive to receive gesture events,
-/// and a channel receiver for gesture events.
+/// and a channel receiver for gesture events. Events are only detected while
+/// the calling thread pumps messages; prefer [`spawn_gesture_thread`].
 ///
 /// Touchpad scroll gestures are delivered as WM_MOUSEWHEEL (vertical) and
 /// WM_MOUSEHWHEEL (horizontal) messages. The hook accumulates wheel deltas
 /// and fires swipe events when the threshold is exceeded.
 pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent>), Win32Error> {
-    // Create channel for events
     let (tx, rx) = mpsc::channel();
-
-    // Store sender globally
-    {
-        let mut sender = GESTURE_SENDER.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Gesture sender mutex poisoned".to_string())
-        })?;
-        if sender.is_some() {
-            return Err(Win32Error::HookInstallFailed(
-                "Gesture sender already initialized - drop existing GestureHandle first"
-                    .to_string(),
-            ));
+    add_feature(|state| {
+        if state.gestures.is_some() {
+            return false;
         }
-        *sender = Some(tx);
-    }
-
-    // Initialize accumulator state
-    {
-        let mut state = GESTURE_STATE.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Gesture state mutex poisoned".to_string())
-        })?;
-        *state = Some(GestureAccumState {
+        state.gestures = Some(GestureDetector {
+            sender: tx,
             accum_x: 0,
             accum_y: 0,
-            last_scroll_time: std::time::Instant::now(),
+            last_scroll_time: None,
         });
-    }
-
-    // Install low-level mouse hook
-    let hook = unsafe {
-        SetWindowsHookExW(WH_MOUSE_LL, Some(gesture_mouse_hook_proc), None, 0).map_err(|e| {
-            Win32Error::HookInstallFailed(format!(
-                "SetWindowsHookExW for gesture hook failed: {}",
-                e
-            ))
-        })?
-    };
-
+        true
+    })?;
     tracing::info!("Gesture detection registered (low-level mouse hook)");
-
-    Ok((GestureHandle { hook }, rx))
+    Ok((
+        GestureHandle {
+            _thread_affine: PhantomData,
+        },
+        rx,
+    ))
 }
 
-/// Low-level mouse hook callback for gesture detection.
+// ============================================================================
+// Focus Follows Mouse
+// ============================================================================
+
+/// Tracks the top-level window under the cursor.
+struct FocusFollowsMouse {
+    sender: mpsc::Sender<WindowEvent>,
+    current_window: Option<WindowId>,
+    last_point: Option<(i32, i32)>,
+}
+
+/// Whether a mouse-move report should be hit-tested for focus-follows-mouse.
 ///
-/// Handles WM_MOUSEWHEEL and WM_MOUSEHWHEEL to accumulate scroll deltas
-/// and fire swipe gesture events when the threshold is exceeded.
-unsafe extern "system" fn gesture_mouse_hook_proc(
-    ncode: i32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    if ncode >= 0 {
-        let msg = wparam.0 as u32;
-        if msg == WM_MOUSEHWHEEL || msg == WM_MOUSEWHEEL {
-            let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            // The high word of mouseData contains the wheel delta (signed).
-            let delta = (mouse_struct.mouseData >> 16) as i16 as i32;
+/// Reports at an unchanged point are noise: they also arrive while the layout
+/// moves windows under a still cursor, and hit-testing them focused whichever
+/// neighbour slid under the cursor (#63). While a button is held the user is
+/// dragging or selecting, and focus must not follow.
+fn should_hit_test_mouse_move(
+    last_point: Option<(i32, i32)>,
+    point: (i32, i32),
+    button_held: bool,
+) -> bool {
+    !button_held && last_point != Some(point)
+}
 
-            // Recover from mutex poisoning for both state and sender
-            let mut state_guard = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
-            if let Some(state) = state_guard.as_mut() {
-                let now = std::time::Instant::now();
+fn any_mouse_button_held() -> bool {
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .iter()
+        .any(|key| unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0)
+}
 
-                // Reset accumulators if timeout exceeded
-                if now.duration_since(state.last_scroll_time).as_millis() > GESTURE_TIMEOUT_MS {
-                    state.accum_x = 0;
-                    state.accum_y = 0;
-                }
-                state.last_scroll_time = now;
+impl FocusFollowsMouse {
+    fn on_mouse_move(&mut self, pt: POINT) {
+        let point = (pt.x, pt.y);
+        let last_point = self.last_point.replace(point);
+        if !should_hit_test_mouse_move(last_point, point, any_mouse_button_held()) {
+            return;
+        }
 
-                if msg == WM_MOUSEHWHEEL {
-                    state.accum_x += delta;
-                } else {
-                    state.accum_y += delta;
-                }
+        let raw_hwnd = unsafe { WindowFromPoint(pt) };
+        let candidate = if raw_hwnd.is_invalid() {
+            None
+        } else {
+            Some(normalize_to_root_window(raw_hwnd)).filter(|hwnd| !hwnd.is_invalid())
+        };
+        let candidate_id = candidate.map(|hwnd| hwnd.0 as WindowId);
+        if self.current_window == candidate_id {
+            return;
+        }
+        self.current_window = candidate_id;
 
-                // Check thresholds and determine gesture
-                let gesture = if state.accum_x.abs() >= GESTURE_SCROLL_THRESHOLD {
-                    let g = if state.accum_x > 0 {
-                        GestureEvent::SwipeRight
-                    } else {
-                        GestureEvent::SwipeLeft
-                    };
-                    state.accum_x = 0;
-                    Some(g)
-                } else if state.accum_y.abs() >= GESTURE_SCROLL_THRESHOLD {
-                    let g = if state.accum_y > 0 {
-                        GestureEvent::SwipeDown
-                    } else {
-                        GestureEvent::SwipeUp
-                    };
-                    state.accum_y = 0;
-                    Some(g)
-                } else {
-                    None
-                };
-
-                if let Some(event) = gesture {
-                    let sender_guard = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-                    if let Some(sender) = sender_guard.as_ref() {
-                        let _ = sender.send(event);
-                    }
-                }
+        if let Some(hwnd) = candidate {
+            if manageable_window_names(hwnd, WindowFilter::MANAGEABLE).is_some() {
+                let _ = self
+                    .sender
+                    .send(WindowEvent::MouseEnterWindow(hwnd.0 as WindowId));
             }
         }
     }
-
-    CallNextHookEx(None, ncode, wparam, lparam)
 }
 
-// ============================================================================
-// Focus Follows Mouse (Low-Level Mouse Hook)
-// ============================================================================
-
-/// Global sender for mouse enter events.
-static MOUSE_EVENT_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
-    std::sync::Mutex::new(None);
-
-/// Track the window the mouse is currently over.
-static CURRENT_MOUSE_WINDOW: std::sync::Mutex<Option<WindowId>> = std::sync::Mutex::new(None);
-
-/// Handle for the low-level mouse hook.
+/// Handle for the focus-follows-mouse hook.
 ///
-/// Dropping this handle will unhook the mouse hook.
+/// Dropping this handle (on the installing thread; it is not `Send`) stops
+/// focus-follows-mouse and removes the hook if gestures do not use it.
 pub struct MouseHookHandle {
-    hook: HHOOK,
+    _thread_affine: PhantomData<*const ()>,
 }
 
 impl Drop for MouseHookHandle {
     fn drop(&mut self) {
-        unsafe {
-            if !self.hook.is_invalid() {
-                let _ = UnhookWindowsHookEx(self.hook);
-            }
-        }
+        remove_feature(|state| state.focus = None);
         tracing::debug!("Mouse hook uninstalled");
-
-        // Clear the global sender (recover from mutex poisoning)
-        let mut sender = MOUSE_EVENT_SENDER
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
     }
 }
 
 /// Install a low-level mouse hook for focus-follows-mouse functionality.
 ///
-/// Returns a handle that must be kept alive to receive mouse events,
-/// and registers the given sender to receive MouseEnterWindow events.
-///
-/// # Arguments
-/// * `event_sender` - Sender for WindowEvent (specifically MouseEnterWindow)
+/// Returns a handle that must be kept alive to receive mouse events, and
+/// sends `MouseEnterWindow` events to `event_sender`. Events are only produced
+/// while the calling thread pumps messages; prefer [`spawn_mouse_hook_thread`].
 pub fn install_mouse_hook(
     event_sender: mpsc::Sender<WindowEvent>,
 ) -> Result<MouseHookHandle, Win32Error> {
-    // Store sender globally
-    {
-        let mut sender = MOUSE_EVENT_SENDER.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Mouse sender mutex poisoned".to_string())
-        })?;
-        if sender.is_some() {
-            return Err(Win32Error::HookInstallFailed(
-                "Mouse sender already initialized - drop existing MouseHookHandle first"
-                    .to_string(),
-            ));
+    add_feature(|state| {
+        if state.focus.is_some() {
+            return false;
         }
-        *sender = Some(event_sender);
-    }
-
-    // Install low-level mouse hook
-    let hook = unsafe {
-        SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_hook_proc), None, 0).map_err(|e| {
-            Win32Error::HookInstallFailed(format!("SetWindowsHookExW failed: {}", e))
-        })?
-    };
-
+        state.focus = Some(FocusFollowsMouse {
+            sender: event_sender,
+            current_window: None,
+            last_point: None,
+        });
+        true
+    })?;
     tracing::info!("Low-level mouse hook installed for focus-follows-mouse");
-
-    Ok(MouseHookHandle { hook })
+    Ok(MouseHookHandle {
+        _thread_affine: PhantomData,
+    })
 }
 
-/// Low-level mouse hook callback.
-///
-/// Tracks mouse movement and sends MouseEnterWindow events when the cursor
-/// enters a different window.
-unsafe extern "system" fn mouse_ll_hook_proc(
-    ncode: i32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    // If ncode < 0, we must call CallNextHookEx without processing
-    if ncode < 0 {
-        return CallNextHookEx(None, ncode, wparam, lparam);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mouse_moves_at_an_unchanged_point_are_ignored() {
+        assert!(should_hit_test_mouse_move(None, (10, 10), false));
+        assert!(should_hit_test_mouse_move(Some((10, 10)), (11, 10), false));
+        // The layout moved windows under a still cursor (#63).
+        assert!(!should_hit_test_mouse_move(Some((10, 10)), (10, 10), false));
+        // Dragging or selecting with a button held.
+        assert!(!should_hit_test_mouse_move(Some((10, 10)), (50, 10), true));
     }
-
-    // Only process mouse move events
-    if wparam.0 as u32 == WM_MOUSEMOVE {
-        // Get the mouse position from the hook struct
-        let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        let point = mouse_struct.pt;
-
-        // Find the window at the cursor position
-        let raw_hwnd = WindowFromPoint(point);
-        let candidate_hwnd = if raw_hwnd.is_invalid() {
-            None
-        } else {
-            let normalized = normalize_to_root_window(raw_hwnd);
-            if normalized.is_invalid() {
-                None
-            } else {
-                Some(normalized)
-            }
-        };
-        let candidate_window_id = candidate_hwnd.map(|hwnd| hwnd.0 as WindowId);
-
-        // Check if this is a different top-level window than before (recover from mutex poisoning)
-        let mut current = CURRENT_MOUSE_WINDOW
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        if *current != candidate_window_id {
-            *current = candidate_window_id;
-
-            if let Some(hwnd) = candidate_hwnd {
-                if should_emit_window_event(hwnd) {
-                    let sender_guard = MOUSE_EVENT_SENDER
-                        .lock()
-                        .unwrap_or_else(recover_poisoned_mutex);
-                    if let Some(sender) = sender_guard.as_ref() {
-                        let _ = sender.send(WindowEvent::MouseEnterWindow(hwnd.0 as WindowId));
-                    }
-                }
-            }
-        }
-    }
-
-    // Always call next hook in the chain
-    CallNextHookEx(None, ncode, wparam, lparam)
 }

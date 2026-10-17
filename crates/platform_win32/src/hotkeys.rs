@@ -1,24 +1,20 @@
 //! Global hotkeys, hotkey string parsing, virtual key codes and display-change
-//! forwarding from the hotkey window.
+//! forwarding (from the hotkey window and from the display watcher).
 
 use crate::error::{recover_poisoned_mutex, Win32Error};
 use crate::events::WindowEvent;
-use std::ffi::c_void;
+use crate::message_loop::{spawn_message_loop_thread, MessageLoopThread, ThreadWindow};
+use std::cell::RefCell;
 use std::sync::mpsc;
-use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
     MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    PostThreadMessageW, RegisterClassW, UnregisterClassW, MSG, WM_HOTKEY, WM_USER, WNDCLASSW,
+    DefWindowProcW, SPI_SETWORKAREA, WM_DISPLAYCHANGE, WM_HOTKEY, WM_SETTINGCHANGE,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
-
-// Window message for display configuration changes
-const WM_DISPLAYCHANGE: u32 = 0x007E;
 
 /// Unique identifier for a registered hotkey.
 pub type HotkeyId = i32;
@@ -102,78 +98,100 @@ pub struct HotkeyEvent {
     pub id: HotkeyId,
 }
 
-/// Global sender for hotkey events.
-/// Uses Mutex to allow re-registration after dropping previous HotkeyHandle.
-static HOTKEY_SENDER: std::sync::Mutex<Option<mpsc::Sender<HotkeyEvent>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Sender for hotkeys registered on this thread's hotkey window.
+    static HOTKEY_SENDER: RefCell<Option<mpsc::Sender<HotkeyEvent>>> =
+        const { RefCell::new(None) };
+    /// Sender of the display watcher running on this thread.
+    static DISPLAY_WATCHER_SENDER: RefCell<Option<mpsc::Sender<WindowEvent>>> =
+        const { RefCell::new(None) };
+}
 
-/// Global sender for display change events forwarded to window event channel.
-/// Uses Mutex to allow re-registration after dropping previous EventHookHandle.
+/// Sender for display change events seen by the hotkey window.
+///
+/// Set by the daemon thread and read by the hotkey thread, so it is shared. It
+/// outlives hotkey re-registration on config reload; clearing it with the
+/// hotkeys used to stop monitor-change detection after every reload.
 static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
     std::sync::Mutex::new(None);
 
-/// Custom message to signal the hotkey thread to stop.
-const WM_QUIT_HOTKEY_THREAD: u32 = WM_USER + 1;
-
-/// Clear the hotkey sender. The display-change sender is left alone: it outlives
-/// hotkey re-registration on config reload, and clearing it here used to stop
-/// monitor-change detection after every reload.
-fn clear_hotkey_globals() {
-    let mut sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-    *sender = None;
-}
-
 /// Drop the display-change sender so its forwarding thread can exit at shutdown.
 pub fn clear_display_change_sender() {
-    let mut sender = DISPLAY_CHANGE_SENDER
+    *DISPLAY_CHANGE_SENDER
         .lock()
-        .unwrap_or_else(recover_poisoned_mutex);
-    *sender = None;
+        .unwrap_or_else(recover_poisoned_mutex) = None;
 }
 
-fn request_hotkey_thread_shutdown(hwnd: HWND, thread_id: u32) -> bool {
-    let mut shutdown_signal_sent = unsafe {
-        PostMessageW(
-            Some(hwnd),
-            WM_QUIT_HOTKEY_THREAD,
-            windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(0),
-        )
-        .is_ok()
-    };
+/// Register a sender for display change events.
+///
+/// This allows the hotkey window to forward WM_DISPLAYCHANGE messages
+/// to the window event channel. [`spawn_display_watcher`] does the same without
+/// depending on hotkeys.
+pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
+    *DISPLAY_CHANGE_SENDER
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex) = Some(sender);
+    Ok(())
+}
 
-    if !shutdown_signal_sent {
-        tracing::warn!(
-            "PostMessageW quit signal failed for hotkey window {:?}; attempting thread message fallback",
-            hwnd
-        );
-        shutdown_signal_sent = unsafe {
-            PostThreadMessageW(
-                thread_id,
-                WM_QUIT_HOTKEY_THREAD,
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
-            )
-            .is_ok()
-        };
-        if !shutdown_signal_sent {
-            tracing::warn!(
-                "PostThreadMessageW quit signal failed for hotkey thread {}; proceeding without blocking join",
-                thread_id
-            );
+/// Hidden top-level window: display and setting changes are broadcast to
+/// top-level windows, but not to message-only windows.
+fn create_hidden_window(
+    class_name: &str,
+    window_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) -> Result<ThreadWindow, Win32Error> {
+    ThreadWindow::create(
+        class_name,
+        Some(window_proc),
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_POPUP,
+        0,
+        0,
+    )
+}
+
+/// Run `inner` as a window procedure, falling back to `DefWindowProcW` on panic.
+fn guarded_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    inner: fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) -> LRESULT {
+    match std::panic::catch_unwind(|| inner(hwnd, msg, wparam, lparam)) {
+        Ok(lresult) => lresult,
+        Err(e) => {
+            tracing::error!("Panic in window procedure: {:?}", e);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
     }
+}
 
-    shutdown_signal_sent
+/// Hotkey window and its registrations, owned by the hotkey thread.
+///
+/// `UnregisterHotKey` only works on the thread that registered the keys, so
+/// dropping this on that thread is what frees them for the next registration.
+struct HotkeyWindow {
+    window: ThreadWindow,
+    registered_ids: Vec<HotkeyId>,
+}
+
+impl Drop for HotkeyWindow {
+    fn drop(&mut self) {
+        for id in &self.registered_ids {
+            let _ = unsafe { UnregisterHotKey(Some(self.window.hwnd()), *id) };
+        }
+        let _ = HOTKEY_SENDER.try_with(|sender| sender.borrow_mut().take());
+        tracing::debug!("Unregistered {} hotkeys", self.registered_ids.len());
+    }
 }
 
 /// Handle for the hotkey message window and thread.
 ///
-/// Dropping this handle will unregister all hotkeys and stop the message loop.
+/// Dropping this handle unregisters all hotkeys (on the thread that registered
+/// them) and stops the message loop.
 pub struct HotkeyHandle {
-    hwnd: HWND,
-    thread_id: u32,
-    thread: Option<std::thread::JoinHandle<()>>,
+    _thread: MessageLoopThread,
     registered_ids: Vec<HotkeyId>,
 }
 
@@ -187,58 +205,6 @@ impl HotkeyHandle {
     pub fn registered_count(&self) -> usize {
         self.registered_ids.len()
     }
-}
-
-impl Drop for HotkeyHandle {
-    fn drop(&mut self) {
-        // Unregister all hotkeys
-        unsafe {
-            for id in &self.registered_ids {
-                let _ = UnregisterHotKey(Some(self.hwnd), *id);
-            }
-        }
-        tracing::debug!("Unregistered {} hotkeys", self.registered_ids.len());
-
-        // Signal the message loop to quit
-        let shutdown_signal_sent = request_hotkey_thread_shutdown(self.hwnd, self.thread_id);
-
-        // Join if finished; otherwise detach to avoid hanging shutdown.
-        if let Some(thread) = self.thread.take() {
-            if shutdown_signal_sent {
-                const HOTKEY_THREAD_WAIT_POLLS: usize = 30;
-                const HOTKEY_THREAD_WAIT_MS: u64 = 10;
-                for _ in 0..HOTKEY_THREAD_WAIT_POLLS {
-                    if thread.is_finished() {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(HOTKEY_THREAD_WAIT_MS));
-                }
-            }
-
-            if thread.is_finished() {
-                let _ = thread.join();
-            } else {
-                tracing::warn!(
-                    "Hotkey thread did not exit promptly after shutdown signal; detaching to avoid hang"
-                );
-            }
-        }
-
-        // Clear the global senders to allow re-registration (recover from mutex poisoning)
-        clear_hotkey_globals();
-    }
-}
-
-/// Register a sender for display change events.
-///
-/// This allows the hotkey window to forward WM_DISPLAYCHANGE messages
-/// to the window event channel. Call this before `register_hotkeys`.
-pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
-    let mut guard = DISPLAY_CHANGE_SENDER.lock().map_err(|_| {
-        Win32Error::HookInstallFailed("Display change sender mutex poisoned".to_string())
-    })?;
-    *guard = Some(sender);
-    Ok(())
 }
 
 /// Register global hotkeys and start listening for them.
@@ -255,79 +221,27 @@ pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<()
 pub fn register_hotkeys(
     hotkeys: Vec<Hotkey>,
 ) -> Result<(HotkeyHandle, mpsc::Receiver<HotkeyEvent>), Win32Error> {
-    // Create channel for events
+    let requested = hotkeys.len();
     let (tx, rx) = mpsc::channel();
-
-    // Store sender globally (check that it's not already set)
-    {
-        let mut sender = HOTKEY_SENDER.lock().map_err(|_| {
-            Win32Error::HotkeyRegistrationFailed("Hotkey sender mutex poisoned".to_string())
-        })?;
-        if sender.is_some() {
-            return Err(Win32Error::HotkeyRegistrationFailed(
-                "Hotkey sender already initialized - drop existing HotkeyHandle first".to_string(),
-            ));
-        }
-        *sender = Some(tx);
-    }
-
-    // Create the message window and register hotkeys on a separate thread
-    // We send isize (raw pointer value) instead of HWND because HWND is !Send
-    let (init_tx, init_rx) =
-        std::sync::mpsc::channel::<Result<(isize, u32, Vec<HotkeyId>), Win32Error>>();
-    let hotkeys_clone = hotkeys.clone();
-
-    let thread = std::thread::spawn(move || {
-        unsafe {
-            let thread_id = GetCurrentThreadId();
-
-            // Register window class
-            let class_name: Vec<u16> = "OpenNiriHotkeyClass\0".encode_utf16().collect();
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(hotkey_window_proc),
-                lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
-                ..Default::default()
+    let (thread, registered_ids) = spawn_message_loop_thread(
+        "openniri-hotkeys",
+        move || {
+            let window = create_hidden_window("OpenNiriHotkeyClass", hotkey_window_proc)?;
+            let mut state = HotkeyWindow {
+                window,
+                registered_ids: Vec::new(),
             };
-            RegisterClassW(&wc);
-
-            // Create a hidden top-level window.
-            // WM_DISPLAYCHANGE is broadcast to top-level windows, but not to message-only windows.
-            let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                windows::core::PCWSTR(class_name.as_ptr()),
-                None,
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                None,
-                None,
-            );
-
-            if hwnd.is_err() {
-                let _ = init_tx.send(Err(Win32Error::HotkeyRegistrationFailed(
-                    "Failed to create message window".to_string(),
-                )));
-                return;
-            }
-
-            let hwnd = hwnd.unwrap();
-            let mut registered_ids = Vec::new();
-
-            // Register all hotkeys
-            for hotkey in &hotkeys_clone {
-                let result = RegisterHotKey(
-                    Some(hwnd),
-                    hotkey.id,
-                    hotkey.modifiers.to_win32(),
-                    hotkey.vk,
-                );
-
+            for hotkey in &hotkeys {
+                let result = unsafe {
+                    RegisterHotKey(
+                        Some(state.window.hwnd()),
+                        hotkey.id,
+                        hotkey.modifiers.to_win32(),
+                        hotkey.vk,
+                    )
+                };
                 if result.is_ok() {
-                    registered_ids.push(hotkey.id);
+                    state.registered_ids.push(hotkey.id);
                     tracing::debug!("Registered hotkey {} (vk=0x{:X})", hotkey.id, hotkey.vk);
                 } else {
                     tracing::warn!(
@@ -337,81 +251,35 @@ pub fn register_hotkeys(
                     );
                 }
             }
-
-            // Send initialization result (hwnd as isize for Send safety)
-            let hwnd_raw = hwnd.0 as isize;
-            let _ = init_tx.send(Ok((hwnd_raw, thread_id, registered_ids)));
-
-            // Message loop
-            let mut msg = MSG::default();
-            loop {
-                let get_message_result = GetMessageW(&mut msg, None, 0, 0).0;
-                if get_message_result <= 0 {
-                    break;
-                }
-                if msg.message == WM_QUIT_HOTKEY_THREAD {
-                    break;
-                }
-                let _ = DispatchMessageW(&msg);
+            // Keep every hotkey that registered. Rejecting the whole set when one
+            // combo was taken (Win+L can never be registered) left users with no
+            // shortcuts at all, including the emergency panic key.
+            if !hotkeys.is_empty() && state.registered_ids.is_empty() {
+                return Err(Win32Error::HotkeyRegistrationFailed(format!(
+                    "None of the {} hotkeys could be registered",
+                    hotkeys.len()
+                )));
             }
+            HOTKEY_SENDER.with(|sender| *sender.borrow_mut() = Some(tx));
+            let registered_ids = state.registered_ids.clone();
+            Ok((state, registered_ids))
+        },
+        |_| {},
+    )?;
 
-            let _ = DestroyWindow(hwnd);
-            let _ = UnregisterClassW(windows::core::PCWSTR(class_name.as_ptr()), None);
-        }
-    });
-
-    // Wait for initialization
-    let init_result = init_rx.recv().map_err(|_| {
-        clear_hotkey_globals();
-        Win32Error::HotkeyRegistrationFailed("Thread initialization failed".to_string())
-    })?;
-    let (hwnd_raw, thread_id, registered_ids) = match init_result {
-        Ok(v) => v,
-        Err(e) => {
-            clear_hotkey_globals();
-            if thread.is_finished() {
-                let _ = thread.join();
-            }
-            return Err(e);
-        }
-    };
-
-    // Reconstruct HWND from raw pointer
-    let hwnd = HWND(hwnd_raw as *mut c_void);
-
-    // Keep every hotkey that registered. Rejecting the whole set when one combo
-    // was taken (Win+L can never be registered) left users with no shortcuts at
-    // all, including the emergency panic key.
-    if !hotkeys.is_empty() && registered_ids.is_empty() {
-        let _ = request_hotkey_thread_shutdown(hwnd, thread_id);
-        if thread.is_finished() {
-            let _ = thread.join();
-        }
-        clear_hotkey_globals();
-        return Err(Win32Error::HotkeyRegistrationFailed(format!(
-            "None of the {} hotkeys could be registered",
-            hotkeys.len()
-        )));
-    }
-    if registered_ids.len() != hotkeys.len() {
+    if registered_ids.len() != requested {
         tracing::warn!(
             "Registered {}/{} hotkeys; the others are already taken by Windows or another application",
             registered_ids.len(),
-            hotkeys.len()
+            requested
         );
-    } else if !hotkeys.is_empty() {
-        tracing::info!(
-            "Registered {}/{} hotkeys",
-            registered_ids.len(),
-            hotkeys.len()
-        );
+    } else if requested > 0 {
+        tracing::info!("Registered {}/{} hotkeys", registered_ids.len(), requested);
     }
 
     Ok((
         HotkeyHandle {
-            hwnd,
-            thread_id,
-            thread: Some(thread),
+            _thread: thread,
             registered_ids,
         },
         rx,
@@ -419,63 +287,106 @@ pub fn register_hotkeys(
 }
 
 /// Window procedure for the hotkey message window.
-///
-/// Wrapped with catch_unwind to prevent panics from crashing the application.
 unsafe extern "system" fn hotkey_window_proc(
     hwnd: HWND,
     msg: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    // Wrap in catch_unwind to prevent panics from crashing
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hotkey_window_proc_inner(hwnd, msg, wparam, lparam)
-    }));
-
-    match result {
-        Ok(lresult) => lresult,
-        Err(e) => {
-            tracing::error!("Panic in hotkey_window_proc: {:?}", e);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-    }
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    guarded_window_proc(hwnd, msg, wparam, lparam, hotkey_window_proc_inner)
 }
 
-/// Inner implementation of hotkey window procedure.
-fn hotkey_window_proc_inner(
-    hwnd: HWND,
-    msg: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
+fn hotkey_window_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_HOTKEY => {
             let hotkey_id = wparam.0 as HotkeyId;
             tracing::debug!("Hotkey {} pressed", hotkey_id);
-
-            // Send event through channel (recover from mutex poisoning)
-            let sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(HotkeyEvent { id: hotkey_id });
-            }
-
-            windows::Win32::Foundation::LRESULT(0)
+            let _ = HOTKEY_SENDER.try_with(|sender| {
+                if let Some(sender) = sender.borrow().as_ref() {
+                    let _ = sender.send(HotkeyEvent { id: hotkey_id });
+                }
+            });
+            LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
             tracing::info!("Display configuration changed (WM_DISPLAYCHANGE)");
-
-            // Send display change event through window event channel (recover from mutex poisoning)
-            let sender_guard = DISPLAY_CHANGE_SENDER
+            let sender = DISPLAY_CHANGE_SENDER
                 .lock()
                 .unwrap_or_else(recover_poisoned_mutex);
-            if let Some(sender) = sender_guard.as_ref() {
+            if let Some(sender) = sender.as_ref() {
                 let _ = sender.send(WindowEvent::DisplayChange);
             }
-
-            windows::Win32::Foundation::LRESULT(0)
+            LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+// ============================================================================
+// Display watcher
+// ============================================================================
+
+/// Display watcher window, owned by its thread.
+struct DisplayWatcher {
+    _window: ThreadWindow,
+}
+
+impl Drop for DisplayWatcher {
+    fn drop(&mut self) {
+        let _ = DISPLAY_WATCHER_SENDER.try_with(|sender| sender.borrow_mut().take());
+    }
+}
+
+/// Watch for monitor and work-area changes on a dedicated message-loop thread.
+///
+/// A hidden top-level window forwards `WM_DISPLAYCHANGE` (monitors added,
+/// removed, rearranged or resolution changed) and
+/// `WM_SETTINGCHANGE(SPI_SETWORKAREA)` (taskbar moved or resized) to `sender`
+/// as [`WindowEvent::DisplayChange`]. Unlike [`set_display_change_sender`], this
+/// works without registered hotkeys.
+pub fn spawn_display_watcher(
+    sender: mpsc::Sender<WindowEvent>,
+) -> Result<MessageLoopThread, Win32Error> {
+    spawn_message_loop_thread(
+        "openniri-display-watcher",
+        move || {
+            let window = create_hidden_window("OpenNiriDisplayWatcherClass", display_window_proc)?;
+            DISPLAY_WATCHER_SENDER.with(|slot| *slot.borrow_mut() = Some(sender));
+            Ok((DisplayWatcher { _window: window }, ()))
+        },
+        |_| {},
+    )
+    .map(|(thread, ())| thread)
+}
+
+/// Whether a broadcast message means the monitor layout or a work area changed.
+fn is_display_change_message(msg: u32, wparam: WPARAM) -> bool {
+    msg == WM_DISPLAYCHANGE || (msg == WM_SETTINGCHANGE && wparam.0 == SPI_SETWORKAREA.0 as usize)
+}
+
+unsafe extern "system" fn display_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    guarded_window_proc(hwnd, msg, wparam, lparam, display_window_proc_inner)
+}
+
+fn display_window_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if !is_display_change_message(msg, wparam) {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    tracing::info!(
+        "Display configuration or work area changed (message 0x{:04X})",
+        msg
+    );
+    let _ = DISPLAY_WATCHER_SENDER.try_with(|sender| {
+        if let Some(sender) = sender.borrow().as_ref() {
+            let _ = sender.send(WindowEvent::DisplayChange);
+        }
+    });
+    LRESULT(0)
 }
 
 /// Common virtual key codes for hotkey registration.
@@ -633,48 +544,6 @@ mod tests {
     use crate::test_support::GLOBAL_SENDER_TEST_LOCK;
 
     #[test]
-    fn test_clear_hotkey_globals_keeps_display_change_sender() {
-        let _guard = GLOBAL_SENDER_TEST_LOCK
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-
-        let (hotkey_tx, _hotkey_rx) = mpsc::channel::<HotkeyEvent>();
-        let (display_tx, _display_rx) = mpsc::channel::<WindowEvent>();
-
-        {
-            let mut sender_guard = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-            *sender_guard = Some(hotkey_tx);
-        }
-        {
-            let mut sender_guard = DISPLAY_CHANGE_SENDER
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            *sender_guard = Some(display_tx);
-        }
-
-        clear_hotkey_globals();
-
-        let hotkey_sender = HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        assert!(hotkey_sender.is_none());
-        drop(hotkey_sender);
-        {
-            let display_sender = DISPLAY_CHANGE_SENDER
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            assert!(
-                display_sender.is_some(),
-                "hotkey re-registration on reload must not disable display-change detection"
-            );
-        }
-
-        clear_display_change_sender();
-        let display_sender = DISPLAY_CHANGE_SENDER
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        assert!(display_sender.is_none());
-    }
-
-    #[test]
     fn test_hotkey_window_proc_forwards_hotkey_and_display_change_events() {
         let _guard = GLOBAL_SENDER_TEST_LOCK
             .lock()
@@ -682,16 +551,12 @@ mod tests {
         let timeout = std::time::Duration::from_millis(100);
 
         let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyEvent>();
-        *HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = Some(hotkey_tx);
+        HOTKEY_SENDER.with(|sender| *sender.borrow_mut() = Some(hotkey_tx));
         let (display_tx, display_rx) = mpsc::channel::<WindowEvent>();
         set_display_change_sender(display_tx).unwrap();
 
-        let lresult = hotkey_window_proc_inner(
-            HWND(std::ptr::null_mut()),
-            WM_HOTKEY,
-            windows::Win32::Foundation::WPARAM(77),
-            windows::Win32::Foundation::LPARAM(0),
-        );
+        let lresult =
+            hotkey_window_proc_inner(HWND(std::ptr::null_mut()), WM_HOTKEY, WPARAM(77), LPARAM(0));
         assert_eq!(lresult.0, 0);
         let event = hotkey_rx
             .recv_timeout(timeout)
@@ -701,8 +566,8 @@ mod tests {
         let lresult = hotkey_window_proc_inner(
             HWND(std::ptr::null_mut()),
             WM_DISPLAYCHANGE,
-            windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(0),
+            WPARAM(0),
+            LPARAM(0),
         );
         assert_eq!(lresult.0, 0);
         let event = display_rx
@@ -710,28 +575,49 @@ mod tests {
             .expect("display change event should be forwarded");
         assert!(matches!(event, WindowEvent::DisplayChange));
 
-        *HOTKEY_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = None;
+        HOTKEY_SENDER.with(|sender| sender.borrow_mut().take());
         clear_display_change_sender();
     }
 
     #[test]
-    fn test_hotkey_handle_drop_does_not_block_when_quit_post_fails() {
+    fn test_hotkey_reregistration_keeps_display_change_sender() {
         let _guard = GLOBAL_SENDER_TEST_LOCK
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
+        let (display_tx, _display_rx) = mpsc::channel::<WindowEvent>();
+        set_display_change_sender(display_tx).unwrap();
 
-        let sleeping_thread = std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        });
+        // An empty set registers nothing but runs the full window lifecycle.
+        let (handle, _rx) = register_hotkeys(Vec::new()).expect("hotkey thread");
+        assert_eq!(handle.registered_count(), 0);
+        drop(handle);
+        assert!(
+            DISPLAY_CHANGE_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex)
+                .is_some(),
+            "hotkey re-registration on reload must not disable display-change detection"
+        );
+        clear_display_change_sender();
+    }
 
-        let start = std::time::Instant::now();
-        drop(HotkeyHandle {
-            hwnd: HWND(std::ptr::null_mut()),
-            thread_id: 0,
-            thread: Some(sleeping_thread),
-            registered_ids: Vec::new(),
-        });
-        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    #[test]
+    fn test_display_watcher_forwards_display_and_work_area_changes() {
+        let (tx, rx) = mpsc::channel::<WindowEvent>();
+        DISPLAY_WATCHER_SENDER.with(|sender| *sender.borrow_mut() = Some(tx));
+        let hwnd = HWND(std::ptr::null_mut());
+        display_window_proc_inner(hwnd, WM_DISPLAYCHANGE, WPARAM(32), LPARAM(0));
+        display_window_proc_inner(
+            hwnd,
+            WM_SETTINGCHANGE,
+            WPARAM(SPI_SETWORKAREA.0 as usize),
+            LPARAM(0),
+        );
+        assert_eq!(rx.try_iter().count(), 2);
+
+        // Other setting changes (wallpaper, colours, ...) are not display changes.
+        assert!(!is_display_change_message(WM_SETTINGCHANGE, WPARAM(0x0014)));
+        DISPLAY_WATCHER_SENDER.with(|sender| sender.borrow_mut().take());
     }
 
     #[test]

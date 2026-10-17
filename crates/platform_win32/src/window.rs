@@ -3,11 +3,16 @@
 use crate::error::Win32Error;
 use openniri_core_layout::{Rect, WindowId};
 use std::ffi::c_void;
-use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HWND, LPARAM, RECT, TRUE};
+use windows::core::{BOOL, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, E_ACCESSDENIED, FILETIME, HANDLE, HWND, LPARAM, RECT,
+    TRUE,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
@@ -45,12 +50,8 @@ pub struct WindowInfo {
 
 /// Enumerate all top-level windows that should be managed.
 ///
-/// Filters out:
-/// - Invisible windows
-/// - Tool windows (WS_EX_TOOLWINDOW without WS_EX_APPWINDOW)
-/// - Windows with empty titles
-/// - Cloaked windows
-/// - Windows with WS_EX_NOACTIVATE
+/// Only windows that pass [`WindowFilter::MANAGEABLE`] and have a non-empty
+/// rectangle are returned.
 pub fn enumerate_windows() -> Result<Vec<WindowInfo>, Win32Error> {
     let mut windows: Vec<WindowInfo> = Vec::new();
 
@@ -75,81 +76,13 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>, Win32Error> {
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
 
-    // Skip invisible windows
-    if !IsWindowVisible(hwnd).as_bool() {
+    let Some((title, class_name)) = manageable_window_names(hwnd, WindowFilter::MANAGEABLE) else {
         return TRUE;
-    }
-
-    // Get window styles
-    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-
-    // Skip if not visible style
-    if style & WS_VISIBLE.0 == 0 {
-        return TRUE;
-    }
-
-    // Skip tool windows (unless they have WS_EX_APPWINDOW)
-    let is_tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
-    let is_app_window = ex_style & WS_EX_APPWINDOW.0 != 0;
-    if is_tool_window && !is_app_window {
-        return TRUE;
-    }
-
-    // Skip windows with WS_EX_NOACTIVATE (tooltips, popups, etc.)
-    if ex_style & WS_EX_NOACTIVATE.0 != 0 {
-        return TRUE;
-    }
-
-    // Skip owned windows (dialogs, secondary windows)
-    if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-        if !owner.is_invalid() {
-            return TRUE;
-        }
-    }
-
-    // Skip cloaked windows (e.g., on other virtual desktops)
-    if is_window_cloaked(hwnd) {
-        return TRUE;
-    }
-
-    // Get window title
-    let title_len = GetWindowTextLengthW(hwnd);
-    if title_len == 0 {
-        return TRUE; // Skip windows with no title
-    }
-
-    let mut title_buf: Vec<u16> = vec![0; (title_len + 1) as usize];
-    let actual_len = GetWindowTextW(hwnd, &mut title_buf);
-    if actual_len == 0 {
-        return TRUE;
-    }
-    let title = String::from_utf16_lossy(&title_buf[..actual_len as usize]);
-
-    // Skip known system windows by title
-    if should_skip_window_by_title(&title) {
-        return TRUE;
-    }
-
-    // Get class name
-    let mut class_buf: Vec<u16> = vec![0; 256];
-    let class_len = GetClassNameW(hwnd, &mut class_buf);
-    let class_name = if class_len > 0 {
-        String::from_utf16_lossy(&class_buf[..class_len as usize])
-    } else {
-        String::new()
     };
 
-    // Skip known system classes
-    if should_skip_window_by_class(&class_name) {
-        return TRUE;
-    }
-
-    // Get process ID
     let mut process_id: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut process_id));
 
-    // Get window rect
     let mut win_rect = RECT::default();
     if GetWindowRect(hwnd, &mut win_rect).is_err() {
         return TRUE;
@@ -179,6 +112,98 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
     TRUE
 }
 
+/// Which manageability checks a top-level window must pass.
+///
+/// Enumeration and every event source share [`manageable_window_names`], so a
+/// window the daemon would never manage produces no events either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowFilter {
+    /// The window must be visible (`IsWindowVisible` and `WS_VISIBLE`).
+    pub(crate) require_visible: bool,
+    /// The window must have a title that is not on the skip list.
+    pub(crate) require_title: bool,
+    /// The window must not be cloaked (for example on another virtual desktop).
+    pub(crate) filter_cloaked: bool,
+}
+
+impl WindowFilter {
+    /// Every check: the windows the daemon tiles.
+    pub(crate) const MANAGEABLE: Self = Self {
+        require_visible: true,
+        require_title: true,
+        filter_cloaked: true,
+    };
+}
+
+/// Title and class name of a window that passes `filter`, or `None`.
+///
+/// Always skipped: tool windows (unless `WS_EX_APPWINDOW`), `WS_EX_NOACTIVATE`
+/// windows, owned windows (dialogs) and known system classes. The title is only
+/// read (and is otherwise empty) when `filter.require_title` is set.
+pub(crate) fn manageable_window_names(
+    hwnd: HWND,
+    filter: WindowFilter,
+) -> Option<(String, String)> {
+    // Keep this best-effort and non-panicking: it runs inside hook callbacks.
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+        if filter.require_visible && (!IsWindowVisible(hwnd).as_bool() || style & WS_VISIBLE.0 == 0)
+        {
+            return None;
+        }
+
+        let is_tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
+        let is_app_window = ex_style & WS_EX_APPWINDOW.0 != 0;
+        if is_tool_window && !is_app_window {
+            return None;
+        }
+
+        // Tooltips, popups and other windows that never take focus.
+        if ex_style & WS_EX_NOACTIVATE.0 != 0 {
+            return None;
+        }
+
+        // Owned windows (dialogs, secondary windows) float with their owner.
+        if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+            if !owner.is_invalid() {
+                return None;
+            }
+        }
+
+        if filter.filter_cloaked && is_window_cloaked(hwnd) {
+            return None;
+        }
+
+        let mut title = String::new();
+        if filter.require_title {
+            let title_len = GetWindowTextLengthW(hwnd);
+            if title_len <= 0 {
+                return None;
+            }
+            let mut title_buf: Vec<u16> = vec![0; (title_len + 1) as usize];
+            let actual_len = GetWindowTextW(hwnd, &mut title_buf);
+            if actual_len <= 0 {
+                return None;
+            }
+            title = String::from_utf16_lossy(&title_buf[..actual_len as usize]);
+            if should_skip_window_by_title(&title) {
+                return None;
+            }
+        }
+
+        let mut class_buf: Vec<u16> = vec![0; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buf).max(0) as usize;
+        let class_name = String::from_utf16_lossy(&class_buf[..class_len]);
+        if should_skip_window_by_class(&class_name) {
+            return None;
+        }
+
+        Some((title, class_name))
+    }
+}
+
 pub(crate) fn normalize_to_root_window(hwnd: HWND) -> HWND {
     let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
     if root_hwnd.0.is_null() {
@@ -189,7 +214,7 @@ pub(crate) fn normalize_to_root_window(hwnd: HWND) -> HWND {
 }
 
 /// Check if a window should be skipped based on its title.
-pub(crate) fn should_skip_window_by_title(title: &str) -> bool {
+fn should_skip_window_by_title(title: &str) -> bool {
     const SKIP_TITLES: &[&str] = &[
         "Program Manager",
         "Windows Input Experience",
@@ -237,7 +262,7 @@ fn should_treat_cloak_query_failure_as_cloaked(window_is_valid: bool) -> bool {
 }
 
 /// Check if a window should be skipped based on its class name.
-pub(crate) fn should_skip_window_by_class(class_name: &str) -> bool {
+fn should_skip_window_by_class(class_name: &str) -> bool {
     const SKIP_CLASSES: &[&str] = &[
         "Progman",                    // Program Manager
         "Shell_TrayWnd",              // Taskbar
@@ -263,34 +288,83 @@ pub(crate) fn should_skip_window_by_class(class_name: &str) -> bool {
 /// Returns just the filename (e.g., "notepad.exe"), not the full path.
 /// Returns None if the process cannot be accessed or doesn't exist.
 pub fn get_process_executable(pid: u32) -> Option<String> {
-    unsafe {
-        // Open the process with limited query rights
-        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(h) => h,
-            Err(_) => return None,
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let path = process_image_path(process);
+    let _ = unsafe { CloseHandle(process) };
+    path?.rsplit('\\').next().map(|s| s.to_string())
+}
+
+/// Full Win32 image path of a process handle opened with
+/// `PROCESS_QUERY_LIMITED_INFORMATION`, including paths longer than `MAX_PATH`.
+fn process_image_path(process: HANDLE) -> Option<String> {
+    // Win32 paths are capped at 32767 characters.
+    let mut capacity: usize = 1024;
+    loop {
+        let mut buffer: Vec<u16> = vec![0; capacity];
+        let mut len = capacity as u32;
+        let result = unsafe {
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(buffer.as_mut_ptr()),
+                &mut len,
+            )
         };
-
-        // Get the executable path
-        let mut buffer: Vec<u16> = vec![0; 260]; // MAX_PATH
-        let len = K32GetModuleFileNameExW(Some(handle), None, &mut buffer);
-
-        // Close the handle
-        let _ = CloseHandle(handle);
-
-        if len == 0 {
-            return None;
+        match result {
+            Ok(()) => return Some(String::from_utf16_lossy(&buffer[..len as usize])),
+            Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && capacity < 32_768 => {
+                capacity *= 2;
+            }
+            Err(_) => return None,
         }
-
-        // Convert to string and extract filename
-        let path = String::from_utf16_lossy(&buffer[..len as usize]);
-        path.rsplit('\\').next().map(|s| s.to_string())
     }
 }
 
+/// Identity of the process that owns a window.
+///
+/// Window handles are reused (also across reboots), so a handle recorded by an
+/// earlier daemon run only refers to the same window if its owner still matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: u32,
+    /// Process creation time in FILETIME ticks; 0 when it could not be read.
+    pub(crate) start_time: u64,
+}
+
+/// Owner identity of a live window, or `None` if the handle is not a window.
+pub(crate) fn window_process_identity(window_id: WindowId) -> Option<ProcessIdentity> {
+    let hwnd = window_id_to_hwnd(window_id).ok()?;
+    let mut pid: u32 = 0;
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid == 0 {
+        return None;
+    }
+    Some(ProcessIdentity {
+        pid,
+        start_time: process_start_time(pid).unwrap_or(0),
+    })
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let result =
+        unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let _ = unsafe { CloseHandle(process) };
+    result.ok()?;
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
 /// Mandatory integrity level RID (for example `0x2000` medium, `0x3000` high) of a process.
-fn process_integrity_rid(
-    process: windows::Win32::Foundation::HANDLE,
-) -> Result<u32, windows::core::Error> {
+pub(crate) fn process_integrity_rid(process: HANDLE) -> Result<u32, windows::core::Error> {
     use windows::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
         TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
@@ -298,7 +372,7 @@ fn process_integrity_rid(
     use windows::Win32::System::Threading::OpenProcessToken;
 
     unsafe {
-        let mut token = windows::Win32::Foundation::HANDLE::default();
+        let mut token = HANDLE::default();
         OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
 
         let mut len: u32 = 0;
@@ -339,12 +413,17 @@ fn own_integrity_rid() -> Option<u32> {
 /// Windows blocks moving, resizing and cloaking windows of more privileged
 /// processes (UIPI), for example an administrator terminal when OpenNiri runs
 /// unelevated. Such windows must not be tiled: every placement fails with
-/// "Access is denied" (INC-49). A process whose token cannot be read at all is
-/// treated as more privileged.
+/// "Access is denied" (INC-49).
+///
+/// When the integrity level cannot be read, access denial decides: a process
+/// whose handle (`PROCESS_QUERY_LIMITED_INFORMATION`) or token is refused with
+/// `E_ACCESSDENIED` is treated as more privileged (protected and system
+/// processes). Any other failure, such as a process that already exited, is
+/// treated as not more privileged.
 pub fn is_process_more_privileged(pid: u32) -> bool {
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-    else {
-        return false;
+    let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(process) => process,
+        Err(e) => return e.code() == E_ACCESSDENIED,
     };
     let theirs = process_integrity_rid(process);
     let _ = unsafe { CloseHandle(process) };
@@ -423,5 +502,12 @@ mod tests {
     fn test_own_process_is_not_more_privileged_than_itself() {
         assert!(own_integrity_rid().is_some());
         assert!(!is_process_more_privileged(std::process::id()));
+    }
+
+    #[test]
+    fn test_own_process_executable_and_start_time() {
+        let exe = get_process_executable(std::process::id()).expect("own executable");
+        assert!(exe.to_ascii_lowercase().ends_with(".exe"), "{exe}");
+        assert!(process_start_time(std::process::id()).is_some_and(|t| t > 0));
     }
 }

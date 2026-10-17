@@ -20,6 +20,8 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 
+use crate::cloak::{flush_cloak_journal, track_daemon_cloak, untrack_daemon_cloak};
+use crate::window::window_process_identity;
 use crate::{spawn_message_loop_thread, MessageLoopThread, Win32Error, WindowId};
 
 /// CLSID of the immersive shell, which implements `IServiceProvider`.
@@ -158,6 +160,22 @@ fn service() -> Option<&'static ShellCloakService> {
                 move |state: &mut ShellState| {
                     while let Ok(request) = request_rx.try_recv() {
                         let result = state.set_cloak(request.hwnd, request.cloak);
+                        // Record the outcome here, not in the caller: a caller that
+                        // timed out has moved on, and the tracking set must still
+                        // reflect what actually happened.
+                        let window_id = request.hwnd as WindowId;
+                        match (request.cloak, result.is_ok()) {
+                            // Callers track before asking, so this only adds a window
+                            // an earlier failure of a queued request removed.
+                            (true, true) => {
+                                if track_daemon_cloak(window_id, window_process_identity(window_id))
+                                {
+                                    flush_cloak_journal();
+                                }
+                            }
+                            (true, false) | (false, true) => untrack_daemon_cloak(window_id),
+                            (false, false) => {}
+                        }
                         let _ = request.reply.send(result);
                     }
                 },
@@ -187,9 +205,31 @@ pub(crate) fn available() -> bool {
     service().is_some()
 }
 
+/// Why a shell cloak request did not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShellCloakError {
+    /// The request was never executed (no shell thread).
+    Unavailable(String),
+    /// The shell executed the request and it failed.
+    Failed(String),
+    /// The request is queued but did not complete in time; the shell thread
+    /// still executes it and records the outcome in the cloak tracking set.
+    Pending(String),
+}
+
+impl std::fmt::Display for ShellCloakError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(m) | Self::Failed(m) => f.write_str(m),
+            Self::Pending(m) => write!(f, "{} (request still pending)", m),
+        }
+    }
+}
+
 /// Cloak (`true`) or uncloak (`false`) a window through the shell.
-pub(crate) fn set_cloak(window_id: WindowId, cloak: bool) -> Result<(), String> {
-    let service = service().ok_or_else(|| "shell cloaking unavailable".to_string())?;
+pub(crate) fn set_cloak(window_id: WindowId, cloak: bool) -> Result<(), ShellCloakError> {
+    let service = service()
+        .ok_or_else(|| ShellCloakError::Unavailable("shell cloaking unavailable".to_string()))?;
     let (reply, reply_rx) = mpsc::channel();
     service
         .requests
@@ -198,11 +238,20 @@ pub(crate) fn set_cloak(window_id: WindowId, cloak: bool) -> Result<(), String> 
             cloak,
             reply,
         })
-        .map_err(|_| "shell cloaking thread stopped".to_string())?;
+        .map_err(|_| ShellCloakError::Unavailable("shell cloaking thread stopped".to_string()))?;
     if !service.thread.wake() {
-        return Err("failed to wake shell cloaking thread".to_string());
+        // Queued; it runs with the next request that wakes the thread.
+        return Err(ShellCloakError::Pending(
+            "failed to wake shell cloaking thread".to_string(),
+        ));
     }
-    reply_rx
-        .recv_timeout(REQUEST_TIMEOUT)
-        .map_err(|_| "shell cloaking request timed out".to_string())?
+    match reply_rx.recv_timeout(REQUEST_TIMEOUT) {
+        Ok(result) => result.map_err(ShellCloakError::Failed),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(ShellCloakError::Pending(
+            "shell cloaking request timed out".to_string(),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ShellCloakError::Unavailable(
+            "shell cloaking thread dropped the request".to_string(),
+        )),
+    }
 }
