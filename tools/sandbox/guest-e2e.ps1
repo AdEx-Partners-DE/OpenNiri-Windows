@@ -210,6 +210,15 @@ try {
     Check 'A-default: IPC pipe ACL admits only this user and SYSTEM' ($pipeSddl -like 'O:*D:P*' -and $broad.Count -eq 0) ("{0} -> {1}" -f $pipeName, $pipeSddl)
     $tileProblems = Test-Tiled $tiled
     Check 'A-default: windows are tiled at startup (full height, no overlap)' ($tileProblems.Count -eq 0) ($tileProblems -join '; ')
+
+    # Visible frames (without invisible resize borders) are spaced by the configured gap (10 px).
+    $frames = @($tiled | Where-Object { $_.Cloaked -eq 0 -and (Test-OnScreen $_) } | Sort-Object FX)
+    $gaps = New-Object System.Collections.Generic.List[int]
+    for ($i = 1; $i -lt $frames.Count; $i++) { $gaps.Add($frames[$i].FX - ($frames[$i - 1].FX + $frames[$i - 1].FW)) }
+    $tops = @($frames | ForEach-Object { $_.FY })
+    $badGaps = @($gaps | Where-Object { [Math]::Abs($_ - 10) -gt 2 })
+    $badTops = @($tops | Where-Object { [Math]::Abs($_ - 10) -gt 2 })
+    Check 'A-default: visible gaps between windows match the configured 10 px' ($gaps.Count -ge 2 -and $badGaps.Count -eq 0 -and $badTops.Count -eq 0) ("gaps={0} tops={1}" -f ($gaps -join ','), ($tops -join ','))
     $offscreen = @($tiled | Where-Object { -not (Test-OnScreen $_) -or $_.Cloaked -ne 0 })
     Check 'A-default: strip extends beyond the viewport (some windows hidden)' ($offscreen.Count -ge 1) ("hidden={0}" -f $offscreen.Count)
     $cloakedHidden = @($tiled | Where-Object { $_.Cloaked -ne 0 })
@@ -266,12 +275,18 @@ try {
     Write-Config "[behavior]`nlog_level = `"debug`"`nfocus_follows_mouse = true`nfocus_follows_mouse_delay_ms = 100`n`n[gestures]`nenabled = true`n"
     $daemonProcess = Start-Daemon
     Measure-CursorLatency 'focus-follows-mouse + gesture hooks'
+    # Let focus changes triggered by the latency moves settle first.
+    Start-Sleep -Milliseconds 800
     $visibleNow = @(Get-TestWindows | Where-Object { (Test-OnScreen $_) -and $_.Cloaked -eq 0 })
     $target = $visibleNow | Where-Object { $_.Hwnd -ne [E2E]::Foreground() } | Select-Object -First 1
     if ($null -ne $target) {
-        [void][E2E]::CursorLatencyMs($target.X + [int]($target.W / 2), $target.Y + [int]($target.H / 2), 500)
+        $cx = $target.FX + [int]($target.FW / 2); $cy = $target.FY + [int]($target.FH / 2)
+        [void][E2E]::CursorLatencyMs($cx, $cy, 500)
         Start-Sleep -Milliseconds 900
-        Check 'B-hooks: focus follows mouse onto a visible window' ([E2E]::Foreground() -eq $target.Hwnd) ("target={0} fg={1}" -f $target.Title, [E2E]::Foreground())
+        $fg = [E2E]::Foreground()
+        $under = [E2E]::WindowAt($cx, $cy)
+        $underTitle = (@(Get-TestWindows | Where-Object { $_.Hwnd -eq $under }) | Select-Object -First 1).Title
+        Check 'B-hooks: focus follows mouse onto a visible window' ($fg -eq $target.Hwnd -and $under -eq $target.Hwnd) ("target={0} fg={1} under-cursor={2} ({3})" -f $target.Title, $fg, $under, $underTitle)
     } else {
         Check 'B-hooks: focus follows mouse onto a visible window' $false 'no unfocused visible window to hover'
     }

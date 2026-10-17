@@ -23,6 +23,7 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HWND, LPARAM, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
@@ -1592,7 +1593,7 @@ fn apply_placements_deferred(placements: &[&WindowPlacement]) -> Result<(), Win3
                     continue;
                 }
             };
-            let rect = &placement.rect;
+            let rect = compensate_invisible_border(&placement.rect, invisible_border(hwnd));
 
             match DeferWindowPos(
                 current_hdwp,
@@ -1721,6 +1722,70 @@ fn apply_placements_immediate(placements: &[&WindowPlacement]) -> Result<(), Win
 }
 
 /// Set window position immediately using SetWindowPos.
+/// Invisible frame around a window, per side (left, top, right, bottom).
+///
+/// On Windows 10/11 `GetWindowRect` includes transparent resize borders (about
+/// 7 px at 100% scale) that `DWMWA_EXTENDED_FRAME_BOUNDS` excludes. Without
+/// compensation the visible gaps between tiled windows are larger than
+/// configured and uneven between applications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct InvisibleBorder {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+/// Borders larger than this are not resize borders (e.g. a window mid-animation).
+const MAX_INVISIBLE_BORDER: i32 = 32;
+
+fn invisible_border_from_rects(window: &RECT, frame: &RECT) -> InvisibleBorder {
+    let border = InvisibleBorder {
+        left: frame.left - window.left,
+        top: frame.top - window.top,
+        right: window.right - frame.right,
+        bottom: window.bottom - frame.bottom,
+    };
+    let sane = |v: i32| (0..=MAX_INVISIBLE_BORDER).contains(&v);
+    if sane(border.left) && sane(border.top) && sane(border.right) && sane(border.bottom) {
+        border
+    } else {
+        InvisibleBorder::default()
+    }
+}
+
+fn invisible_border(hwnd: HWND) -> InvisibleBorder {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            return InvisibleBorder::default();
+        }
+        let mut window = RECT::default();
+        let mut frame = RECT::default();
+        if GetWindowRect(hwnd, &mut window).is_err()
+            || DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut frame as *mut RECT as *mut c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_err()
+        {
+            return InvisibleBorder::default();
+        }
+        invisible_border_from_rects(&window, &frame)
+    }
+}
+
+/// Window rectangle that puts the window's *visible* frame at `rect`.
+fn compensate_invisible_border(rect: &Rect, border: InvisibleBorder) -> Rect {
+    Rect::new(
+        rect.x - border.left,
+        rect.y - border.top,
+        rect.width + border.left + border.right,
+        rect.height + border.top + border.bottom,
+    )
+}
+
 fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Error> {
     let window_id = placement.window_id;
     let hwnd = window_id_to_hwnd(window_id)?;
@@ -1729,7 +1794,7 @@ fn set_window_pos_immediate(placement: &WindowPlacement) -> Result<(), Win32Erro
             return Err(Win32Error::WindowNotFound(window_id));
         }
 
-        let rect = &placement.rect;
+        let rect = compensate_invisible_border(&placement.rect, invisible_border(hwnd));
 
         if let Err(e) = SetWindowPos(
             hwnd,
@@ -4210,6 +4275,54 @@ mod tests {
     fn test_own_process_is_not_more_privileged_than_itself() {
         assert!(own_integrity_rid().is_some());
         assert!(!is_process_more_privileged(std::process::id()));
+    }
+
+    #[test]
+    fn test_invisible_border_compensation() {
+        let window = RECT {
+            left: 93,
+            top: 10,
+            right: 507,
+            bottom: 1057,
+        };
+        let frame = RECT {
+            left: 100,
+            top: 10,
+            right: 500,
+            bottom: 1050,
+        };
+        let border = invisible_border_from_rects(&window, &frame);
+        assert_eq!(
+            border,
+            InvisibleBorder {
+                left: 7,
+                top: 0,
+                right: 7,
+                bottom: 7
+            }
+        );
+        // The visible frame lands exactly on the layout rectangle.
+        assert_eq!(
+            compensate_invisible_border(&Rect::new(10, 10, 400, 1040), border),
+            Rect::new(3, 10, 414, 1047)
+        );
+        // Implausible values (e.g. mid-animation) are ignored.
+        let odd = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 1000,
+        };
+        let tiny = RECT {
+            left: 200,
+            top: 200,
+            right: 300,
+            bottom: 300,
+        };
+        assert_eq!(
+            invisible_border_from_rects(&odd, &tiny),
+            InvisibleBorder::default()
+        );
     }
 
     #[test]

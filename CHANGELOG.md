@@ -154,6 +154,8 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 
 ### Fixed
 
+- Gaps between tiled windows now match the configured `gap`/`outer_gap`: placement compensates for the invisible resize borders Windows 10/11 adds around windows (`DWMWA_EXTENDED_FRAME_BOUNDS`). Previously visible gaps were about 14 px larger and differed between applications.
+
 - Windows cloaked by a daemon that crashed or was killed are recorded in `%LOCALAPPDATA%\openniri\cloaked-windows.txt` and restored by `emergency-uncloak`, the panic path and the next daemon start
 - Windows at the edge of the strip are moved fully into view on stop and recovery instead of staying partly off-screen
 - `openniri-cli query all` shows titles for cloaked windows instead of "Unknown"
