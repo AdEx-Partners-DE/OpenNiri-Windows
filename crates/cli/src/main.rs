@@ -1199,19 +1199,19 @@ log_level = "info"
 focus_follows_mouse = false
 
 [hotkeys]
-# Vim-style navigation with Win key
-"Win+H" = "focus_left"
-"Win+L" = "focus_right"
-"Win+J" = "focus_down"
-"Win+K" = "focus_up"
+# Vim-style navigation with Alt (most Win+letter combos are reserved by Windows 11)
+"Alt+H" = "focus_left"
+"Alt+L" = "focus_right"
+"Alt+J" = "focus_down"
+"Alt+K" = "focus_up"
 
-# Move columns with Win+Shift
-"Win+Shift+H" = "move_column_left"
-"Win+Shift+L" = "move_column_right"
+# Move columns with Alt+Shift
+"Alt+Shift+H" = "move_column_left"
+"Alt+Shift+L" = "move_column_right"
 
-# Resize with Win+Ctrl
-"Win+Ctrl+H" = "resize_shrink"
-"Win+Ctrl+L" = "resize_grow"
+# Resize with Alt+Ctrl
+"Alt+Ctrl+H" = "resize_shrink"
+"Alt+Ctrl+L" = "resize_grow"
 
 # Emergency restore + stop daemon
 "Win+Ctrl+Escape" = "panic_revert"
@@ -1219,21 +1219,22 @@ focus_follows_mouse = false
 #"Win+Ctrl+P" = "toggle_pause"
 
 # Close focused window
-"Win+Shift+Q" = "close_window"
+"Alt+Shift+Q" = "close_window"
 
 # Toggle floating / fullscreen
-"Win+F" = "toggle_floating"
-"Win+Shift+F" = "toggle_fullscreen"
+"Alt+F" = "toggle_floating"
+"Alt+Shift+F" = "toggle_fullscreen"
 
 # Column width presets
-"Win+1" = "width_third"
-"Win+2" = "width_half"
-"Win+3" = "width_two_thirds"
-"Win+0" = "equalize_widths"
+"Alt+1" = "width_third"
+"Alt+2" = "width_half"
+"Alt+3" = "width_two_thirds"
+"Alt+0" = "equalize_widths"
 
 [gestures]
-# Touchpad gesture support
-enabled = true
+# Touchpad gesture support (experimental). Swipes are detected from scroll
+# events, so ordinary scrolling can trigger these commands.
+enabled = false
 swipe_left = "focus_left"
 swipe_right = "focus_right"
 swipe_up = "focus_up"
@@ -1335,25 +1336,25 @@ log_level = "info"
 focus_follows_mouse = false
 
 [hotkeys]
-"Win+H" = "focus_left"
-"Win+L" = "focus_right"
-"Win+J" = "focus_down"
-"Win+K" = "focus_up"
-"Win+Shift+H" = "move_column_left"
-"Win+Shift+L" = "move_column_right"
-"Win+Ctrl+H" = "resize_shrink"
-"Win+Ctrl+L" = "resize_grow"
+"Alt+H" = "focus_left"
+"Alt+L" = "focus_right"
+"Alt+J" = "focus_down"
+"Alt+K" = "focus_up"
+"Alt+Shift+H" = "move_column_left"
+"Alt+Shift+L" = "move_column_right"
+"Alt+Ctrl+H" = "resize_shrink"
+"Alt+Ctrl+L" = "resize_grow"
 "Win+Ctrl+Escape" = "panic_revert"
-"Win+Shift+Q" = "close_window"
-"Win+F" = "toggle_floating"
-"Win+Shift+F" = "toggle_fullscreen"
-"Win+1" = "width_third"
-"Win+2" = "width_half"
-"Win+3" = "width_two_thirds"
-"Win+0" = "equalize_widths"
+"Alt+Shift+Q" = "close_window"
+"Alt+F" = "toggle_floating"
+"Alt+Shift+F" = "toggle_fullscreen"
+"Alt+1" = "width_third"
+"Alt+2" = "width_half"
+"Alt+3" = "width_two_thirds"
+"Alt+0" = "equalize_widths"
 
 [gestures]
-enabled = true
+enabled = false
 swipe_left = "focus_left"
 swipe_right = "focus_right"
 swipe_up = "focus_up"
@@ -1694,15 +1695,15 @@ fn handle_setup() -> Result<()> {
     println!("  3. Check health: openniri-cli doctor");
     println!();
     println!("## Default Hotkeys");
-    println!("  Win+H/L    Focus left/right");
-    println!("  Win+J/K    Focus down/up");
-    println!("  Win+Shift+H/L   Move column");
-    println!("  Win+Ctrl+H/L    Resize column");
+    println!("  Alt+H/L    Focus left/right");
+    println!("  Alt+J/K    Focus down/up");
+    println!("  Alt+Shift+H/L   Move column");
+    println!("  Alt+Ctrl+H/L    Resize column");
     println!("  Win+Ctrl+Escape Emergency restore + stop daemon");
-    println!("  Win+F      Toggle floating");
-    println!("  Win+Shift+F     Toggle fullscreen");
-    println!("  Win+1/2/3/0     Column width presets");
-    println!("  Win+Shift+Q     Close focused window");
+    println!("  Alt+F      Toggle floating");
+    println!("  Alt+Shift+F     Toggle fullscreen");
+    println!("  Alt+1/2/3/0     Column width presets");
+    println!("  Alt+Shift+Q     Close focused window");
     println!();
     println!("## Optional: Enable Auto-Start");
     println!("  openniri-cli autostart enable");
@@ -2541,7 +2542,8 @@ mod tests {
     fn test_generate_default_config_contains_gestures() {
         let config = generate_default_config();
         assert!(config.contains("[gestures]"));
-        assert!(config.contains("enabled = true"));
+        assert!(config.contains("[gestures]\n# Touchpad gesture support (experimental)"));
+        assert!(config.contains("(experimental). Swipes are detected from scroll\n# events, so ordinary scrolling can trigger these commands.\nenabled = false"));
     }
 
     #[test]

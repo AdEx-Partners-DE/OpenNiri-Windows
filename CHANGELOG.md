@@ -124,6 +124,12 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 
 ### Changed
 
+- **Default hotkeys now use Alt instead of Win** (`Alt+H/J/K/L` focus, `Alt+Shift+H/L` move column, `Alt+Ctrl+H/L` resize, `Alt+F` / `Alt+Shift+F` floating/fullscreen, `Alt+1/2/3/0` widths, `Alt+Shift+Q` close, `Alt+Shift+R` refresh). Most `Win+letter` combinations are reserved by Windows 11 and `Win+L` can never be registered. Monitor bindings (`Win+Alt+...`) and the `Win+Ctrl+Escape` panic key are unchanged. Existing config files keep their bindings.
+- Hotkeys that register are kept when others fail; each failed hotkey is logged by name (previously one failure disabled all hotkeys, including the panic key)
+- Touchpad gestures are off by default and marked experimental: swipes are detected from scroll-wheel deltas, so ordinary scrolling triggered them
+- Five consecutive failed layout applications pause tiling, stop animations and restore window visibility
+- Windows of processes running with higher privileges than OpenNiri (for example an administrator terminal) are no longer tiled
+
 - Focused event handler now updates `previous_focused_hwnd` for all managed windows including floating, making ToggleFloating roundtrip reliable (iter 40)
 - Event validation skips `is_valid_window` for already-managed windows, preventing racy event drops during focus transitions (iter 40)
 - ToggleFloating roundtrip test rewritten to use `handle_window_event(Focused(...))` instead of direct internal-field mutation (iter 40)
@@ -138,6 +144,14 @@ As of 2026-02-07, this project has not had a tagged public release yet. All work
 - AppState refactored from single workspace to per-monitor HashMap of workspaces (iter 11)
 
 ### Fixed
+
+- WinEvent hooks, mouse hooks and the tray icon now run on threads with a message loop. They used to sit on the async main thread, which caused cursor lag after start, late or missing window events, gestures that never fired and an unresponsive tray menu (#12)
+- Uncloak is only attempted for windows that are cloaked, and a denied cloak falls back to moving the window off-screen; this ends the repeated `DwmSetWindowAttribute(CLOAK=0) failed` errors and failed layout passes, also with `use_cloaking = false` (#12)
+- A failed layout pass no longer forces the foreground window during rollback, which kept stealing focus during animations (INC-49)
+- Closing a child window (tab, browser pane) no longer removes its still-open top-level window from management
+- Tiled windows snap back when the user finishes dragging or resizing them (`EVENT_SYSTEM_MOVESIZEEND`) instead of on every position change, which fought the drag. Maximizing, Win+Arrow snapping or an app moving itself no longer triggers a snap-back; the next layout pass corrects the position
+- New windows are adopted when first shown or uncloaked (`EVENT_OBJECT_SHOW`, `EVENT_OBJECT_UNCLOAKED`), not only when created; most apps create their window hidden
+- Cloak/uncloak errors now include the HRESULT
 
 - Restored scroll offsets no longer overwritten by `ensure_focused_visible()` during startup (iter 38)
 - Banner and tray tooltip now show true OS-registered hotkey count instead of parsed-config count (iter 38)

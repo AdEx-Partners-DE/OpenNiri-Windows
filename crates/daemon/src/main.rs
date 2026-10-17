@@ -22,9 +22,9 @@ use openniri_ipc::{
 };
 use openniri_platform_win32::{
     enumerate_monitors, enumerate_windows, find_monitor_for_rect, get_process_executable,
-    install_event_hooks, install_mouse_hook, monitor_to_left, monitor_to_right,
-    overlay::OverlayWindow, parse_hotkey_string, register_gestures, register_hotkeys,
-    restore_windows_moved_offscreen, set_display_change_sender, set_dpi_awareness,
+    monitor_to_left, monitor_to_right, overlay::OverlayWindow, parse_hotkey_string,
+    register_hotkeys, restore_windows_moved_offscreen, set_display_change_sender,
+    set_dpi_awareness, spawn_event_hook_thread, spawn_gesture_thread, spawn_mouse_hook_thread,
     uncloak_all_managed_windows, uncloak_all_visible_windows, GestureEvent, Hotkey, HotkeyEvent,
     HotkeyId, MonitorId, MonitorInfo, PlatformConfig, WindowEvent,
 };
@@ -102,6 +102,11 @@ const IPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Max time allowed for a single Win32 placement apply call.
 const APPLY_LAYOUT_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Consecutive failed layout applications after which tiling pauses itself.
+///
+/// A failing apply repeats on every animation frame (about 60 per second); left
+/// running it fights the user for window visibility and focus (INC-49).
+const APPLY_FAILURE_BREAKER_THRESHOLD: u32 = 5;
 /// Poll interval for cooperative timed thread joins.
 const JOIN_WITH_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Suppress MovedOrResized events briefly after placements are applied.
@@ -216,6 +221,8 @@ struct AppState {
     pending_apply_workers: Vec<std::thread::JoinHandle<()>>,
     /// Max time allowed for Win32 placement calls before auto-pausing tiling.
     layout_apply_timeout: Duration,
+    /// Failed layout applications since the last success.
+    consecutive_apply_failures: u32,
     /// Daemon start time for uptime reporting.
     start_time: std::time::Instant,
     /// Injected window info for testing. When set, `lookup_window_info()` returns
@@ -304,6 +311,7 @@ impl AppState {
             apply_epoch: Arc::new(AtomicU64::new(0)),
             pending_apply_workers: Vec::new(),
             layout_apply_timeout: APPLY_LAYOUT_TIMEOUT,
+            consecutive_apply_failures: 0,
             start_time: std::time::Instant::now(),
             #[cfg(test)]
             injected_window_info: HashMap::new(),
@@ -650,7 +658,41 @@ impl AppState {
     /// Recalculate layout and apply placements for all monitors.
     /// Uses animated offsets if any workspace has an active animation.
     /// No-op when tiling is paused.
+    ///
+    /// After [`APPLY_FAILURE_BREAKER_THRESHOLD`] consecutive failures, tiling is
+    /// paused, animations stop, and window visibility is restored.
     fn apply_layout(&mut self) -> Result<()> {
+        let result = self.apply_layout_once();
+        match &result {
+            Ok(()) => self.consecutive_apply_failures = 0,
+            Err(e) => {
+                self.consecutive_apply_failures = self.consecutive_apply_failures.saturating_add(1);
+                if !self.paused
+                    && self.consecutive_apply_failures >= APPLY_FAILURE_BREAKER_THRESHOLD
+                {
+                    self.trip_apply_failure_breaker(e);
+                }
+            }
+        }
+        result
+    }
+
+    /// Pause tiling after repeated apply failures and make every managed window visible.
+    fn trip_apply_failure_breaker(&mut self, last_error: &anyhow::Error) {
+        warn!(
+            "Layout application failed {} times in a row (last error: {}); pausing tiling and restoring window visibility. Resume with toggle-pause once the cause is fixed.",
+            self.consecutive_apply_failures, last_error
+        );
+        self.paused = true;
+        self.consecutive_apply_failures = 0;
+        for workspace in self.workspaces.values_mut() {
+            workspace.cancel_animation();
+        }
+        let managed_window_ids = self.all_managed_window_ids();
+        run_visibility_recovery_pass(&managed_window_ids, "apply-failure-breaker");
+    }
+
+    fn apply_layout_once(&mut self) -> Result<()> {
         let reaped_workers = self.reap_finished_pending_apply_workers();
         if reaped_workers > 0 {
             let managed_window_ids = self.all_managed_window_ids();
@@ -853,6 +895,11 @@ impl AppState {
                     "Ignoring window by rule: {} ({})",
                     win_info.title, win_info.class_name
                 );
+                continue;
+            }
+
+            if is_process_more_privileged_than_daemon(win_info.process_id) {
+                log_skipped_privileged_window(&win_info.title);
                 continue;
             }
 
@@ -1577,6 +1624,11 @@ impl AppState {
                         return;
                     }
 
+                    if is_process_more_privileged_than_daemon(win_info.process_id) {
+                        log_skipped_privileged_window(&win_info.title);
+                        return;
+                    }
+
                     // Determine which monitor this window should be on
                     let monitors: Vec<_> = self.monitors.values().cloned().collect();
                     let monitor_id = find_monitor_for_rect(&monitors, &win_info.rect)
@@ -1947,12 +1999,14 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
     // Build hotkey definitions and command mapping
     let mut hotkeys = Vec::new();
     let mut mapping = HashMap::new();
+    let mut key_names: HashMap<HotkeyId, &str> = HashMap::new();
     let mut next_id: HotkeyId = 1;
 
     for (key_str, cmd_str) in config_hotkeys {
         if let Some((modifiers, vk)) = parse_hotkey_string(key_str) {
             if let Some(cmd) = config::parse_command(cmd_str) {
                 hotkeys.push(Hotkey::new(next_id, modifiers, vk));
+                key_names.insert(next_id, key_str.as_str());
                 mapping.insert(next_id, cmd);
                 debug!(
                     "Configured hotkey {}: {} -> {:?}",
@@ -2002,6 +2056,8 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
                 }
             }
 
+            report_unregistered_hotkeys(&handle, &mapping, &key_names);
+
             let registered_count = handle.registered_count();
             HotkeyState {
                 handle: Some(handle),
@@ -2021,6 +2077,56 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
                 requested_count,
                 registered_count: 0,
             }
+        }
+    }
+}
+
+/// Whether a window's process is more privileged than the daemon (see
+/// [`openniri_platform_win32::is_process_more_privileged`]). Tests use fake
+/// process ids, so the check is disabled there.
+fn is_process_more_privileged_than_daemon(process_id: u32) -> bool {
+    #[cfg(test)]
+    {
+        let _ = process_id;
+        false
+    }
+    #[cfg(not(test))]
+    {
+        openniri_platform_win32::is_process_more_privileged(process_id)
+    }
+}
+
+fn log_skipped_privileged_window(title: &str) {
+    info!(
+        "Not managing window '{}': OpenNiri cannot read its process's privilege level or it runs with higher privileges (for example as administrator), so Windows would block moving it",
+        title
+    );
+}
+
+/// Log each configured hotkey that could not be registered.
+fn report_unregistered_hotkeys(
+    handle: &openniri_platform_win32::HotkeyHandle,
+    mapping: &HashMap<HotkeyId, IpcCommand>,
+    key_names: &HashMap<HotkeyId, &str>,
+) {
+    let mut ids: Vec<HotkeyId> = mapping.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        if handle.is_registered(id) {
+            continue;
+        }
+        let key = key_names.get(&id).copied().unwrap_or("?");
+        if matches!(mapping.get(&id), Some(IpcCommand::PanicRevert)) {
+            warn!(
+                "Emergency hotkey {} (panic_revert) could not be registered; use `openniri-cli panic-revert` or the tray menu instead",
+                key
+            );
+        } else {
+            warn!(
+                "Hotkey {} -> {:?} could not be registered (already used by Windows or another application)",
+                key,
+                mapping.get(&id)
+            );
         }
     }
 }
@@ -2740,10 +2846,10 @@ async fn main() -> Result<()> {
     let mut thread_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     // Install WinEvent hooks for window lifecycle tracking (if enabled in config)
-    let _hook_handle = if config.behavior.track_focus_changes {
-        match install_event_hooks() {
+    let hook_thread = if config.behavior.track_focus_changes {
+        match spawn_event_hook_thread() {
             Ok((handle, event_receiver)) => {
-                info!("WinEvent hooks installed");
+                info!("WinEvent hooks installed on dedicated message-loop thread");
 
                 // Spawn task to forward window events from std::sync::mpsc to tokio channel
                 match spawn_forwarding_thread(
@@ -2806,9 +2912,9 @@ async fn main() -> Result<()> {
     };
 
     // Install mouse hook for focus-follows-mouse (if enabled)
-    let _mouse_hook_handle = if config.behavior.focus_follows_mouse {
+    let mouse_hook_thread = if config.behavior.focus_follows_mouse {
         let (mouse_tx, mouse_rx) = std::sync::mpsc::channel::<WindowEvent>();
-        match install_mouse_hook(mouse_tx) {
+        match spawn_mouse_hook_thread(mouse_tx) {
             Ok(handle) => {
                 info!(
                     "Focus-follows-mouse enabled (delay: {}ms)",
@@ -2842,8 +2948,8 @@ async fn main() -> Result<()> {
     };
 
     // Register gesture detection (if enabled)
-    let _gesture_handle = if config.gestures.enabled {
-        match register_gestures() {
+    let gesture_thread = if config.gestures.enabled {
+        match spawn_gesture_thread() {
             Ok((handle, gesture_receiver)) => {
                 info!("Gesture detection enabled");
 
@@ -3425,6 +3531,15 @@ async fn main() -> Result<()> {
         handle.abort();
     }
 
+    // Unhook first: removing the hooks drops the global senders, and dropping the
+    // tray stops its menu thread, so those forwarding threads see a closed channel.
+    // Dropping the receiver unblocks any forwarder waiting on a full channel.
+    drop(hook_thread);
+    drop(mouse_hook_thread);
+    drop(gesture_thread);
+    drop(tray_manager);
+    drop(event_rx);
+
     // Join forwarding threads with timeout for graceful shutdown
     info!("Waiting for forwarding threads to exit...");
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3836,6 +3951,46 @@ mod tests {
         let resp = state.handle_command(IpcCommand::TogglePause);
         assert_eq!(resp, IpcResponse::Ok);
         assert!(!state.paused, "second toggle_pause should resume tiling");
+    }
+
+    #[test]
+    fn test_repeated_apply_failures_trip_breaker_and_pause_tiling() {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndFail(
+            Duration::from_millis(1),
+        ));
+
+        for attempt in 1..APPLY_FAILURE_BREAKER_THRESHOLD {
+            assert!(state.apply_layout().is_err());
+            assert!(!state.paused, "attempt {} should not pause yet", attempt);
+            assert_eq!(state.consecutive_apply_failures, attempt);
+        }
+
+        assert!(state.apply_layout().is_err());
+        assert!(state.paused, "breaker should pause tiling");
+        assert_eq!(state.consecutive_apply_failures, 0);
+
+        // Paused apply is a no-op that succeeds and does not count as a failure.
+        assert!(state.apply_layout().is_ok());
+        assert_eq!(state.consecutive_apply_failures, 0);
+    }
+
+    #[test]
+    fn test_successful_apply_resets_failure_count() {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndFail(
+            Duration::from_millis(1),
+        ));
+        assert!(state.apply_layout().is_err());
+        assert!(state.apply_layout().is_err());
+        assert_eq!(state.consecutive_apply_failures, 2);
+
+        state.injected_apply_placements_behavior = Some(
+            TestApplyPlacementsBehavior::SleepAndSucceed(Duration::from_millis(1)),
+        );
+        assert!(state.apply_layout().is_ok());
+        assert_eq!(state.consecutive_apply_failures, 0);
+        assert!(!state.paused);
     }
 
     #[test]

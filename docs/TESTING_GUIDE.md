@@ -61,7 +61,7 @@ Logs go to `%TEMP%\openniri-daemon.log` when launched via `openniri-cli run`.
 
 ### 2. Hotkey Navigation
 
-**Steps**: Press `Win+H` (focus left), `Win+L` (focus right), `Win+J` (focus down), `Win+K` (focus up).
+**Steps**: Press `Alt+H` (focus left), `Alt+L` (focus right), `Alt+J` (focus down), `Alt+K` (focus up).
 
 **Expected**:
 - Focus moves between windows/columns
@@ -101,7 +101,7 @@ Logs go to `%TEMP%\openniri-daemon.log` when launched via `openniri-cli run`.
 
 ### 5. Floating Toggle
 
-**Steps**: Focus a window. Press `Win+F` to float it. Press `Win+F` again to unfloat.
+**Steps**: Focus a window. Press `Alt+F` to float it. Press `Alt+F` again to unfloat.
 
 **Expected**:
 - Floating: window is freed from tiling, can be moved/resized freely
@@ -113,7 +113,7 @@ Logs go to `%TEMP%\openniri-daemon.log` when launched via `openniri-cli run`.
 
 ### 6. Fullscreen Toggle
 
-**Steps**: Focus a window. Press `Win+Shift+F` to enter fullscreen. Press again to exit.
+**Steps**: Focus a window. Press `Alt+Shift+F` to enter fullscreen. Press again to exit.
 
 **Expected**:
 - Fullscreen: window fills the entire monitor work area, other windows hidden
@@ -174,7 +174,7 @@ Logs go to `%TEMP%\openniri-daemon.log` when launched via `openniri-cli run`.
 
 ### 11. Fullscreen + Minimize
 
-**Steps**: Enter fullscreen (`Win+Shift+F`). Minimize the fullscreen window.
+**Steps**: Enter fullscreen (`Alt+Shift+F`). Minimize the fullscreen window.
 
 **Expected**:
 - Fullscreen mode exits
@@ -199,7 +199,7 @@ Logs go to `%TEMP%\openniri-daemon.log` when launched via `openniri-cli run`.
 
 ### 13. Column Resize
 
-**Steps**: Press `Win+Ctrl+H` (decrease width) or `Win+Ctrl+L` (increase width). Also try presets: `Win+1` (1/3), `Win+2` (1/2), `Win+3` (2/3), `Win+0` (equalize).
+**Steps**: Press `Alt+Ctrl+H` (decrease width) or `Alt+Ctrl+L` (increase width). Also try presets: `Alt+1` (1/3), `Alt+2` (1/2), `Alt+3` (2/3), `Alt+0` (equalize).
 
 **Expected**:
 - Column width changes with snap hint overlay briefly visible
@@ -404,7 +404,7 @@ openniri-cli stop
 
 ### Running manually (without PowerShell)
 
-If you prefer manual testing: start the daemon, open Notepad, press `Win+H` / `Win+L` to navigate, press `Win+F` to toggle floating, then run `openniri-cli stop` from a terminal.
+If you prefer manual testing: start the daemon, open Notepad, press `Alt+H` / `Alt+L` to navigate, press `Alt+F` to toggle floating, then run `openniri-cli stop` from a terminal.
 
 ---
 

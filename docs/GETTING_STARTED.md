@@ -68,7 +68,7 @@ If the tray icon is not visible, open the Windows "hidden icons" panel and pin O
 
 ### 3. Verify It Works
 
-Try pressing `Win+H` and `Win+L` to move focus between windows, or run:
+Try pressing `Alt+H` and `Alt+L` to move focus between windows, or run:
 
 ```
 openniri-cli status
@@ -96,31 +96,31 @@ This checks your binary, config, daemon status, admin privileges, and Windows ve
 
 ## Default Hotkeys
 
-All hotkeys use the `Win` key as the modifier:
+Most default hotkeys use `Alt` as the modifier, because most `Win+letter` combinations are reserved by Windows 11 (`Win+L` can never be registered), like GlazeWM. Monitor and emergency hotkeys use `Win`. Existing config files keep whatever bindings they contain. Hotkeys that cannot be registered are logged by name and the rest stay active:
 
 | Key | Action |
 |-----|--------|
-| `Win+H` | Focus column to the left |
-| `Win+L` | Focus column to the right |
-| `Win+J` | Focus window below (stacked columns) |
-| `Win+K` | Focus window above (stacked columns) |
-| `Win+Shift+H` | Move column left |
-| `Win+Shift+L` | Move column right |
-| `Win+Ctrl+H` | Shrink column width |
-| `Win+Ctrl+L` | Grow column width |
+| `Alt+H` | Focus column to the left |
+| `Alt+L` | Focus column to the right |
+| `Alt+J` | Focus window below (stacked columns) |
+| `Alt+K` | Focus window above (stacked columns) |
+| `Alt+Shift+H` | Move column left |
+| `Alt+Shift+L` | Move column right |
+| `Alt+Ctrl+H` | Shrink column width |
+| `Alt+Ctrl+L` | Grow column width |
 | `Win+Ctrl+Escape` | Emergency visibility restore + daemon panic-revert |
 | `Win+Alt+H` | Focus monitor to the left |
 | `Win+Alt+L` | Focus monitor to the right |
 | `Win+Alt+Shift+H` | Move window to monitor left |
 | `Win+Alt+Shift+L` | Move window to monitor right |
-| `Win+Shift+Q` | Close focused window |
-| `Win+F` | Toggle floating mode |
-| `Win+Shift+F` | Toggle fullscreen |
-| `Win+1` | Set column width to 1/3 viewport |
-| `Win+2` | Set column width to 1/2 viewport |
-| `Win+3` | Set column width to 2/3 viewport |
-| `Win+0` | Equalize all column widths |
-| `Win+R` | Refresh (re-enumerate windows) |
+| `Alt+Shift+Q` | Close focused window |
+| `Alt+F` | Toggle floating mode |
+| `Alt+Shift+F` | Toggle fullscreen |
+| `Alt+1` | Set column width to 1/3 viewport |
+| `Alt+2` | Set column width to 1/2 viewport |
+| `Alt+3` | Set column width to 2/3 viewport |
+| `Alt+0` | Equalize all column widths |
+| `Alt+Shift+R` | Refresh (re-enumerate windows) |
 
 All hotkeys can be customized in `config.toml` under the `[hotkeys]` section.
 
@@ -144,8 +144,8 @@ focus_follows_mouse = true    # Hover to focus
 focus_new_windows = true      # Auto-focus new windows
 
 [hotkeys]
-"Win+H" = "focus_left"
-"Win+L" = "focus_right"
+"Alt+H" = "focus_left"
+"Alt+L" = "focus_right"
 # Add your own bindings here
 ```
 

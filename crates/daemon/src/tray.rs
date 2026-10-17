@@ -5,12 +5,15 @@
 //! - Reload configuration
 //! - Exit daemon
 
-use std::sync::mpsc;
+use openniri_platform_win32::{spawn_message_loop_thread, MessageLoopThread, Win32Error};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIcon, TrayIconBuilder,
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 /// Menu item IDs for tray context menu.
@@ -43,108 +46,82 @@ pub enum TrayEvent {
     EmergencyUncloakAll,
 }
 
+/// Updates sent from the daemon to the tray thread.
+enum TrayCommand {
+    SetPauseText(&'static str),
+    SetTooltip(String),
+}
+
 /// Manages the system tray icon and context menu.
+///
+/// The tray icon and its menu live on a dedicated message-loop thread. The tray
+/// window receives clicks through that thread's message queue; created on the
+/// tokio main thread, which never pumps messages, the menu (including
+/// "Emergency: Uncloak All Windows") did not respond.
 pub struct TrayManager {
+    thread: MessageLoopThread,
+    commands: mpsc::Sender<TrayCommand>,
+    /// Tells the menu-event thread to exit, which closes the tray event channel.
+    menu_thread_stop: Arc<AtomicBool>,
+}
+
+impl Drop for TrayManager {
+    fn drop(&mut self) {
+        self.menu_thread_stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Tray objects owned by the tray thread. `MenuItem` is `!Send`.
+struct TrayUi {
     tray: TrayIcon,
     /// The pause/resume menu item, kept for dynamic text updates.
     pause_item: MenuItem,
+}
+
+impl TrayUi {
+    fn apply(&self, command: TrayCommand) {
+        match command {
+            TrayCommand::SetPauseText(text) => self.pause_item.set_text(text),
+            TrayCommand::SetTooltip(tooltip) => {
+                let _ = self.tray.set_tooltip(Some(&tooltip));
+            }
+        }
+    }
 }
 
 impl TrayManager {
     /// Create a new tray manager with icon and context menu.
     ///
     /// The provided sender will receive tray events when menu items are clicked.
-    /// The sender should be a std::sync::mpsc::Sender that can be passed to the
-    /// event thread.
     pub fn new(event_sender: mpsc::Sender<TrayEvent>) -> Result<Self, TrayError> {
-        // Create context menu
-        let menu = Menu::new();
-
-        // Title item (disabled)
-        let title = MenuItem::new("OpenNiri Windows", false, None);
-        menu.append(&title)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Separator
-        menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Refresh Windows
-        let refresh = MenuItem::with_id(menu_ids::REFRESH, "Refresh Windows", true, None);
-        menu.append(&refresh)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Reload Config
-        let reload = MenuItem::with_id(menu_ids::RELOAD, "Reload Config", true, None);
-        menu.append(&reload)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Toggle Pause
-        let toggle_pause = MenuItem::with_id(menu_ids::TOGGLE_PAUSE, "Pause Tiling", true, None);
-        menu.append(&toggle_pause)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Open Config
-        let open_config = MenuItem::with_id(menu_ids::OPEN_CONFIG, "Open Config", true, None);
-        menu.append(&open_config)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // View Logs
-        let view_logs = MenuItem::with_id(menu_ids::VIEW_LOGS, "View Logs", true, None);
-        menu.append(&view_logs)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Emergency: Uncloak All Windows
-        let emergency_uncloak = MenuItem::with_id(
-            menu_ids::EMERGENCY_UNCLOAK_ALL,
-            "Emergency: Uncloak All Windows",
-            true,
-            None,
-        );
-        menu.append(&emergency_uncloak)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Separator
-        menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Exit
-        let exit = MenuItem::with_id(menu_ids::EXIT, "Exit", true, None);
-        menu.append(&exit)
-            .map_err(|e| TrayError::Menu(e.to_string()))?;
-
-        // Create the tray icon with a simple embedded icon
-        let icon = create_default_icon()?;
-
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("OpenNiri Windows - Tiling Window Manager")
-            .with_icon(icon)
-            .build()
-            .map_err(|e| TrayError::Build(e.to_string()))?;
-
-        info!("System tray icon created");
-
-        // Spawn thread to handle menu events and forward them
-        std::thread::spawn(move || {
-            let menu_channel = MenuEvent::receiver();
-            while let Ok(event) = menu_channel.recv() {
-                let Some(tray_event) = map_menu_id_to_event(event.id.0.as_str()) else {
-                    debug!("Unknown menu item clicked: {}", event.id.0);
-                    continue;
-                };
-
-                if event_sender.send(tray_event).is_err() {
-                    // Receiver dropped, exit thread
-                    break;
+        let (commands, command_rx) = mpsc::channel::<TrayCommand>();
+        let menu_thread_stop = Arc::new(AtomicBool::new(false));
+        let stop = menu_thread_stop.clone();
+        let (thread, ()) = spawn_message_loop_thread(
+            "openniri-tray",
+            move || {
+                build_tray_ui(event_sender, stop)
+                    .map(|ui| (ui, ()))
+                    .map_err(|e| Win32Error::HookInstallFailed(e.to_string()))
+            },
+            move |ui: &mut TrayUi| {
+                while let Ok(command) = command_rx.try_recv() {
+                    ui.apply(command);
                 }
-            }
-        });
-
+            },
+        )
+        .map_err(|e| TrayError::Build(e.to_string()))?;
         Ok(Self {
-            tray,
-            pause_item: toggle_pause,
+            thread,
+            commands,
+            menu_thread_stop,
         })
+    }
+
+    fn send(&self, command: TrayCommand) {
+        if self.commands.send(command).is_ok() {
+            self.thread.wake();
+        }
     }
 
     /// Update the pause menu item text based on the current paused state.
@@ -154,7 +131,7 @@ impl TrayManager {
         } else {
             "Pause Tiling"
         };
-        self.pause_item.set_text(text);
+        self.send(TrayCommand::SetPauseText(text));
     }
 
     /// Update the tray tooltip to reflect current state.
@@ -169,8 +146,112 @@ impl TrayManager {
         hotkey_mismatch: Option<(usize, usize)>,
     ) {
         let tooltip = format_tooltip_text(window_count, monitor_count, paused, hotkey_mismatch);
-        let _ = self.tray.set_tooltip(Some(&tooltip));
+        self.send(TrayCommand::SetTooltip(tooltip));
     }
+}
+
+/// Build the tray icon and menu. Must run on the thread that pumps tray messages.
+fn build_tray_ui(
+    event_sender: mpsc::Sender<TrayEvent>,
+    stop: Arc<AtomicBool>,
+) -> Result<TrayUi, TrayError> {
+    // Create context menu
+    let menu = Menu::new();
+
+    // Title item (disabled)
+    let title = MenuItem::new("OpenNiri Windows", false, None);
+    menu.append(&title)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Separator
+    menu.append(&PredefinedMenuItem::separator())
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Refresh Windows
+    let refresh = MenuItem::with_id(menu_ids::REFRESH, "Refresh Windows", true, None);
+    menu.append(&refresh)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Reload Config
+    let reload = MenuItem::with_id(menu_ids::RELOAD, "Reload Config", true, None);
+    menu.append(&reload)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Toggle Pause
+    let toggle_pause = MenuItem::with_id(menu_ids::TOGGLE_PAUSE, "Pause Tiling", true, None);
+    menu.append(&toggle_pause)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Open Config
+    let open_config = MenuItem::with_id(menu_ids::OPEN_CONFIG, "Open Config", true, None);
+    menu.append(&open_config)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // View Logs
+    let view_logs = MenuItem::with_id(menu_ids::VIEW_LOGS, "View Logs", true, None);
+    menu.append(&view_logs)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Emergency: Uncloak All Windows
+    let emergency_uncloak = MenuItem::with_id(
+        menu_ids::EMERGENCY_UNCLOAK_ALL,
+        "Emergency: Uncloak All Windows",
+        true,
+        None,
+    );
+    menu.append(&emergency_uncloak)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Separator
+    menu.append(&PredefinedMenuItem::separator())
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Exit
+    let exit = MenuItem::with_id(menu_ids::EXIT, "Exit", true, None);
+    menu.append(&exit)
+        .map_err(|e| TrayError::Menu(e.to_string()))?;
+
+    // Create the tray icon with a simple embedded icon
+    let icon = create_default_icon()?;
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("OpenNiri Windows - Tiling Window Manager")
+        .with_icon(icon)
+        .build()
+        .map_err(|e| TrayError::Build(e.to_string()))?;
+
+    info!("System tray icon created");
+
+    // Spawn thread to handle menu events and forward them
+    // Icon events (hover, clicks on the icon itself) are unused; without a handler
+    // they accumulate in tray-icon's unbounded global channel.
+    TrayIconEvent::set_event_handler(Some(|_event: TrayIconEvent| {}));
+
+    std::thread::spawn(move || {
+        let menu_channel = MenuEvent::receiver();
+        while !stop.load(Ordering::SeqCst) {
+            let event = match menu_channel.recv_timeout(Duration::from_millis(200)) {
+                Ok(event) => event,
+                Err(e) if e.is_timeout() => continue,
+                Err(_) => break,
+            };
+            let Some(tray_event) = map_menu_id_to_event(event.id.0.as_str()) else {
+                debug!("Unknown menu item clicked: {}", event.id.0);
+                continue;
+            };
+
+            if event_sender.send(tray_event).is_err() {
+                // Receiver dropped, exit thread
+                break;
+            }
+        }
+    });
+
+    Ok(TrayUi {
+        tray,
+        pause_item: toggle_pause,
+    })
 }
 
 fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {

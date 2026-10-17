@@ -50,14 +50,25 @@ Quick-reference for diagnosing and resolving the most common OpenNiri-Windows is
 
 ## Hotkeys Don't Work
 
-**Symptoms**: Pressing Win+H/L/J/K does nothing.
+**Symptoms**: Pressing Alt+H/L/J/K does nothing.
 
 **Steps**:
 1. Check if the daemon is running: `openniri-cli status`
-2. Check for hotkey registration failures in the log — look for "Failed to register hotkey"
+2. Check for hotkey registration failures in the log — look for "Failed to register hotkey". Registration is not all-or-nothing: hotkeys that register stay active, each failure is logged by name, and the tray tooltip shows the registered/requested mismatch. Most `Win+letter` combinations are reserved by Windows 11, so the defaults use `Alt`.
 3. Check for conflicts with other apps (PowerToys, AutoHotkey, display drivers, game overlays). Temporarily close them and reload: `openniri-cli reload`
 4. If running as a non-admin user and the focused app is elevated (Admin), hotkeys may not reach the daemon. Try launching the daemon elevated (not recommended for daily use).
 5. Safe mode fallback: stop the daemon, confirm shutdown with `openniri-cli status` (must fail: timeout OR "Daemon is not running..."), then restart in safe mode via `openniri-cli run --safe-mode` and control via CLI commands.
+
+---
+
+## Tiling Paused Itself
+
+**Symptoms**: Windows stop being tiled and the log shows repeated layout errors.
+
+**Steps**:
+1. If layout application fails 5 times in a row, OpenNiri pauses tiling, stops animations and restores window visibility.
+2. Find and fix the cause in the log (look for "Failed to apply layout").
+3. Resume with `openniri-cli toggle-pause` (or tray **Resume Tiling**).
 
 ---
 
@@ -127,7 +138,7 @@ Quick-reference for diagnosing and resolving the most common OpenNiri-Windows is
 
 **Steps**:
 1. Check if scroll animations are stuck: try `openniri-cli refresh` to reset state.
-2. Disable gesture detection if not needed:
+2. Gestures are experimental and off by default (swipes are detected from mouse-wheel deltas, so ordinary scrolling can trigger them). If you enabled them, disable if not needed:
    ```toml
    [gestures]
    enabled = false

@@ -232,7 +232,7 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - System tray icon with context menu (Pause/Resume, Refresh Windows, Reload Config, Open Config, View Logs, Emergency: Uncloak All Windows, Exit)
   - Visual snap hints overlay (enabled by default)
   - Focus follows mouse with configurable delay
-  - Touchpad gesture support (enabled by default)
+  - Touchpad gesture support (experimental, off by default)
   - Workspace state persistence
   - Ctrl+C shutdown handling routed into daemon event loop
   - Shutdown cleanup: save state + uncloak managed windows
@@ -280,15 +280,15 @@ OpenNiri-Windows is structured as a Rust workspace with five crates, each with d
   - Visual snap hints (overlay window, enabled by default)
   - Focus follows mouse (low-level mouse hook with debouncing)
   - Display change detection and monitor reconciliation
-  - Touchpad gesture support (low-level mouse hook with wheel accumulation, enabled by default)
+  - Touchpad gesture support (low-level mouse hook with wheel accumulation, experimental, off by default)
   - Workspace state persistence (save/restore across restarts)
   - HWND validation on window events
   - catch_unwind in all Win32 callbacks
   - SetForegroundWindow for actual focus changes
-  - CloseWindow command (Win+Shift+Q)
-  - ToggleFloating command (Win+F)
-  - ToggleFullscreen command (Win+Shift+F)
-  - SetColumnWidth presets (Win+1/2/3) and EqualizeColumnWidths (Win+0)
+  - CloseWindow command (Alt+Shift+Q)
+  - ToggleFloating command (Alt+F)
+  - ToggleFullscreen command (Alt+Shift+F)
+  - SetColumnWidth presets (Alt+1/2/3) and EqualizeColumnWidths (Alt+0)
   - Active window border (DWM)
   - QueryStatus command
   - PanicRevert command

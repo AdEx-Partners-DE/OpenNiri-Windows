@@ -1,6 +1,6 @@
 {
   "plan_id": "codex_fix_plan_review_32_incident_49",
-  "last_updated": "2026-09-22",
+  "last_updated": "2026-10-17",
   "ci_delivery_update": {
     "date": "2026-09-22",
     "scope": "Main push/manual CI, full action pins, read-only default token, non-persisted checkout credentials, locked Cargo resolution, workflow contract tests",
@@ -113,6 +113,20 @@
       ],
       "status": "done",
       "evidence": "Release/readiness/finalization docs explicitly block tag/publish while INC-49 remains open, and CI now executes on all tag pushes ('.github/workflows/ci.yml' `tags: ['**']`) while release-sensitive steps remain `refs/tags/v`-gated"
+    },
+    {
+      "id": "INC-49-6",
+      "priority": "critical",
+      "title": "Fix code-level lockout causes: hook thread without message loop, unconditional uncloak, focus-stealing rollback, child-window destroy, elevated windows, all-or-nothing hotkeys",
+      "targets": [
+        "crates/platform_win32/src/lib.rs",
+        "crates/daemon/src/main.rs",
+        "crates/daemon/src/tray.rs",
+        "crates/daemon/src/config.rs",
+        "crates/cli/src/main.rs"
+      ],
+      "status": "done",
+      "evidence": "WinEvent, mouse and gesture hooks plus the tray icon now run on dedicated message-loop threads (spawn_message_loop_thread); uncloak only targets windows the daemon cloaked or DWM reports app-cloaked, and E_ACCESSDENIED on cloak falls back to moving off-screen; rollback no longer calls SetForegroundWindow; 5 consecutive apply failures pause tiling, cancel animations and run a visibility recovery pass; child-window DESTROY events no longer map to their live top-level window; windows of more privileged processes are not managed; hotkeys register partially with per-key warnings (Alt-based defaults, panic key unchanged); gestures off by default. Unit tests added for each pure part. Host validation still required (INC-49-1/4/T1)."
     }
   ],
   "required_tests": [
@@ -204,5 +218,11 @@
       "validation_gate_passed"
     ],
     "archive_when": "all tasks and required_tests are done"
+  },
+  "root_cause_fix_update": {
+    "date": "2026-10-17",
+    "scope": "Code-level root causes of the INC-49 lockout and GitHub issue #12 found in the 2026-10-17 whole-repo review",
+    "local_validation": "cargo test --locked --workspace, cargo test -- --ignored, cargo clippy --workspace --all-targets -D warnings and cargo fmt --check passed on the task branch (GNU toolchain); no daemon launch or host desktop run",
+    "incident_state": "INC-49-1, INC-49-4 and INC-49-T1 stay in_progress until a host run on a build with these fixes passes; no tag or release authorized"
   }
 }
