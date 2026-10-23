@@ -36,7 +36,7 @@ windows = { version = "0.62", features = [
 ] }
 
 # Needed by the windows::core::interface macro for custom COM interfaces
-windows-core = "0.62"
+windows-core = "0.100"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
